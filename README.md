@@ -32,7 +32,7 @@ A Python tool that simulates the NTSC composite video signal encoding and decodi
 pip install -r requirements.txt
 ```
 
-Dependencies: `numpy`, `scipy`, `opencv-python`
+Dependencies: `numpy`, `scipy`, `opencv-python`, `tqdm`
 
 ## Usage
 
@@ -78,8 +78,8 @@ python main.py colorbars -o colorbars.npy --save-png bars.png
 # Subtle snow
 python main.py image photo.png -o noisy.png --noise 0.05
 
-# Heavy degradation — all effects combined
-python main.py roundtrip input.mp4 -o degraded.mp4 --noise 0.08 --ghost 0.3 --attenuation 0.2 --jitter 1.5
+# Moderate degradation — all effects combined
+python main.py roundtrip input.mp4 -o degraded.mp4 --noise 0.05 --ghost 0.15 --attenuation 0.1 --jitter 0.5
 ```
 
 ### Options
@@ -93,6 +93,7 @@ python main.py roundtrip input.mp4 -o degraded.mp4 --noise 0.08 --ghost 0.3 --at
 | `--comb-1h` | decode, roundtrip, image | Use 1H line-delay comb filter instead of 2-sample delay |
 | `--crf` | decode, roundtrip | x264 CRF quality, 0=lossless, 51=worst (default: 17) |
 | `--preset` | decode, roundtrip | x264 encoding preset, e.g. `ultrafast`, `fast`, `slow` (default: fast) |
+| `--threads` | roundtrip | Number of worker processes (default: auto-detect) |
 | `--noise` | decode, roundtrip, image | Snow amplitude (e.g. 0.05=subtle, 0.2=heavy) |
 | `--ghost` | decode, roundtrip, image | Ghost amplitude 0-1 (multipath echo) |
 | `--ghost-delay` | decode, roundtrip, image | Ghost delay in microseconds (default: 2.0) |
