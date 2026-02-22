@@ -128,14 +128,15 @@ def _mux_audio(source_path, video_path):
 
 
 def _read_input(path):
-    """Open a video file with OpenCV, return (capture, frame_count)."""
+    """Open a video file with OpenCV, return (capture, frame_count, fps)."""
     import cv2
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         print(f"Error: Cannot open video file '{path}'")
         sys.exit(1)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    return cap, total
+    fps = cap.get(cv2.CAP_PROP_FPS) or 29.97
+    return cap, total, fps
 
 
 def _read_frame_rgb(cap):
@@ -152,7 +153,7 @@ def cmd_encode(args):
     from ntsc_simulator.encoder import encode_frame
     from ntsc_simulator.signal_io import export_signal, export_wav
 
-    cap, total_frames = _read_input(args.input)
+    cap, total_frames, _ = _read_input(args.input)
     print(f"Encoding {args.input} ({total_frames} frames) to composite signal...")
 
     all_signals = []
@@ -350,7 +351,7 @@ def _get_num_workers(override=None):
 
 def cmd_roundtrip(args):
     """Encode video to composite signal and decode back."""
-    cap, total_frames = _read_input(args.input)
+    cap, total_frames, input_fps = _read_input(args.input)
     width = args.width
     height = args.height
     workers = _get_num_workers(args.threads)
@@ -366,17 +367,18 @@ def cmd_roundtrip(args):
         print(f"  Signal effects: {', '.join(effects.keys())}")
 
     if args.telecine:
+        # Telecine always outputs 29.97fps interlaced (4 film frames -> 5 NTSC frames)
         out = _make_writer(args.output, width, height, fps=29.97, interlaced=True,
                            crf=crf, preset=preset)
         print(f"Roundtrip (3:2 telecine 480i): {args.input} -> composite -> {args.output}")
-        print(f"  Output: {width}x{height} 29.97fps interlaced (TFF), {workers} workers")
+        print(f"  Input: {input_fps:.3f}fps, Output: {width}x{height} 29.97fps interlaced (TFF), {workers} workers")
         _roundtrip_telecine(cap, out, width, height, total_frames, workers,
                             comb_1h, effects)
     else:
-        out = _make_writer(args.output, width, height, fps=29.97, interlaced=False,
+        out = _make_writer(args.output, width, height, fps=input_fps, interlaced=False,
                            crf=crf, preset=preset)
         print(f"Roundtrip (progressive): {args.input} -> composite -> {args.output}")
-        print(f"  Output: {width}x{height} 29.97fps progressive, {workers} workers")
+        print(f"  Output: {width}x{height} {input_fps:.3f}fps progressive, {workers} workers")
         _roundtrip_progressive(cap, out, width, height, total_frames, workers,
                                comb_1h, effects)
 
