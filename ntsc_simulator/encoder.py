@@ -139,8 +139,14 @@ def encode_frame(frame, frame_number=0, field2_frame=None):
     abs_lines[0::2] = np.arange(20, 260)   # field 1
     abs_lines[1::2] = np.arange(283, 523)  # field 2
 
-    # line_start_phase for each visible line
-    line_phases = (np.pi * abs_lines).reshape(-1, 1)  # (480, 1)
+    # line_start_phase for each visible line.
+    # In real NTSC, there are 227.5 subcarrier cycles per line, so the phase
+    # advances by π each line AND by π each frame (525 × 227.5 = 119437.5
+    # cycles/frame — the half-cycle means phase flips every frame).
+    # This causes the dot crawl / rainbow pattern to alternate every frame,
+    # producing the characteristic ~15 Hz shimmer.
+    frame_phase = np.pi * frame_number
+    line_phases = (np.pi * abs_lines + frame_phase).reshape(-1, 1)  # (480, 1)
 
     # Carrier for active region: phase = omega * index + line_phase + angle
     active_phase = _OMEGA_PER_SAMPLE * _ACTIVE_INDICES.reshape(1, -1) + line_phases
@@ -166,7 +172,7 @@ def encode_frame(frame, frame_number=0, field2_frame=None):
         signal[ln, _ACTIVE_START:_ACTIVE_START + ACTIVE_SAMPLES] = active_voltage[vis_idx]
 
     # Write burst on blank (non-vblank, non-visible) lines too
-    _write_burst_blank_lines(signal)
+    _write_burst_blank_lines(signal, frame_phase)
 
     return signal.ravel()
 
@@ -208,13 +214,12 @@ def _write_burst_all(signal, abs_lines, line_phases):
         signal[ln, _BURST_START:_BURST_START + BURST_SAMPLES] = BLANKING_V + (-np.cos(phase) * burst_v)
 
 
-def _write_burst_blank_lines(signal):
+def _write_burst_blank_lines(signal, frame_phase=0.0):
     """Write colorburst on blank (non-visible, non-vblank special) lines."""
     burst_v = BURST_AMPLITUDE_IRE / 140.0
-    # Lines 9-19 and 271-282 are normal blank lines that need burst
     blank_lines = list(range(9, 20)) + list(range(260, 262)) + list(range(271, 283)) + list(range(523, 525))
     for ln in blank_lines:
         if ln >= TOTAL_LINES:
             continue
-        phase = _OMEGA_PER_SAMPLE * _BURST_INDICES + np.pi * ln
+        phase = _OMEGA_PER_SAMPLE * _BURST_INDICES + np.pi * ln + frame_phase
         signal[ln, _BURST_START:_BURST_START + BURST_SAMPLES] = BLANKING_V + (-np.cos(phase) * burst_v)
