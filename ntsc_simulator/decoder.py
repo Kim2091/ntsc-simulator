@@ -56,21 +56,24 @@ def decode_frame(signal, frame_number=0, output_width=640, output_height=480):
     # Reshape signal into lines
     signal_2d = signal[:TOTAL_LINES * SAMPLES_PER_LINE].reshape(TOTAL_LINES, SAMPLES_PER_LINE)
 
-    # Extract active regions for all visible lines at once
-    active_all = signal_2d[_ABS_LINES, _ACTIVE_START:_ACTIVE_START + ACTIVE_SAMPLES].copy()
-    # Shape: (480, 754)
+    # Extract FULL lines for all visible lines (910 samples each).
+    # Processing the entire line gives the comb filter and FIR filters
+    # valid signal data to settle on before reaching the active region,
+    # eliminating edge artifacts on the left side of the picture.
+    full_lines = signal_2d[_ABS_LINES].copy()  # (480, 910)
 
     # --- Comb filter for luma/chroma separation (vectorized) ---
-    delayed = np.zeros_like(active_all)
-    delayed[:, 2:] = active_all[:, :-2]
-    y_all = (active_all + delayed) / 2.0
-    chroma_all = (active_all - delayed) / 2.0
+    # 2-sample delay comb at 4xfsc separates luma and chroma
+    delayed = np.zeros_like(full_lines)
+    delayed[:, 2:] = full_lines[:, :-2]
+    y_full = (full_lines + delayed) / 2.0
+    chroma_full = (full_lines - delayed) / 2.0
 
     # Undo composite voltage scaling on luma
-    y_all = (y_all - COMPOSITE_OFFSET) / COMPOSITE_SCALE
+    y_full = (y_full - COMPOSITE_OFFSET) / COMPOSITE_SCALE
 
     # --- Burst phase detection (vectorized) ---
-    burst_all = signal_2d[_ABS_LINES, _BURST_START:_BURST_START + BURST_SAMPLES]
+    burst_all = full_lines[:, _BURST_START:_BURST_START + BURST_SAMPLES]
     line_phases = np.pi * _ABS_LINES.astype(np.float64)  # (480,)
 
     # Reference carriers at burst positions for all lines
@@ -82,18 +85,32 @@ def decode_frame(signal, frame_number=0, output_width=640, output_height=480):
     sin_corr = np.sum(burst_all * sin_ref, axis=1)
     burst_phase = np.arctan2(sin_corr, cos_corr) - np.pi  # (480,)
 
-    # --- Chroma demodulation (vectorized) ---
-    # Carrier phase for each line's active region
-    active_omega = (_OMEGA_PER_SAMPLE * _ACTIVE_INDICES.reshape(1, -1)
-                    + (line_phases + burst_phase).reshape(-1, 1))
+    # --- Chroma demodulation on full lines (vectorized) ---
+    # Zero out chroma in the blanking region (everything before active start).
+    # The burst was already used for phase detection above, so we null it out
+    # to prevent the colorburst from leaking through the FIR filter into the
+    # first ~100 samples of the active picture.
+    chroma_full[:, :_ACTIVE_START] = 0.0
+    chroma_full[:, _ACTIVE_START + ACTIVE_SAMPLES:] = 0.0
 
-    # Product detection
-    i_raw = 2.0 * chroma_all * np.cos(active_omega + I_PHASE_RAD)
-    q_raw = 2.0 * chroma_all * np.cos(active_omega + Q_PHASE_RAD)
+    # Carrier phase for each line's FULL sample range
+    full_indices = np.arange(SAMPLES_PER_LINE, dtype=np.float64)
+    full_omega = (_OMEGA_PER_SAMPLE * full_indices.reshape(1, -1)
+                  + (line_phases + burst_phase).reshape(-1, 1))
 
-    # Low-pass filter all rows at once
-    i_demod = _filtfilt_2d(_FIR_I, i_raw)
-    q_demod = _filtfilt_2d(_FIR_Q, q_raw)
+    # Product detection on full lines
+    i_raw = 2.0 * chroma_full * np.cos(full_omega + I_PHASE_RAD)
+    q_raw = 2.0 * chroma_full * np.cos(full_omega + Q_PHASE_RAD)
+
+    # Low-pass filter full lines — filters now have zero-padded blanking
+    # region to settle on cleanly before reaching active picture
+    i_full = _filtfilt_2d(_FIR_I, i_raw)
+    q_full = _filtfilt_2d(_FIR_Q, q_raw)
+
+    # Crop to active region after filtering
+    y_all = y_full[:, _ACTIVE_START:_ACTIVE_START + ACTIVE_SAMPLES]
+    i_demod = i_full[:, _ACTIVE_START:_ACTIVE_START + ACTIVE_SAMPLES]
+    q_demod = q_full[:, _ACTIVE_START:_ACTIVE_START + ACTIVE_SAMPLES]
 
     # Undo composite scaling on chroma
     i_demod /= COMPOSITE_SCALE

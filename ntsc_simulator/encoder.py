@@ -126,10 +126,15 @@ def encode_frame(frame, frame_number=0, field2_frame=None):
     i_all[0::2] = i_f1;  i_all[1::2] = i_f2
     q_all[0::2] = q_f1;  q_all[1::2] = q_f2
 
-    # Bandwidth-limit all rows at once
-    y_all = _filtfilt_2d(_FIR_Y, y_all)
-    i_all = _filtfilt_2d(_FIR_I, i_all)
-    q_all = _filtfilt_2d(_FIR_Q, q_all)
+    # Bandwidth-limit all rows at once.
+    # Pad with edge values to avoid FIR filter startup artifacts at left/right edges.
+    _PAD = _NUM_TAPS  # 201 samples of padding on each side
+    y_pad = np.pad(y_all, ((0, 0), (_PAD, _PAD)), mode='edge')
+    i_pad = np.pad(i_all, ((0, 0), (_PAD, _PAD)), mode='edge')
+    q_pad = np.pad(q_all, ((0, 0), (_PAD, _PAD)), mode='edge')
+    y_all = _filtfilt_2d(_FIR_Y, y_pad)[:, _PAD:-_PAD]
+    i_all = _filtfilt_2d(_FIR_I, i_pad)[:, _PAD:-_PAD]
+    q_all = _filtfilt_2d(_FIR_Q, q_pad)[:, _PAD:-_PAD]
 
     # Build carrier phases for all 480 visible lines.
     # visible_line -> absolute_line_num is needed for the phase.
