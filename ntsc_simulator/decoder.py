@@ -8,8 +8,8 @@ from .constants import (
     FRONT_PORCH_SAMPLES, HSYNC_SAMPLES, BREEZEWAY_SAMPLES,
     BURST_SAMPLES, BACK_PORCH_SAMPLES, ACTIVE_SAMPLES,
     COMPOSITE_SCALE, COMPOSITE_OFFSET,
-    YIQ_TO_RGB, I_PHASE_RAD, Q_PHASE_RAD, GAMMA,
-    I_BW, Q_BW,
+    YIQ_TO_RGB, I_PHASE_RAD, Q_PHASE_RAD,
+    I_BW, Q_BW, LUMA_BW,
 )
 
 _OMEGA_PER_SAMPLE = 2.0 * np.pi * FSC / SAMPLE_RATE
@@ -17,6 +17,7 @@ _OMEGA_PER_SAMPLE = 2.0 * np.pi * FSC / SAMPLE_RATE
 # Precompute filter coefficients for I/Q demodulation
 _NYQ = SAMPLE_RATE / 2
 _NUM_TAPS = 201
+_FIR_Y = firwin(_NUM_TAPS, LUMA_BW / _NYQ)
 _FIR_I = firwin(_NUM_TAPS, I_BW / _NYQ)
 _FIR_Q = firwin(_NUM_TAPS, Q_BW / _NYQ)
 
@@ -92,6 +93,9 @@ def decode_frame(signal, frame_number=0, output_width=640, output_height=480,
         y_full = (full_lines + delayed) / 2.0
         chroma_full = (full_lines - delayed) / 2.0
 
+    # Lowpass luma at 4.2 MHz to remove residual subcarrier energy
+    y_full = _filtfilt_2d(_FIR_Y, y_full)
+
     # Undo composite voltage scaling on luma
     y_full = (y_full - COMPOSITE_OFFSET) / COMPOSITE_SCALE
 
@@ -148,9 +152,7 @@ def decode_frame(signal, frame_number=0, output_width=640, output_height=480,
     yiq = np.stack([y_all, i_demod, q_demod], axis=-1)  # (480, 754, 3)
     rgb = yiq @ YIQ_TO_RGB.T
 
-    # Clip and inverse gamma
     np.clip(rgb, 0.0, 1.0, out=rgb)
-    np.power(rgb, 1.0 / GAMMA, out=rgb)
 
     # Convert to uint8
     output = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)

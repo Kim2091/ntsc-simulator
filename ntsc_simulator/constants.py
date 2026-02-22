@@ -25,8 +25,8 @@ def _us_to_samples(us):
 FRONT_PORCH_US = 1.5
 HSYNC_US = 4.7
 BREEZEWAY_US = 0.6
-BURST_US = 2.5                          # ~9-10 cycles
-BACK_PORCH_US = 1.6                     # Remainder of back porch after burst
+BURST_US = 2.79                         # 10 cycles of subcarrier
+BACK_PORCH_US = 1.31                    # Remainder of back porch after burst
 
 FRONT_PORCH_SAMPLES = _us_to_samples(FRONT_PORCH_US)    # ~21
 HSYNC_SAMPLES = _us_to_samples(HSYNC_US)                 # ~67
@@ -42,7 +42,7 @@ ACTIVE_SAMPLES = SAMPLES_PER_LINE - HBLANK_SAMPLES       # ~754
 ACTIVE_WIDTH = 704                      # Active picture samples (standard)
 
 # --- Colorburst ---
-BURST_CYCLES = 9                        # 9 cycles of subcarrier in burst
+BURST_CYCLES = 10                       # 10 cycles of subcarrier in burst
 BURST_AMPLITUDE_IRE = 20                # ±20 IRE
 
 # --- IRE Levels and Voltage Mapping ---

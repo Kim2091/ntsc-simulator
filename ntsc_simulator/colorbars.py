@@ -39,8 +39,7 @@ def generate_colorbars(width=640, height=480):
         x_end = (i + 1) * bar_width if i < 6 else width
         frame[0:bar_height, x_start:x_end] = color
 
-    # Bottom section: simplified SMPTE pattern
-    # Reverse order bars at 75% for the middle strip
+    # Middle section: reverse-order castellations (1/12 of height)
     strip_height = height // 12
     strip_top = bar_height
 
@@ -59,21 +58,39 @@ def generate_colorbars(width=640, height=480):
         x_end = (i + 1) * bar_width if i < 6 else width
         frame[strip_top:strip_top + strip_height, x_start:x_end] = color
 
-    # Bottom strip: PLUGE (Picture Line-Up Generation Equipment)
+    # Bottom section: SMPTE EG 1-1990 PLUGE layout
+    # | -I  | White | +Q  | Black | sub-black | black | above-black | black |
+    # Columns 0-2 aligned with bars 0-2, column 3-6 aligned with bars 3-6
     pluge_top = strip_top + strip_height
-    pluge_section_width = width // 4
 
-    # -4% black, 0% black, +4% black, 100% white reference
-    pluge_colors = [
-        (0, 0, 0),        # Superblack (below black)
-        (16, 16, 16),     # Black
-        (36, 36, 36),     # Slightly above black
-        (255, 255, 255),  # White reference
-    ]
+    # -I signal (approximation in RGB)
+    x0 = 0
+    x1 = bar_width
+    frame[pluge_top:height, x0:x1] = [0, 68, 130]
 
-    for i, color in enumerate(pluge_colors):
-        x_start = i * pluge_section_width
-        x_end = (i + 1) * pluge_section_width if i < 3 else width
-        frame[pluge_top:height, x_start:x_end] = color
+    # 100% White
+    x0 = bar_width
+    x1 = 2 * bar_width
+    frame[pluge_top:height, x0:x1] = [255, 255, 255]
+
+    # +Q signal (approximation in RGB)
+    x0 = 2 * bar_width
+    x1 = 3 * bar_width
+    frame[pluge_top:height, x0:x1] = [67, 0, 130]
+
+    # Black fill from bar 3 through bar 6 (remainder of width)
+    x0 = 3 * bar_width
+    frame[pluge_top:height, x0:] = [16, 16, 16]
+
+    # PLUGE sub-bars within bar 5's width: superblack, black, above-black
+    pluge_left = 4 * bar_width
+    pluge_right = 5 * bar_width
+    sub_width = (pluge_right - pluge_left) // 3
+    # Superblack (-4 IRE below setup)
+    frame[pluge_top:height, pluge_left:pluge_left + sub_width] = [1, 1, 1]
+    # Black reference (7.5 IRE setup)
+    frame[pluge_top:height, pluge_left + sub_width:pluge_left + 2 * sub_width] = [16, 16, 16]
+    # Slightly above black (+4 IRE above setup, ~11.5 IRE)
+    frame[pluge_top:height, pluge_left + 2 * sub_width:pluge_right] = [33, 33, 33]
 
     return frame

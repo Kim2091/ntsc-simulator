@@ -9,7 +9,7 @@ from .constants import (
     BURST_SAMPLES, BACK_PORCH_SAMPLES, ACTIVE_SAMPLES,
     SYNC_TIP_V, BLANKING_V,
     COMPOSITE_SCALE, COMPOSITE_OFFSET,
-    RGB_TO_YIQ, I_PHASE_RAD, Q_PHASE_RAD, GAMMA,
+    RGB_TO_YIQ, I_PHASE_RAD, Q_PHASE_RAD,
     EQ_PULSE_SAMPLES, VSYNC_PULSE_SAMPLES, HALF_LINE_SAMPLES,
     BURST_AMPLITUDE_IRE, LUMA_BW, I_BW, Q_BW,
 )
@@ -36,7 +36,6 @@ _BURST_INDICES = np.arange(BURST_SAMPLES, dtype=np.float64) + _BURST_START
 def rgb_to_yiq(frame):
     """Convert an RGB frame (H x W x 3, uint8) to YIQ (float64)."""
     rgb = frame.astype(np.float64) / 255.0
-    rgb = np.power(rgb, GAMMA)
     return rgb @ RGB_TO_YIQ.T
 
 
@@ -162,6 +161,10 @@ def encode_frame(frame, frame_number=0, field2_frame=None):
     chroma = i_all * i_carrier + q_all * q_carrier
     active_voltage = (y_all + chroma) * COMPOSITE_SCALE + COMPOSITE_OFFSET  # (480, 754)
 
+    # Apply 4.2 MHz lowpass to composite signal (vestigial sideband effect)
+    av_pad = np.pad(active_voltage, ((0, 0), (_PAD, _PAD)), mode='edge')
+    active_voltage = _filtfilt_2d(_FIR_Y, av_pad)[:, _PAD:-_PAD]
+
     # --- Build the full 525-line signal ---
     signal = np.full((TOTAL_LINES, SAMPLES_PER_LINE), BLANKING_V, dtype=np.float64)
 
@@ -182,32 +185,81 @@ def encode_frame(frame, frame_number=0, field2_frame=None):
     return signal.ravel()
 
 
+def _write_eq_pulse(signal, ln, pos):
+    """Write an equalizing pulse at the given sample position on a line."""
+    end = min(pos + EQ_PULSE_SAMPLES, SAMPLES_PER_LINE)
+    signal[ln, pos:end] = SYNC_TIP_V
+
+
+def _write_broad_pulse(signal, ln, pos):
+    """Write a vsync broad pulse at the given sample position on a line."""
+    end = min(pos + VSYNC_PULSE_SAMPLES, SAMPLES_PER_LINE)
+    signal[ln, pos:end] = SYNC_TIP_V
+
+
 def _write_blanking_structure(signal):
     """Write sync pulses and blanking for all 525 lines (vectorized)."""
     fp = FRONT_PORCH_SAMPLES
     hs = HSYNC_SAMPLES
+    hl = HALF_LINE_SAMPLES
 
     # Normal hsync for all lines first
     signal[:, fp:fp + hs] = SYNC_TIP_V
 
-    # Overwrite vblank lines with special sync patterns
-    # Pre-eq pulses: lines 0-2, 262-264
-    for ln in list(range(0, 3)) + list(range(262, 265)):
+    # --- Field 1 (lines 0-8): sync pulses at sample 0, no half-line offset ---
+    # Pre-eq pulses: lines 0-2
+    for ln in range(0, 3):
         signal[ln, :] = BLANKING_V
-        signal[ln, 0:EQ_PULSE_SAMPLES] = SYNC_TIP_V
-        signal[ln, HALF_LINE_SAMPLES:HALF_LINE_SAMPLES + EQ_PULSE_SAMPLES] = SYNC_TIP_V
+        _write_eq_pulse(signal, ln, 0)
+        _write_eq_pulse(signal, ln, hl)
 
-    # Vsync broad pulses: lines 3-5, 265-267
-    for ln in list(range(3, 6)) + list(range(265, 268)):
+    # Vsync broad pulses: lines 3-5
+    for ln in range(3, 6):
         signal[ln, :] = BLANKING_V
-        signal[ln, 0:VSYNC_PULSE_SAMPLES] = SYNC_TIP_V
-        signal[ln, HALF_LINE_SAMPLES:HALF_LINE_SAMPLES + VSYNC_PULSE_SAMPLES] = SYNC_TIP_V
+        _write_broad_pulse(signal, ln, 0)
+        _write_broad_pulse(signal, ln, hl)
 
-    # Post-eq pulses: lines 6-8, 268-270
-    for ln in list(range(6, 9)) + list(range(268, 271)):
+    # Post-eq pulses: lines 6-8
+    for ln in range(6, 9):
         signal[ln, :] = BLANKING_V
-        signal[ln, 0:EQ_PULSE_SAMPLES] = SYNC_TIP_V
-        signal[ln, HALF_LINE_SAMPLES:HALF_LINE_SAMPLES + EQ_PULSE_SAMPLES] = SYNC_TIP_V
+        _write_eq_pulse(signal, ln, 0)
+        _write_eq_pulse(signal, ln, hl)
+
+    # --- Field 2 (lines 262-270): half-line offset ---
+    # Line 262: first half = blanking, second half = EQ pulse at hl
+    signal[262, :] = BLANKING_V
+    _write_eq_pulse(signal, 262, hl)
+
+    # Lines 263-264: EQ pulse at 0 AND at hl (same as field 1 eq)
+    for ln in range(263, 265):
+        signal[ln, :] = BLANKING_V
+        _write_eq_pulse(signal, ln, 0)
+        _write_eq_pulse(signal, ln, hl)
+
+    # Line 265: EQ->Vsync transition: EQ at 0, broad pulse at hl
+    signal[265, :] = BLANKING_V
+    _write_eq_pulse(signal, 265, 0)
+    _write_broad_pulse(signal, 265, hl)
+
+    # Lines 266-267: broad pulse at 0 AND hl
+    for ln in range(266, 268):
+        signal[ln, :] = BLANKING_V
+        _write_broad_pulse(signal, ln, 0)
+        _write_broad_pulse(signal, ln, hl)
+
+    # Line 268: Vsync->Post-eq transition: broad at 0, EQ at hl
+    signal[268, :] = BLANKING_V
+    _write_broad_pulse(signal, 268, 0)
+    _write_eq_pulse(signal, 268, hl)
+
+    # Line 269: EQ at 0 AND hl
+    signal[269, :] = BLANKING_V
+    _write_eq_pulse(signal, 269, 0)
+    _write_eq_pulse(signal, 269, hl)
+
+    # Line 270: EQ at 0, second half = blanking (no pulse)
+    signal[270, :] = BLANKING_V
+    _write_eq_pulse(signal, 270, 0)
 
 
 def _write_burst_all(signal, abs_lines, line_phases):
