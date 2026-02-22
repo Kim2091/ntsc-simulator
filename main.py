@@ -1,6 +1,7 @@
 """CLI entry point for the NTSC Composite Video Simulator."""
 
 import argparse
+import ctypes
 import multiprocessing
 import os
 import shutil
@@ -278,8 +279,72 @@ def _ntsc_worker(args):
                         comb_1h=comb_1h)
 
 
-def _get_num_workers():
-    """Get number of parallel workers (leave one core free for I/O)."""
+def _detect_p_core_threads():
+    """Detect P-core thread count on hybrid CPUs (Intel 12th gen+).
+
+    Uses GetSystemCpuSetInformation on Windows to read each logical
+    processor's EfficiencyClass.  P-cores get the highest class value.
+    Returns the count of logical processors at the max efficiency class,
+    or None if detection is unavailable or the CPU is not hybrid.
+    """
+    if sys.platform != 'win32':
+        return None
+
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        try:
+            fn = kernel32.GetSystemCpuSetInformation
+        except AttributeError:
+            return None
+
+        # First call: query required buffer size
+        length = ctypes.c_ulong(0)
+        fn(None, 0, ctypes.byref(length), None, 0)
+        buf_size = length.value
+        if buf_size == 0:
+            return None
+
+        buf = (ctypes.c_byte * buf_size)()
+        ok = fn(buf, buf_size, ctypes.byref(length), None, 0)
+        if not ok:
+            return None
+
+        # Read struct size from the Size field (DWORD at offset 0).
+        # EfficiencyClass is a BYTE at offset 18.
+        struct_size = int.from_bytes(bytes(buf[0:4]), 'little')
+        efficiency_offset = 18
+        count = buf_size // struct_size
+
+        classes = []
+        for i in range(count):
+            eff = buf[i * struct_size + efficiency_offset]
+            classes.append(eff)
+
+        if not classes:
+            return None
+
+        max_class = max(classes)
+        if max_class == min(classes):
+            # All cores same efficiency — not a hybrid CPU
+            return None
+
+        return sum(1 for c in classes if c == max_class)
+    except Exception:
+        return None
+
+
+def _get_num_workers(override=None):
+    """Get number of parallel workers.
+
+    If *override* is given (from --threads), use it directly.
+    Otherwise try to detect P-core thread count on hybrid CPUs,
+    falling back to os.cpu_count() - 1.
+    """
+    if override is not None:
+        return max(1, override)
+    detected = _detect_p_core_threads()
+    if detected is not None:
+        return max(1, detected)
     return max(1, os.cpu_count() - 1)
 
 
@@ -288,7 +353,7 @@ def cmd_roundtrip(args):
     cap, total_frames = _read_input(args.input)
     width = args.width
     height = args.height
-    workers = _get_num_workers()
+    workers = _get_num_workers(args.threads)
 
     comb_1h = getattr(args, 'comb_1h', False)
 
@@ -549,6 +614,8 @@ Examples:
                       help='Simulate 3:2 pulldown telecine (480i, 4 film frames -> 5 NTSC frames)')
     p_rt.add_argument('--comb-1h', action='store_true',
                       help='Use 1H line-delay comb filter (reduces rainbow, adds hanging dots)')
+    p_rt.add_argument('--threads', type=int, default=None,
+                      help='Number of worker processes (default: auto-detect P-core threads, or cpu_count-1)')
     p_rt.add_argument('--crf', type=int, default=17, help='x264 CRF quality (0=lossless, 51=worst, default: 17)')
     p_rt.add_argument('--preset', default='fast',
                       help='x264 preset (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, default: fast)')
