@@ -115,21 +115,21 @@ def decode_frame(signal, frame_number=0, output_width=640, output_height=480,
     # the left edge of the active picture.
     chroma_full[:, :_ACTIVE_START] = 0.0
 
-    # Carrier phase for each line's FULL sample range
+    # Carrier phase for each line's sample range
     full_indices = np.arange(SAMPLES_PER_LINE, dtype=np.float64)
     full_omega = (_OMEGA_PER_SAMPLE * full_indices.reshape(1, -1)
                   + (line_phases + burst_phase).reshape(-1, 1))
 
-    # Product detection on full lines
+    # Product detection on full lines (910 samples)
     i_raw = 2.0 * chroma_full * np.cos(full_omega + I_PHASE_RAD)
     q_raw = 2.0 * chroma_full * np.cos(full_omega + Q_PHASE_RAD)
 
-    # Pad the right edge with zeros before filtering.
-    # The active region ends at sample 910 (= SAMPLES_PER_LINE), leaving
-    # filtfilt no room to settle on the right. Adding zero-padding prevents
-    # the backward pass from creating color bleed on the right edge.
-    i_raw = np.pad(i_raw, ((0, 0), (0, _RIGHT_PAD)), mode='constant')
-    q_raw = np.pad(q_raw, ((0, 0), (0, _RIGHT_PAD)), mode='constant')
+    # Pad the demodulated baseband I/Q on the right with reflected values.
+    # The active region ends at sample 910 (= SAMPLES_PER_LINE) with no
+    # blanking after it. Reflect padding preserves signal continuity for
+    # filtfilt's backward pass better than edge or zero padding.
+    i_raw = np.pad(i_raw, ((0, 0), (0, _RIGHT_PAD)), mode='reflect')
+    q_raw = np.pad(q_raw, ((0, 0), (0, _RIGHT_PAD)), mode='reflect')
 
     # Low-pass filter padded lines, then strip padding
     i_full = _filtfilt_2d(_FIR_I, i_raw)[:, :SAMPLES_PER_LINE]
