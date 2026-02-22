@@ -1,6 +1,8 @@
 """CLI entry point for the NTSC Composite Video Simulator."""
 
 import argparse
+import multiprocessing
+import os
 import shutil
 import subprocess
 import sys
@@ -165,59 +167,81 @@ def cmd_decode(args):
     print(f"Done: {args.output}")
 
 
-def cmd_roundtrip(args):
-    """Encode video to composite signal and decode back."""
+def _ntsc_worker(args):
+    """Worker process: encode frame through NTSC composite and decode back.
+
+    Must be at module level for pickling by multiprocessing.
+    """
     from ntsc_simulator.encoder import encode_frame
     from ntsc_simulator.decoder import decode_frame
-    from ntsc_simulator.pipeline import SignalPipeline
 
+    frame_rgb, frame_number, width, height, field2_frame = args
+    signal = encode_frame(frame_rgb, frame_number=frame_number,
+                          field2_frame=field2_frame)
+    return decode_frame(signal, frame_number=frame_number,
+                        output_width=width, output_height=height)
+
+
+def _get_num_workers():
+    """Get number of parallel workers (leave one core free for I/O)."""
+    return max(1, os.cpu_count() - 1)
+
+
+def cmd_roundtrip(args):
+    """Encode video to composite signal and decode back."""
     cap, total_frames = _read_input(args.input)
     width = args.width
     height = args.height
-    pipeline = SignalPipeline()
+    workers = _get_num_workers()
 
     if args.telecine:
         out = _make_writer(args.output, width, height, fps=29.97, interlaced=True)
         print(f"Roundtrip (3:2 telecine 480i): {args.input} -> composite -> {args.output}")
-        print(f"  Output: {width}x{height} 29.97fps interlaced (TFF)")
-        _roundtrip_telecine(cap, out, pipeline, encode_frame, decode_frame,
-                            width, height, total_frames)
+        print(f"  Output: {width}x{height} 29.97fps interlaced (TFF), {workers} workers")
+        _roundtrip_telecine(cap, out, width, height, total_frames, workers)
     else:
         out = _make_writer(args.output, width, height, fps=29.97, interlaced=False)
         print(f"Roundtrip (progressive): {args.input} -> composite -> {args.output}")
-        print(f"  Output: {width}x{height} 29.97fps progressive")
-        _roundtrip_progressive(cap, out, pipeline, encode_frame, decode_frame,
-                               width, height, total_frames)
+        print(f"  Output: {width}x{height} 29.97fps progressive, {workers} workers")
+        _roundtrip_progressive(cap, out, width, height, total_frames, workers)
 
     cap.release()
     out.release()
 
 
-def _roundtrip_progressive(cap, out, pipeline, encode_frame, decode_frame,
-                           width, height, total_frames):
-    """Progressive roundtrip: each input frame -> one NTSC frame."""
+def _roundtrip_progressive(cap, out, width, height, total_frames, workers):
+    """Progressive roundtrip with parallel processing."""
     frame_num = 0
-    while True:
-        frame_rgb = _read_frame_rgb(cap)
-        if frame_rgb is None:
-            break
-        signal = encode_frame(frame_rgb, frame_number=frame_num)
-        if len(pipeline) > 0:
-            signal = pipeline.process(signal)
-        result = decode_frame(signal, frame_number=frame_num,
-                              output_width=width, output_height=height)
-        out.write(result)
-        frame_num += 1
-        if frame_num % 10 == 0:
-            print(f"  Frame {frame_num}/{total_frames}")
+    batch_size = workers * 2
+
+    with multiprocessing.Pool(workers) as pool:
+        while True:
+            # Read a batch of frames
+            batch = []
+            for _ in range(batch_size):
+                frame_rgb = _read_frame_rgb(cap)
+                if frame_rgb is None:
+                    break
+                batch.append((frame_rgb, frame_num + len(batch), width, height, None))
+
+            if not batch:
+                break
+
+            # Process batch in parallel, results come back in order
+            results = pool.map(_ntsc_worker, batch)
+
+            for result in results:
+                out.write(result)
+                frame_num += 1
+
+            if frame_num % 25 == 0 or len(batch) < batch_size:
+                print(f"  Frame {frame_num}/{total_frames}")
+
     print(f"Done: {frame_num} output frames")
 
 
-def _roundtrip_telecine(cap, out, pipeline, encode_frame, decode_frame,
-                        width, height, total_frames):
-    """3:2 pulldown telecine: 4 input frames -> 5 NTSC frames (480i).
-
-    Streams frames in groups of 4 to avoid loading entire video into memory.
+def _roundtrip_telecine(cap, out, width, height, total_frames, workers):
+    """3:2 pulldown telecine with parallel processing.
 
     Pulldown pattern per group of 4 film frames A, B, C, D:
       NTSC frame 1: field1=A, field2=A  (clean)
@@ -226,44 +250,53 @@ def _roundtrip_telecine(cap, out, pipeline, encode_frame, decode_frame,
       NTSC frame 4: field1=C, field2=D  (combed)
       NTSC frame 5: field1=D, field2=D  (clean)
     """
-    def _encode_decode(f1, f2, ntsc_num):
-        signal = encode_frame(f1, frame_number=ntsc_num, field2_frame=f2)
-        if len(pipeline) > 0:
-            signal = pipeline.process(signal)
-        return decode_frame(signal, frame_number=ntsc_num,
-                            output_width=width, output_height=height)
-
     ntsc_num = 0
     film_idx = 0
-    buf = []  # Rolling buffer of up to 4 frames
+    # Process multiple groups at once: read N groups, expand to NTSC jobs, process in parallel
+    groups_per_batch = max(1, workers)  # N groups -> 5N NTSC frames per batch
 
-    while True:
-        # Fill buffer to 4 frames
-        while len(buf) < 4:
-            frame_rgb = _read_frame_rgb(cap)
-            if frame_rgb is None:
+    with multiprocessing.Pool(workers) as pool:
+        while True:
+            # Read groups_per_batch * 4 film frames
+            film_buf = []
+            for _ in range(groups_per_batch * 4):
+                frame_rgb = _read_frame_rgb(cap)
+                if frame_rgb is None:
+                    break
+                film_buf.append(frame_rgb)
+
+            if not film_buf:
                 break
-            buf.append(frame_rgb)
 
-        if len(buf) >= 4:
-            a, b, c, d = buf[0], buf[1], buf[2], buf[3]
+            # Expand film frames into NTSC (field1, field2) jobs
+            jobs = []
+            fi = 0
+            while fi + 3 < len(film_buf):
+                a, b, c, d = film_buf[fi], film_buf[fi+1], film_buf[fi+2], film_buf[fi+3]
+                for f1, f2 in [(a, a), (b, b), (b, c), (c, d), (d, d)]:
+                    jobs.append((f1, ntsc_num + len(jobs), width, height, f2))
+                fi += 4
 
-            for f1, f2 in [(a, a), (b, b), (b, c), (c, d), (d, d)]:
-                out.write(_encode_decode(f1, f2, ntsc_num))
-                ntsc_num += 1
+            # Handle remaining < 4 frames as progressive
+            while fi < len(film_buf):
+                f = film_buf[fi]
+                jobs.append((f, ntsc_num + len(jobs), width, height, None))
+                fi += 1
 
-            film_idx += 4
-            buf = buf[4:]  # Advance past the group
+            if not jobs:
+                break
 
-            if ntsc_num % 25 == 0:
+            # Process all NTSC frames in this batch in parallel
+            results = pool.map(_ntsc_worker, jobs)
+
+            for result in results:
+                out.write(result)
+
+            film_idx += len(film_buf)
+            ntsc_num += len(results)
+
+            if ntsc_num % 25 == 0 or len(film_buf) < groups_per_batch * 4:
                 print(f"  NTSC frame {ntsc_num} (film frame {film_idx}/{total_frames})")
-        else:
-            # Fewer than 4 remaining — output as progressive
-            for frame in buf:
-                out.write(_encode_decode(frame, frame, ntsc_num))
-                ntsc_num += 1
-                film_idx += 1
-            break
 
     print(f"Done: {film_idx} film frames -> {ntsc_num} NTSC frames")
 
