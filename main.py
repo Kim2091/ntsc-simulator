@@ -80,7 +80,7 @@ class FFmpegWriter:
     """
 
     def __init__(self, filepath, width, height, fps=29.97, interlaced=False,
-                 crf=17, preset='fast'):
+                 crf=17, preset='fast', lossless=False):
         self.width = width
         self.height = height
 
@@ -101,13 +101,17 @@ class FFmpegWriter:
                 '-top', '1',
             ]
 
-        cmd += [
-            '-c:v', 'libx264',
-            '-preset', preset,
-            '-crf', str(crf),
-            '-pix_fmt', 'yuv420p',
-            filepath,
-        ]
+        if lossless:
+            if filepath.endswith('.mkv'):
+                cmd += ['-c:v', 'ffv1', '-level', '3', '-pix_fmt', 'yuv444p']
+            else:
+                cmd += ['-c:v', 'libx264', '-preset', preset, '-qp', '0',
+                        '-pix_fmt', 'yuv444p']
+        else:
+            cmd += ['-c:v', 'libx264', '-preset', preset, '-crf', str(crf),
+                    '-pix_fmt', 'yuv420p']
+
+        cmd += [filepath]
 
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE,
@@ -140,11 +144,11 @@ class CV2Writer:
 
 
 def _make_writer(filepath, width, height, fps=29.97, interlaced=False,
-                 crf=17, preset='fast'):
+                 crf=17, preset='fast', lossless=False):
     """Create a video writer, preferring ffmpeg for interlaced output."""
     if shutil.which('ffmpeg'):
         return FFmpegWriter(filepath, width, height, fps, interlaced,
-                            crf=crf, preset=preset)
+                            crf=crf, preset=preset, lossless=lossless)
     if interlaced:
         print("Warning: ffmpeg not found, interlace flags will not be set")
     return CV2Writer(filepath, width, height, fps)
@@ -453,7 +457,7 @@ def _get_num_workers(override=None):
     return max(1, os.cpu_count() - 1)
 
 
-def _roundtrip_one(input_path, output_path, args, workers):
+def _roundtrip_one(input_path, output_path, args, workers, batch_label=None):
     """Run a single-file roundtrip (progressive or telecine)."""
     cap, total_frames, input_fps = _read_input(input_path)
     width = args.width
@@ -461,22 +465,24 @@ def _roundtrip_one(input_path, output_path, args, workers):
     comb_1h = getattr(args, 'comb_1h', False)
     crf = args.crf
     preset = args.preset
+    lossless = getattr(args, 'lossless', False)
     effects = _build_effects_dict(args)
+    desc = batch_label or 'Processing'
 
     if args.telecine:
         out = _make_writer(output_path, width, height, fps=29.97, interlaced=True,
-                           crf=crf, preset=preset)
+                           crf=crf, preset=preset, lossless=lossless)
         print(f"Roundtrip (3:2 telecine 480i): {input_path} -> composite -> {output_path}")
         print(f"  Input: {input_fps:.3f}fps, Output: {width}x{height} 29.97fps interlaced (TFF), {workers} workers")
         _roundtrip_telecine(cap, out, width, height, total_frames, workers,
-                            comb_1h, effects)
+                            comb_1h, effects, desc=desc)
     else:
         out = _make_writer(output_path, width, height, fps=input_fps, interlaced=False,
-                           crf=crf, preset=preset)
+                           crf=crf, preset=preset, lossless=lossless)
         print(f"Roundtrip (progressive): {input_path} -> composite -> {output_path}")
         print(f"  Output: {width}x{height} {input_fps:.3f}fps progressive, {workers} workers")
         _roundtrip_progressive(cap, out, width, height, total_frames, workers,
-                               comb_1h, effects)
+                               comb_1h, effects, desc=desc)
 
     cap.release()
     out.release()
@@ -497,20 +503,21 @@ def cmd_roundtrip(args):
             sys.exit(1)
         os.makedirs(args.output, exist_ok=True)
         print(f"Batch roundtrip: {len(files)} file(s) -> '{args.output}' ({workers} workers)")
-        for path in files:
+        for i, path in enumerate(files):
             # Preserve original container extension (e.g. .mkv -> .mkv)
             out_path = _batch_output_path(args.output, path)
-            _roundtrip_one(path, out_path, args, workers)
+            batch_label = f"[{i+1}/{len(files)}] {os.path.basename(path)}"
+            _roundtrip_one(path, out_path, args, workers, batch_label=batch_label)
     else:
         _roundtrip_one(args.input, args.output, args, workers)
 
 
 def _roundtrip_progressive(cap, out, width, height, total_frames, workers,
-                           comb_1h=False, effects=None):
+                           comb_1h=False, effects=None, desc='Processing'):
     """Progressive roundtrip with parallel processing."""
     frame_num = 0
     batch_size = workers * 2
-    pbar = tqdm(total=total_frames, unit='frame', desc='Processing')
+    pbar = tqdm(total=total_frames, unit='frame', desc=desc)
 
     with multiprocessing.Pool(workers) as pool:
         while True:
@@ -540,7 +547,7 @@ def _roundtrip_progressive(cap, out, width, height, total_frames, workers,
 
 
 def _roundtrip_telecine(cap, out, width, height, total_frames, workers,
-                        comb_1h=False, effects=None):
+                        comb_1h=False, effects=None, desc='Processing'):
     """3:2 pulldown telecine with parallel processing.
 
     Pulldown pattern per group of 4 film frames A, B, C, D:
@@ -554,7 +561,7 @@ def _roundtrip_telecine(cap, out, width, height, total_frames, workers,
     film_idx = 0
     # Process multiple groups at once: read N groups, expand to NTSC jobs, process in parallel
     groups_per_batch = max(1, workers)  # N groups -> 5N NTSC frames per batch
-    pbar = tqdm(total=total_frames, unit='film frame', desc='Processing')
+    pbar = tqdm(total=total_frames, unit='film frame', desc=desc)
 
     with multiprocessing.Pool(workers) as pool:
         while True:
@@ -603,7 +610,7 @@ def _roundtrip_telecine(cap, out, width, height, total_frames, workers,
     print(f"Done: {film_idx} film frames -> {ntsc_num} NTSC frames")
 
 
-def _image_one(input_path, output_path, args):
+def _image_one(input_path, output_path, args, batch_label=None):
     """Roundtrip a single image through the NTSC composite pipeline."""
     import cv2
     from ntsc_simulator.encoder import encode_frame
@@ -616,6 +623,8 @@ def _image_one(input_path, output_path, args):
         return
 
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    if batch_label:
+        print(f"{batch_label}")
     print(f"Input: {input_path} ({frame_rgb.shape[1]}x{frame_rgb.shape[0]})")
 
     print("Encoding to composite signal...")
@@ -655,10 +664,11 @@ def cmd_image(args):
             sys.exit(1)
         os.makedirs(args.output, exist_ok=True)
         print(f"Batch image: {len(files)} file(s) -> '{args.output}'")
-        for path in files:
+        for i, path in enumerate(files):
             # Preserve original image format extension
             out_path = _batch_output_path(args.output, path)
-            _image_one(path, out_path, args)
+            batch_label = f"[{i+1}/{len(files)}] {os.path.basename(path)}"
+            _image_one(path, out_path, args, batch_label=batch_label)
     else:
         _image_one(args.input, args.output, args)
 
@@ -683,10 +693,10 @@ def cmd_colorbars(args):
         export_wav(signal, args.wav)
         print(f"WAV: {args.wav}")
 
-    if args.save_png:
+    if args.save_source:
         import cv2
-        cv2.imwrite(args.save_png, cv2.cvtColor(bars, cv2.COLOR_RGB2BGR))
-        print(f"Saved source pattern: {args.save_png}")
+        cv2.imwrite(args.save_source, cv2.cvtColor(bars, cv2.COLOR_RGB2BGR))
+        print(f"Saved source pattern: {args.save_source}")
 
 
 def _add_effect_args(parser):
@@ -761,6 +771,8 @@ Examples:
     p_rt.add_argument('--crf', type=int, default=17, help='x264 CRF quality (0=lossless, 51=worst, default: 17)')
     p_rt.add_argument('--preset', default='fast',
                       help='x264 preset (ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, default: fast)')
+    p_rt.add_argument('--lossless', action='store_true',
+                      help='Lossless output (FFV1 for .mkv, x264 QP 0 for .mp4)')
     _add_effect_args(p_rt)
 
     # image
@@ -779,7 +791,7 @@ Examples:
     p_cb = subparsers.add_parser('colorbars', help='Generate color bar test signal')
     p_cb.add_argument('-o', '--output', default='colorbars.npy', help='Output signal file (.npy)')
     p_cb.add_argument('--wav', default=None, help='Also export as WAV (stretched to 48 kHz for audio editors)')
-    p_cb.add_argument('--save-png', default=None, help='Also save source pattern as PNG')
+    p_cb.add_argument('--save-source', default=None, help='Also save source pattern as PNG')
 
     args = parser.parse_args()
 

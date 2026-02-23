@@ -1,0 +1,21 @@
+[package]
+name = "ntsc-composite-simulator"
+version = "0.1.0"
+edition = "2021"
+description = "NTSC composite video simulator — encode and decode RGB frames through a simulated NTSC signal path"
+
+[dependencies]
+realfft = "3"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+image = "0.25"
+indicatif = "0.17"
+anyhow = "1"
+rand = "0.9"
+rand_distr = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
