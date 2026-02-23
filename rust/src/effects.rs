@@ -134,9 +134,10 @@ impl SignalEffects {
     ///   4. Luminance-dependent noise — tape media noise
     ///   5. Tape dropout — physical oxide damage
     ///   6. Gaussian noise — reception snow
-    ///   7. Tape trailing — causal rightward luma smudge (after noise so
-    ///      noise gets smeared too)
-    ///   8. Ghosting / attenuation / jitter — reception effects
+    ///   7. Ghosting / attenuation / jitter — reception effects
+    ///   8. Tape trailing — **last**: causal rightward luma smudge from
+    ///      playback electronics.  Everything on the tape (noise, dropouts,
+    ///      ghosts) passes through this bottleneck on readout.
     pub fn apply(&self, signal: &mut [f32], sample_rate: f64, rng: &mut impl Rng) {
         // VHS tape-path effects (must come first)
         if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {
@@ -157,10 +158,6 @@ impl SignalEffects {
         if let Some(amp) = self.noise {
             apply_noise(signal, amp, rng);
         }
-        // Tape trail after noise so the rightward smear catches noise too
-        if let Some(strength) = self.tape_trail_smear {
-            apply_tape_trail_smear(signal, strength);
-        }
         if !self.ghosts.is_empty() {
             apply_ghosting(signal, &self.ghosts, sample_rate, rng);
         }
@@ -169,6 +166,12 @@ impl SignalEffects {
         }
         if let Some(amp) = self.jitter {
             apply_jitter(signal, amp, rng);
+        }
+        // Tape trail is the very last step — the playback head's bandwidth
+        // limit smears everything that's on the tape (noise, dropouts,
+        // ghosts, etc.) rightward on readout.
+        if let Some(strength) = self.tape_trail_smear {
+            apply_tape_trail_smear(signal, strength);
         }
     }
 }
