@@ -100,11 +100,30 @@ impl Encoder {
         frame_number: u32,
     ) -> &[f32] {
         self.update_interp_tables(width, height);
+        self.resample_yiq_field1(frame_rgb, width);
+        self.resample_yiq_field2(frame_rgb, width);
+        self.encode_signal_from_yiq(frame_number)
+    }
 
-        // 1. RGB -> YIQ (directly into pre-allocated y/i/q planes via resampling)
-        self.resample_yiq_interleaved(frame_rgb, width);
+    /// Encode an interlaced frame from two separate RGB images (for telecine).
+    /// Field 1 (even visible lines) from `f1_rgb`, Field 2 (odd) from `f2_rgb`.
+    pub fn encode_frame_interlaced(
+        &mut self,
+        f1_rgb: &[u8],
+        width: usize,
+        height: usize,
+        f2_rgb: &[u8],
+        frame_number: u32,
+    ) -> &[f32] {
+        self.update_interp_tables(width, height);
+        self.resample_yiq_field1(f1_rgb, width);
+        self.resample_yiq_field2(f2_rgb, width);
+        self.encode_signal_from_yiq(frame_number)
+    }
 
-        // 2. Bandwidth-limit: pad, filter, unpad for Y, I, Q
+    /// Build composite signal from the already-filled y/i/q planes.
+    fn encode_signal_from_yiq(&mut self, frame_number: u32) -> &[f32] {
+        // Bandwidth-limit: pad, filter, unpad for Y, I, Q
         pad_edge_into(&self.y_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD, &mut self.padded_buf);
         filters::filter_rows_sequential(&self.active_filters.luma, &mut self.padded_buf, PADDED_ACTIVE, &mut self.fft_scratch);
         unpad_into(&self.padded_buf, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut self.y_all);
@@ -117,7 +136,7 @@ impl Encoder {
         filters::filter_rows_sequential(&self.active_filters.q_channel, &mut self.padded_buf, PADDED_ACTIVE, &mut self.fft_scratch);
         unpad_into(&self.padded_buf, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut self.q_all);
 
-        // 3. Generate carriers using LUT and modulate chroma
+        // Generate carriers using LUT and modulate chroma
         let frame_phase = std::f32::consts::PI * frame_number as f32;
 
         for vis_line in 0..VISIBLE_LINES {
@@ -153,12 +172,12 @@ impl Encoder {
             }
         }
 
-        // 4. VSB filter: 4.2 MHz lowpass on composite
+        // VSB filter: 4.2 MHz lowpass on composite
         pad_edge_into(&self.active_voltage, VISIBLE_LINES, ACTIVE_SAMPLES, PAD, &mut self.padded_buf);
         filters::filter_rows_sequential(&self.vsb_filter, &mut self.padded_buf, PADDED_ACTIVE, &mut self.fft_scratch);
         unpad_into(&self.padded_buf, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut self.active_voltage);
 
-        // 5. Build the full 525-line signal (reuse pre-allocated buffer)
+        // Build the full 525-line signal (reuse pre-allocated buffer)
         self.signal.fill(BLANKING_V);
 
         write_blanking_structure(&mut self.signal);
@@ -192,10 +211,9 @@ impl Encoder {
         }
     }
 
-    /// RGB to YIQ conversion + resampling + field interleaving in one pass.
-    fn resample_yiq_interleaved(&mut self, frame_rgb: &[u8], width: usize) {
+    /// Resample field 1 (even visible lines) from RGB to YIQ.
+    fn resample_yiq_field1(&mut self, frame_rgb: &[u8], width: usize) {
         for field_row in 0..240 {
-            // Field 1 (even visible lines)
             let vis_even = field_row * 2;
             let src_row = self.src_rows_f1[field_row];
             write_yiq_row(
@@ -203,8 +221,12 @@ impl Encoder {
                 &mut self.y_all, &mut self.i_all, &mut self.q_all,
                 vis_even, &self.x0s, &self.x1s, &self.ts,
             );
+        }
+    }
 
-            // Field 2 (odd visible lines)
+    /// Resample field 2 (odd visible lines) from RGB to YIQ.
+    fn resample_yiq_field2(&mut self, frame_rgb: &[u8], width: usize) {
+        for field_row in 0..240 {
             let vis_odd = field_row * 2 + 1;
             let src_row = self.src_rows_f2[field_row];
             write_yiq_row(

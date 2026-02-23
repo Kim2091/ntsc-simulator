@@ -11,6 +11,8 @@ clap = { version = "4", features = ["derive"] }
 image = "0.25"
 indicatif = "0.17"
 anyhow = "1"
+rand = "0.9"
+rand_distr = "0.5"
 
 [profile.release]
 opt-level = 3
