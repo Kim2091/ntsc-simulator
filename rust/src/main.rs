@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 
 use crate::decoder::Decoder;
 use crate::encoder::Encoder;
@@ -64,6 +65,9 @@ enum Commands {
         /// x264 preset
         #[arg(long, default_value = "fast")]
         preset: String,
+        /// Number of parallel worker threads (default: all logical cores)
+        #[arg(long)]
+        threads: Option<usize>,
     },
 }
 
@@ -86,7 +90,8 @@ fn main() {
             comb_1h,
             crf,
             preset,
-        } => cmd_roundtrip(&input, &output, width, height, comb_1h, crf, &preset),
+            threads,
+        } => cmd_roundtrip(&input, &output, width, height, comb_1h, crf, &preset, threads),
     }
 }
 
@@ -143,6 +148,7 @@ fn cmd_roundtrip(
     comb_1h: bool,
     crf: u32,
     preset: &str,
+    threads: Option<usize>,
 ) {
     let out_w = width as usize;
     let out_h = height as usize;
@@ -217,11 +223,23 @@ fn cmd_roundtrip(
     let encoder = Encoder::new();
     let decoder = Decoder::new();
 
-    let mut frame_buf = vec![0u8; frame_bytes];
+    let num_cpus = threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    });
+    let batch_size = num_cpus;
+    eprintln!("  Batch size: {} (parallel frames)", batch_size);
+
+    // Disable rayon's internal row-level parallelism — with frame-level
+    // parallelism we want one frame per thread for maximum throughput.
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_cpus)
+        .build_global()
+        .ok(); // ignore error if pool already initialized
+
     let mut frame_num = 0u32;
     let total_start = Instant::now();
-    let mut total_encode_ms = 0.0f64;
-    let mut total_decode_ms = 0.0f64;
 
     let pb = if total_frames > 0 {
         let pb = ProgressBar::new(total_frames as u64);
@@ -243,37 +261,48 @@ fn cmd_roundtrip(
     };
 
     loop {
-        // Read one frame
-        match reader_buf.read_exact(&mut frame_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => {
-                eprintln!("Read error: {}", e);
-                break;
+        // Read a batch of frames
+        let mut batch: Vec<(Vec<u8>, u32)> = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            let mut frame_buf = vec![0u8; frame_bytes];
+            match reader_buf.read_exact(&mut frame_buf) {
+                Ok(()) => {
+                    batch.push((frame_buf, frame_num + batch.len() as u32));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => {
+                    eprintln!("Read error: {}", e);
+                    break;
+                }
             }
         }
 
-        // Encode
-        let t0 = Instant::now();
-        let signal = encoder.encode_frame(&frame_buf, in_w, in_h, frame_num);
-        total_encode_ms += t0.elapsed().as_secs_f64() * 1000.0;
-
-        // Decode
-        let t0 = Instant::now();
-        let result_rgb = decoder.decode_frame(&signal, frame_num, out_w, out_h, comb_1h);
-        total_decode_ms += t0.elapsed().as_secs_f64() * 1000.0;
-
-        // Write frame
-        writer_buf.write_all(&result_rgb).expect("write failed");
-
-        frame_num += 1;
-        pb.inc(1);
-
-        if frame_num % 10 == 0 {
-            let elapsed = total_start.elapsed().as_secs_f64();
-            let fps_actual = frame_num as f64 / elapsed;
-            pb.set_message(format!("{:.1} fps", fps_actual));
+        if batch.is_empty() {
+            break;
         }
+
+        let batch_len = batch.len() as u32;
+
+        // Process all frames in the batch in parallel
+        let results: Vec<Vec<u8>> = batch
+            .par_iter()
+            .map(|(frame_buf, fnum)| {
+                let signal = encoder.encode_frame(frame_buf, in_w, in_h, *fnum);
+                decoder.decode_frame(&signal, *fnum, out_w, out_h, comb_1h)
+            })
+            .collect();
+
+        // Write results in order
+        for result in &results {
+            writer_buf.write_all(result).expect("write failed");
+        }
+
+        frame_num += batch_len;
+        pb.inc(batch_len as u64);
+
+        let elapsed = total_start.elapsed().as_secs_f64();
+        let fps_actual = frame_num as f64 / elapsed;
+        pb.set_message(format!("{:.1} fps", fps_actual));
     }
 
     pb.finish_and_clear();
@@ -284,12 +313,10 @@ fn cmd_roundtrip(
 
     let total_elapsed = total_start.elapsed().as_secs_f64();
     eprintln!(
-        "Done: {} frames in {:.1}s ({:.1} fps, enc {:.1}ms + dec {:.1}ms avg)",
+        "Done: {} frames in {:.1}s ({:.1} fps)",
         frame_num,
         total_elapsed,
         frame_num as f64 / total_elapsed,
-        total_encode_ms / frame_num.max(1) as f64,
-        total_decode_ms / frame_num.max(1) as f64,
     );
 
     // Mux audio from source

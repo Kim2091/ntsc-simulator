@@ -3,8 +3,6 @@
 use crate::constants::*;
 use crate::filters::{self, FilterKernel};
 
-use rayon::prelude::*;
-
 const RIGHT_PAD: usize = NUM_TAPS;
 
 /// Precomputed data for the decoder (reuse across frames).
@@ -98,7 +96,7 @@ impl Decoder {
         }
 
         // Lowpass luma at 4.2 MHz
-        filters::filter_rows_parallel(&self.luma_filter, &mut y_full, spl);
+        filters::filter_rows_sequential(&self.luma_filter, &mut y_full, spl);
 
         // Undo composite voltage scaling on luma
         for v in &mut y_full {
@@ -141,33 +139,31 @@ impl Decoder {
         let mut i_raw = vec![0.0f32; VISIBLE_LINES * iq_padded_len];
         let mut q_raw = vec![0.0f32; VISIBLE_LINES * iq_padded_len];
 
-        i_raw
-            .par_chunks_mut(iq_padded_len)
-            .zip(q_raw.par_chunks_mut(iq_padded_len))
-            .enumerate()
-            .for_each(|(vis, (i_row, q_row))| {
-                let abs_line = self.abs_lines[vis];
-                let line_phase = std::f32::consts::PI * abs_line as f32;
-                let bp = burst_phases[vis];
-                let chroma_base = vis * spl;
+        for vis in 0..VISIBLE_LINES {
+            let abs_line = self.abs_lines[vis];
+            let line_phase = std::f32::consts::PI * abs_line as f32;
+            let bp = burst_phases[vis];
+            let chroma_base = vis * spl;
+            let i_base = vis * iq_padded_len;
+            let q_base = vis * iq_padded_len;
 
-                for n in 0..spl {
-                    let full_omega = omega * n as f32 + line_phase + bp;
-                    let chroma_val = chroma_full[chroma_base + n];
-                    i_row[n] = 2.0 * chroma_val * (full_omega + I_PHASE_RAD).cos();
-                    q_row[n] = 2.0 * chroma_val * (full_omega + Q_PHASE_RAD).cos();
-                }
+            for n in 0..spl {
+                let full_omega = omega * n as f32 + line_phase + bp;
+                let chroma_val = chroma_full[chroma_base + n];
+                i_raw[i_base + n] = 2.0 * chroma_val * (full_omega + I_PHASE_RAD).cos();
+                q_raw[q_base + n] = 2.0 * chroma_val * (full_omega + Q_PHASE_RAD).cos();
+            }
 
-                // Reflect padding on right
-                for j in 0..RIGHT_PAD {
-                    i_row[spl + j] = i_row[spl - 2 - j];
-                    q_row[spl + j] = q_row[spl - 2 - j];
-                }
-            });
+            // Reflect padding on right
+            for j in 0..RIGHT_PAD {
+                i_raw[i_base + spl + j] = i_raw[i_base + spl - 2 - j];
+                q_raw[q_base + spl + j] = q_raw[q_base + spl - 2 - j];
+            }
+        }
 
         // Low-pass filter I and Q
-        filters::filter_rows_parallel(&self.i_filter, &mut i_raw, iq_padded_len);
-        filters::filter_rows_parallel(&self.q_filter, &mut q_raw, iq_padded_len);
+        filters::filter_rows_sequential(&self.i_filter, &mut i_raw, iq_padded_len);
+        filters::filter_rows_sequential(&self.q_filter, &mut q_raw, iq_padded_len);
 
         // Crop to active region and convert YIQ -> RGB
         let mut rgb_float = vec![0.0f32; VISIBLE_LINES * ACTIVE_SAMPLES * 3];

@@ -3,8 +3,6 @@
 use crate::constants::*;
 use crate::filters::{self, FilterKernel, NtscFilters};
 
-use rayon::prelude::*;
-
 const PAD: usize = NUM_TAPS;
 const PADDED_ACTIVE: usize = ACTIVE_SAMPLES + 2 * PAD;
 
@@ -86,9 +84,9 @@ impl Encoder {
         let mut i_padded = pad_edge_2d(&i_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD);
         let mut q_padded = pad_edge_2d(&q_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD);
 
-        filters::filter_rows_parallel(&self.active_filters.luma, &mut y_padded, PADDED_ACTIVE);
-        filters::filter_rows_parallel(&self.active_filters.i_channel, &mut i_padded, PADDED_ACTIVE);
-        filters::filter_rows_parallel(&self.active_filters.q_channel, &mut q_padded, PADDED_ACTIVE);
+        filters::filter_rows_sequential(&self.active_filters.luma, &mut y_padded, PADDED_ACTIVE);
+        filters::filter_rows_sequential(&self.active_filters.i_channel, &mut i_padded, PADDED_ACTIVE);
+        filters::filter_rows_sequential(&self.active_filters.q_channel, &mut q_padded, PADDED_ACTIVE);
 
         // Unpad
         unpad_2d(&y_padded, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut y_all);
@@ -103,34 +101,32 @@ impl Encoder {
         // Using carrier LUT optimization: cos(ω*n + φ) cycles through 4-element pattern
         let mut active_voltage = vec![0.0f32; VISIBLE_LINES * ACTIVE_SAMPLES];
 
-        active_voltage
-            .par_chunks_mut(ACTIVE_SAMPLES)
-            .enumerate()
-            .for_each(|(vis_line, row)| {
-                let abs_line = if vis_line % 2 == 0 {
-                    20 + vis_line / 2
-                } else {
-                    283 + vis_line / 2
-                };
-                let line_phase = std::f32::consts::PI * abs_line as f32 + frame_phase;
+        for vis_line in 0..VISIBLE_LINES {
+            let abs_line = if vis_line % 2 == 0 {
+                20 + vis_line / 2
+            } else {
+                283 + vis_line / 2
+            };
+            let line_phase = std::f32::consts::PI * abs_line as f32 + frame_phase;
 
-                let y_row = &y_all[vis_line * ACTIVE_SAMPLES..(vis_line + 1) * ACTIVE_SAMPLES];
-                let i_row = &i_all[vis_line * ACTIVE_SAMPLES..(vis_line + 1) * ACTIVE_SAMPLES];
-                let q_row = &q_all[vis_line * ACTIVE_SAMPLES..(vis_line + 1) * ACTIVE_SAMPLES];
+            let y_row = &y_all[vis_line * ACTIVE_SAMPLES..(vis_line + 1) * ACTIVE_SAMPLES];
+            let i_row = &i_all[vis_line * ACTIVE_SAMPLES..(vis_line + 1) * ACTIVE_SAMPLES];
+            let q_row = &q_all[vis_line * ACTIVE_SAMPLES..(vis_line + 1) * ACTIVE_SAMPLES];
+            let row = &mut active_voltage[vis_line * ACTIVE_SAMPLES..(vis_line + 1) * ACTIVE_SAMPLES];
 
-                for n in 0..ACTIVE_SAMPLES {
-                    let sample_idx = ACTIVE_START + n;
-                    let phase = omega * sample_idx as f32 + line_phase;
-                    let i_carrier = (phase + I_PHASE_RAD).cos();
-                    let q_carrier = (phase + Q_PHASE_RAD).cos();
-                    let chroma = i_row[n] * i_carrier + q_row[n] * q_carrier;
-                    row[n] = (y_row[n] + chroma) * COMPOSITE_SCALE + COMPOSITE_OFFSET;
-                }
-            });
+            for n in 0..ACTIVE_SAMPLES {
+                let sample_idx = ACTIVE_START + n;
+                let phase = omega * sample_idx as f32 + line_phase;
+                let i_carrier = (phase + I_PHASE_RAD).cos();
+                let q_carrier = (phase + Q_PHASE_RAD).cos();
+                let chroma = i_row[n] * i_carrier + q_row[n] * q_carrier;
+                row[n] = (y_row[n] + chroma) * COMPOSITE_SCALE + COMPOSITE_OFFSET;
+            }
+        }
 
         // 7. VSB filter: 4.2 MHz lowpass on composite
         let mut av_padded = pad_edge_2d(&active_voltage, VISIBLE_LINES, ACTIVE_SAMPLES, PAD);
-        filters::filter_rows_parallel(&self.vsb_filter, &mut av_padded, PADDED_ACTIVE);
+        filters::filter_rows_sequential(&self.vsb_filter, &mut av_padded, PADDED_ACTIVE);
         unpad_2d(
             &av_padded,
             VISIBLE_LINES,

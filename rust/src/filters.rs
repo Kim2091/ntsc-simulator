@@ -154,6 +154,19 @@ pub fn filter_rows_parallel(kernel: &FilterKernel, data: &mut [f32], row_len: us
     });
 }
 
+/// Apply zero-phase FFT filter to multiple rows sequentially (single-threaded).
+/// Use this when frame-level parallelism is already saturating all cores.
+pub fn filter_rows_sequential(kernel: &FilterKernel, data: &mut [f32], row_len: usize) {
+    let mut planner = FftPlanner::new();
+    let mut scratch = Vec::with_capacity(kernel.fft_n());
+    let mut output = vec![0.0f32; row_len];
+
+    for row in data.chunks_mut(row_len) {
+        apply_filter_kernel(kernel, row, &mut output, &mut scratch, &mut planner);
+        row.copy_from_slice(&output[..row.len()]);
+    }
+}
+
 /// Precomputed filter set for the standard NTSC filters.
 pub struct NtscFilters {
     pub luma: FilterKernel,
