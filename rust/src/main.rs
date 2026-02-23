@@ -6,6 +6,7 @@ mod encoder;
 mod filters;
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -18,6 +19,36 @@ use crate::constants::SAMPLE_RATE;
 use crate::decoder::Decoder;
 use crate::effects::SignalEffects;
 use crate::encoder::Encoder;
+
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "ts", "mts", "m2ts", "mpg", "mpeg"];
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp"];
+
+/// List files in a directory filtered by extension (case-insensitive), sorted by name.
+fn iter_files(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| extensions.iter().any(|&ex| ex.eq_ignore_ascii_case(ext)))
+                .unwrap_or(false)
+        })
+        .map(|e| e.path())
+        .collect();
+    files.sort_by(|a, b| {
+        a.file_name().unwrap().to_ascii_lowercase().cmp(&b.file_name().unwrap().to_ascii_lowercase())
+    });
+    files
+}
+
+/// Build an output path by joining the output directory with the input filename.
+fn batch_output_path(output_dir: &Path, input_path: &Path) -> PathBuf {
+    output_dir.join(input_path.file_name().unwrap())
+}
 
 #[derive(Parser)]
 #[command(name = "ntsc-composite-simulator")]
@@ -62,7 +93,7 @@ impl EffectsArgs {
 enum Commands {
     /// Roundtrip a single image through the NTSC composite pipeline
     Image {
-        /// Input image file (PNG, JPG, etc.)
+        /// Input image file or directory of images
         input: String,
         /// Output image file
         #[arg(short, long, default_value = "output.png")]
@@ -81,7 +112,7 @@ enum Commands {
     },
     /// Encode video to composite and decode back (roundtrip)
     Roundtrip {
-        /// Input video file
+        /// Input video file or directory of videos
         input: String,
         /// Output video file
         #[arg(short, long, default_value = "output.mp4")]
@@ -143,7 +174,29 @@ fn main() -> Result<()> {
             height,
             comb_1h,
             effects,
-        } => cmd_image(&input, &output, width, height, comb_1h, &effects),
+        } => {
+            if Path::new(&input).is_dir() {
+                let files = iter_files(Path::new(&input), IMAGE_EXTENSIONS);
+                if files.is_empty() {
+                    bail!("No image files found in '{}'", input);
+                }
+                let output_dir = Path::new(&output);
+                std::fs::create_dir_all(output_dir)?;
+                eprintln!("Batch image: {} file(s) -> '{}'", files.len(), output);
+                for (i, path) in files.iter().enumerate() {
+                    let out_path = batch_output_path(output_dir, path);
+                    let prefix = format!("[{}/{}] {}", i + 1, files.len(),
+                        path.file_name().unwrap().to_string_lossy());
+                    cmd_image(
+                        &path.to_string_lossy(), &out_path.to_string_lossy(),
+                        width, height, comb_1h, &effects, &prefix,
+                    )?;
+                }
+                Ok(())
+            } else {
+                cmd_image(&input, &output, width, height, comb_1h, &effects, "")
+            }
+        }
         Commands::Roundtrip {
             input,
             output,
@@ -156,10 +209,41 @@ fn main() -> Result<()> {
             telecine,
             effects,
         } => {
-            if telecine {
-                cmd_roundtrip_telecine(&input, &output, width, height, comb_1h, crf, &preset, threads, &effects)
+            if Path::new(&input).is_dir() {
+                let files = iter_files(Path::new(&input), VIDEO_EXTENSIONS);
+                if files.is_empty() {
+                    bail!("No video files found in '{}'", input);
+                }
+                let output_dir = Path::new(&output);
+                std::fs::create_dir_all(output_dir)?;
+                eprintln!("Batch roundtrip: {} file(s) -> '{}'", files.len(), output);
+
+                // Initialize thread pool once before batch loop
+                let num_cpus = resolve_threads(threads);
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_cpus)
+                    .build_global()
+                    .ok();
+
+                for (i, path) in files.iter().enumerate() {
+                    let out_path = batch_output_path(output_dir, path);
+                    let prefix = format!("[{}/{}] {}", i + 1, files.len(),
+                        path.file_name().unwrap().to_string_lossy());
+                    let inp = path.to_string_lossy();
+                    let outp = out_path.to_string_lossy();
+                    if telecine {
+                        cmd_roundtrip_telecine(&inp, &outp, width, height, comb_1h, crf, &preset, threads, &effects, &prefix)?;
+                    } else {
+                        cmd_roundtrip(&inp, &outp, width, height, comb_1h, crf, &preset, threads, &effects, &prefix)?;
+                    }
+                }
+                Ok(())
             } else {
-                cmd_roundtrip(&input, &output, width, height, comb_1h, crf, &preset, threads, &effects)
+                if telecine {
+                    cmd_roundtrip_telecine(&input, &output, width, height, comb_1h, crf, &preset, threads, &effects, "")
+                } else {
+                    cmd_roundtrip(&input, &output, width, height, comb_1h, crf, &preset, threads, &effects, "")
+                }
             }
         }
         Commands::Colorbars {
@@ -180,6 +264,7 @@ fn cmd_image(
     height: Option<u32>,
     comb_1h: bool,
     effects_args: &EffectsArgs,
+    prefix: &str,
 ) -> Result<()> {
     let img = image::open(input).with_context(|| format!("Cannot open image '{}'", input))?;
 
@@ -192,6 +277,9 @@ fn cmd_image(
 
     let fx = effects_args.to_signal_effects();
 
+    if !prefix.is_empty() {
+        eprintln!("{}", prefix);
+    }
     eprintln!("Input: {} ({}x{})", input, w, h);
     eprintln!("Encoding to composite signal...");
 
@@ -320,6 +408,7 @@ fn cmd_roundtrip(
     preset: &str,
     threads: Option<usize>,
     effects_args: &EffectsArgs,
+    prefix: &str,
 ) -> Result<()> {
     let out_w = width as usize;
     let out_h = height as usize;
@@ -358,7 +447,7 @@ fn cmd_roundtrip(
     let mut frame_num = 0u32;
     let total_start = Instant::now();
 
-    let pb = make_progress_bar(total_frames);
+    let pb = make_progress_bar(total_frames, prefix);
 
     use std::cell::RefCell;
     thread_local! {
@@ -472,6 +561,7 @@ fn cmd_roundtrip_telecine(
     preset: &str,
     threads: Option<usize>,
     effects_args: &EffectsArgs,
+    prefix: &str,
 ) -> Result<()> {
     let out_w = width as usize;
     let out_h = height as usize;
@@ -510,7 +600,7 @@ fn cmd_roundtrip_telecine(
     let mut film_idx = 0u32;
     let total_start = Instant::now();
 
-    let pb = make_progress_bar(total_frames);
+    let pb = make_progress_bar(total_frames, prefix);
 
     use std::cell::RefCell;
     thread_local! {
@@ -652,12 +742,13 @@ fn resolve_threads(threads: Option<usize>) -> usize {
     })
 }
 
-fn make_progress_bar(total_frames: usize) -> ProgressBar {
+fn make_progress_bar(total_frames: usize, prefix: &str) -> ProgressBar {
+    let label = if prefix.is_empty() { "Processing" } else { prefix };
     if total_frames > 0 {
         let pb = ProgressBar::new(total_frames as u64);
         pb.set_style(
             ProgressStyle::with_template(
-                "Processing {bar:40.cyan/blue} {pos}/{len} [{elapsed_precise}<{eta_precise}, {msg}]",
+                &format!("{label} {{bar:40.cyan/blue}} {{pos}}/{{len}} [{{elapsed_precise}}<{{eta_precise}}, {{msg}}]"),
             )
             .unwrap()
             .progress_chars("##-"),
@@ -667,7 +758,7 @@ fn make_progress_bar(total_frames: usize) -> ProgressBar {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
             ProgressStyle::with_template(
-                "Processing {spinner} {pos} frames [{elapsed_precise}, {msg}]",
+                &format!("{label} {{spinner}} {{pos}} frames [{{elapsed_precise}}, {{msg}}]"),
             )
             .unwrap(),
         );
