@@ -93,6 +93,25 @@ struct EffectsArgs {
     /// Horizontal jitter std dev in subcarrier cycles
     #[arg(long)]
     jitter: Option<f32>,
+    // ── VHS tape-path effects ──
+    /// VHS luma bandwidth in MHz (SP ≈ 3.0, EP/SLP ≈ 1.6)
+    #[arg(long)]
+    vhs_luma_bw: Option<f32>,
+    /// Color-under chroma bandwidth in kHz (typical 300–500)
+    #[arg(long)]
+    color_under_bw: Option<f32>,
+    /// Average tape dropouts per frame (e.g. 2–20)
+    #[arg(long)]
+    tape_dropout_rate: Option<f32>,
+    /// Average dropout length in microseconds
+    #[arg(long, default_value = "15.0")]
+    tape_dropout_len: f32,
+    /// Edge peaking / ringing gain (e.g. 0.5–3.0)
+    #[arg(long)]
+    edge_ringing: Option<f32>,
+    /// Luminance-dependent noise amplitude (e.g. 0.02–0.10)
+    #[arg(long)]
+    luma_noise: Option<f32>,
 }
 
 impl EffectsArgs {
@@ -140,6 +159,12 @@ impl EffectsArgs {
             ghosts,
             attenuation: self.attenuation,
             jitter: self.jitter,
+            vhs_luma_bw: self.vhs_luma_bw.map(|m| m * 1e6),
+            color_under_bw: self.color_under_bw.map(|k| k * 1e3),
+            tape_dropout_rate: self.tape_dropout_rate,
+            tape_dropout_len: self.tape_dropout_len,
+            edge_ringing: self.edge_ringing,
+            luma_noise: self.luma_noise,
         }
     }
 }
@@ -525,6 +550,12 @@ fn cmd_roundtrip(
     let fx_ghosts = fx.ghosts.clone();
     let fx_attenuation = fx.attenuation;
     let fx_jitter = fx.jitter;
+    let fx_vhs_luma_bw = fx.vhs_luma_bw;
+    let fx_color_under_bw = fx.color_under_bw;
+    let fx_tape_dropout_rate = fx.tape_dropout_rate;
+    let fx_tape_dropout_len = fx.tape_dropout_len;
+    let fx_edge_ringing = fx.edge_ringing;
+    let fx_luma_noise = fx.luma_noise;
 
     loop {
         let mut batch_count = 0usize;
@@ -565,6 +596,12 @@ fn cmd_roundtrip(
                                     ghosts: fx_ghosts.clone(),
                                     attenuation: fx_attenuation,
                                     jitter: fx_jitter,
+                                    vhs_luma_bw: fx_vhs_luma_bw,
+                                    color_under_bw: fx_color_under_bw,
+                                    tape_dropout_rate: fx_tape_dropout_rate,
+                                    tape_dropout_len: fx_tape_dropout_len,
+                                    edge_ringing: fx_edge_ringing,
+                                    luma_noise: fx_luma_noise,
                                 };
                                 let mut rng = rand::rng();
                                 fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);
@@ -677,6 +714,12 @@ fn cmd_roundtrip_telecine(
     let fx_ghosts = fx.ghosts.clone();
     let fx_attenuation = fx.attenuation;
     let fx_jitter = fx.jitter;
+    let fx_vhs_luma_bw = fx.vhs_luma_bw;
+    let fx_color_under_bw = fx.color_under_bw;
+    let fx_tape_dropout_rate = fx.tape_dropout_rate;
+    let fx_tape_dropout_len = fx.tape_dropout_len;
+    let fx_edge_ringing = fx.edge_ringing;
+    let fx_luma_noise = fx.luma_noise;
 
     loop {
         // Read groups_per_batch * 4 film frames
@@ -749,6 +792,12 @@ fn cmd_roundtrip_telecine(
                                     ghosts: fx_ghosts.clone(),
                                     attenuation: fx_attenuation,
                                     jitter: fx_jitter,
+                                    vhs_luma_bw: fx_vhs_luma_bw,
+                                    color_under_bw: fx_color_under_bw,
+                                    tape_dropout_rate: fx_tape_dropout_rate,
+                                    tape_dropout_len: fx_tape_dropout_len,
+                                    edge_ringing: fx_edge_ringing,
+                                    luma_noise: fx_luma_noise,
                                 };
                                 let mut rng = rand::rng();
                                 fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);
