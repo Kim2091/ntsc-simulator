@@ -17,7 +17,7 @@ use rayon::prelude::*;
 
 use crate::constants::SAMPLE_RATE;
 use crate::decoder::Decoder;
-use crate::effects::SignalEffects;
+use crate::effects::{GhostConfig, SignalEffects};
 use crate::encoder::Encoder;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "ts", "mts", "m2ts", "mpg", "mpeg"];
@@ -64,12 +64,29 @@ struct EffectsArgs {
     /// Gaussian noise amplitude (e.g. 0.05 = subtle, 0.2 = heavy snow)
     #[arg(long)]
     noise: Option<f32>,
-    /// Ghost amplitude 0-1
+    /// Ghost amplitude 0-1 (creates a single ghost; use --ghost-multi for
+    /// multiple reflections)
     #[arg(long)]
     ghost: Option<f32>,
     /// Ghost delay in microseconds
     #[arg(long, default_value = "2.0")]
     ghost_delay: f32,
+    /// Ghost phase shift in degrees (0 = in-phase, 180 = polarity inversion)
+    #[arg(long, default_value = "0.0")]
+    ghost_phase: f32,
+    /// Ghost HF rolloff cutoff in MHz (default 3.0)
+    #[arg(long)]
+    ghost_rolloff_mhz: Option<f32>,
+    /// Enable dynamic (time-varying) ghost amplitude
+    #[arg(long, default_value = "false")]
+    ghost_dynamic: bool,
+    /// Dynamic ghost modulation rate in Hz
+    #[arg(long, default_value = "0.5")]
+    ghost_dynamic_rate: f32,
+    /// Additional ghosts as "amp,delay_us,phase_deg" triples separated by
+    /// semicolons.  Example: --ghost-multi "0.15,4.0,180;0.08,7.5,0"
+    #[arg(long)]
+    ghost_multi: Option<String>,
     /// Signal attenuation strength 0-1 (0 = none, 1 = flat at blanking)
     #[arg(long)]
     attenuation: Option<f32>,
@@ -80,9 +97,47 @@ struct EffectsArgs {
 
 impl EffectsArgs {
     fn to_signal_effects(&self) -> SignalEffects {
+        let mut ghosts: Vec<GhostConfig> = Vec::new();
+
+        // Primary ghost from --ghost
+        if let Some(amp) = self.ghost {
+            ghosts.push(GhostConfig {
+                amplitude: amp,
+                delay_us: self.ghost_delay,
+                phase_shift: self.ghost_phase.to_radians(),
+                rolloff_hz: self.ghost_rolloff_mhz.map(|m| m as f64 * 1e6),
+                dynamic: self.ghost_dynamic,
+                dynamic_rate: self.ghost_dynamic_rate,
+            });
+        }
+
+        // Extra ghosts from --ghost-multi
+        if let Some(ref multi) = self.ghost_multi {
+            for entry in multi.split(';') {
+                let parts: Vec<&str> = entry.trim().split(',').collect();
+                if parts.len() >= 2 {
+                    let amp: f32 = parts[0].trim().parse().unwrap_or(0.0);
+                    let delay: f32 = parts[1].trim().parse().unwrap_or(2.0);
+                    let phase_deg: f32 = if parts.len() >= 3 {
+                        parts[2].trim().parse().unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    ghosts.push(GhostConfig {
+                        amplitude: amp,
+                        delay_us: delay,
+                        phase_shift: phase_deg.to_radians(),
+                        rolloff_hz: self.ghost_rolloff_mhz.map(|m| m as f64 * 1e6),
+                        dynamic: self.ghost_dynamic,
+                        dynamic_rate: self.ghost_dynamic_rate,
+                    });
+                }
+            }
+        }
+
         SignalEffects {
             noise: self.noise,
-            ghost: self.ghost.map(|amp| (amp, self.ghost_delay)),
+            ghosts,
             attenuation: self.attenuation,
             jitter: self.jitter,
         }
@@ -467,7 +522,7 @@ fn cmd_roundtrip(
 
     // Clone effects for move into closure
     let fx_noise = fx.noise;
-    let fx_ghost = fx.ghost;
+    let fx_ghosts = fx.ghosts.clone();
     let fx_attenuation = fx.attenuation;
     let fx_jitter = fx.jitter;
 
@@ -507,7 +562,7 @@ fn cmd_roundtrip(
                                 sb_ref.copy_from_slice(signal);
                                 let fx = SignalEffects {
                                     noise: fx_noise,
-                                    ghost: fx_ghost,
+                                    ghosts: fx_ghosts.clone(),
                                     attenuation: fx_attenuation,
                                     jitter: fx_jitter,
                                 };
@@ -619,7 +674,7 @@ fn cmd_roundtrip_telecine(
 
     // Clone effects for move into closure
     let fx_noise = fx.noise;
-    let fx_ghost = fx.ghost;
+    let fx_ghosts = fx.ghosts.clone();
     let fx_attenuation = fx.attenuation;
     let fx_jitter = fx.jitter;
 
@@ -691,7 +746,7 @@ fn cmd_roundtrip_telecine(
                                 sb_ref.copy_from_slice(signal);
                                 let fx = SignalEffects {
                                     noise: fx_noise,
-                                    ghost: fx_ghost,
+                                    ghosts: fx_ghosts.clone(),
                                     attenuation: fx_attenuation,
                                     jitter: fx_jitter,
                                 };
