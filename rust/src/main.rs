@@ -112,6 +112,15 @@ struct EffectsArgs {
     /// Luminance-dependent noise amplitude (e.g. 0.02–0.10)
     #[arg(long)]
     luma_noise: Option<f32>,
+    /// Head-wear symmetric smear strength (0.3–1.0).  Worn-head box blur
+    /// that varies in bands across the frame.
+    #[arg(long)]
+    head_smear: Option<f32>,
+    /// Tape trailing / causal rightward smear strength (0.3–1.0).  The
+    /// classic worn-tape look where edges and noise leave a rightward
+    /// “comet tail”.
+    #[arg(long)]
+    tape_trail: Option<f32>,
 }
 
 impl EffectsArgs {
@@ -165,6 +174,8 @@ impl EffectsArgs {
             tape_dropout_len: self.tape_dropout_len,
             edge_ringing: self.edge_ringing,
             luma_noise: self.luma_noise,
+            head_switching_smear: self.head_smear,
+            tape_trail_smear: self.tape_trail,
         }
     }
 }
@@ -556,6 +567,8 @@ fn cmd_roundtrip(
     let fx_tape_dropout_len = fx.tape_dropout_len;
     let fx_edge_ringing = fx.edge_ringing;
     let fx_luma_noise = fx.luma_noise;
+    let fx_head_switching_smear = fx.head_switching_smear;
+    let fx_tape_trail_smear = fx.tape_trail_smear;
 
     loop {
         let mut batch_count = 0usize;
@@ -602,6 +615,8 @@ fn cmd_roundtrip(
                                     tape_dropout_len: fx_tape_dropout_len,
                                     edge_ringing: fx_edge_ringing,
                                     luma_noise: fx_luma_noise,
+                                    head_switching_smear: fx_head_switching_smear,
+                                    tape_trail_smear: fx_tape_trail_smear,
                                 };
                                 let mut rng = rand::rng();
                                 fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);
@@ -720,6 +735,8 @@ fn cmd_roundtrip_telecine(
     let fx_tape_dropout_len = fx.tape_dropout_len;
     let fx_edge_ringing = fx.edge_ringing;
     let fx_luma_noise = fx.luma_noise;
+    let fx_head_switching_smear = fx.head_switching_smear;
+    let fx_tape_trail_smear = fx.tape_trail_smear;
 
     loop {
         // Read groups_per_batch * 4 film frames
@@ -798,6 +815,8 @@ fn cmd_roundtrip_telecine(
                                     tape_dropout_len: fx_tape_dropout_len,
                                     edge_ringing: fx_edge_ringing,
                                     luma_noise: fx_luma_noise,
+                                    head_switching_smear: fx_head_switching_smear,
+                                    tape_trail_smear: fx_tape_trail_smear,
                                 };
                                 let mut rng = rand::rng();
                                 fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);

@@ -95,6 +95,19 @@ pub struct SignalEffects {
     /// areas, mimicking real VHS tape noise characteristics.
     /// `None` = no luma-dependent noise.
     pub luma_noise: Option<f32>,
+    /// Head-wear smearing strength (e.g. 0.3–1.0).  Simulates the
+    /// horizontal smudging caused by worn heads / degraded tape oxide
+    /// from repeated playback.  Applies a per-line variable-width
+    /// box blur whose width drifts slowly across groups of lines.
+    /// `None` = no head-wear smearing.
+    pub head_switching_smear: Option<f32>,
+    /// Tape trailing / causal smear strength (e.g. 0.3–1.0).  Simulates
+    /// the rightward-only horizontal smudge caused by the causal low-pass
+    /// response of worn VHS playback electronics.  Uses a one-pole IIR
+    /// (exponential moving average) so edges and noise leave a "comet
+    /// tail" trailing to the right — the classic worn-tape look.
+    /// `None` = no trailing smear.
+    pub tape_trail_smear: Option<f32>,
 }
 
 impl SignalEffects {
@@ -108,6 +121,8 @@ impl SignalEffects {
             || self.tape_dropout_rate.is_some()
             || self.edge_ringing.is_some()
             || self.luma_noise.is_some()
+            || self.head_switching_smear.is_some()
+            || self.tape_trail_smear.is_some()
     }
 
     /// Apply all active effects to the signal in-place.
@@ -115,9 +130,13 @@ impl SignalEffects {
     /// Processing order:
     ///   1. VHS tape-path (luma BW + color-under) — fundamental recording limits
     ///   2. Edge ringing — playback circuit detail enhancement
-    ///   3. Luminance-dependent noise — tape media noise
-    ///   4. Tape dropout — physical oxide damage
-    ///   5. Gaussian noise / ghosting / attenuation / jitter — reception effects
+    ///   3. Head-wear smearing — worn head / degraded oxide blur
+    ///   4. Luminance-dependent noise — tape media noise
+    ///   5. Tape dropout — physical oxide damage
+    ///   6. Gaussian noise — reception snow
+    ///   7. Tape trailing — causal rightward luma smudge (after noise so
+    ///      noise gets smeared too)
+    ///   8. Ghosting / attenuation / jitter — reception effects
     pub fn apply(&self, signal: &mut [f32], sample_rate: f64, rng: &mut impl Rng) {
         // VHS tape-path effects (must come first)
         if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {
@@ -126,15 +145,21 @@ impl SignalEffects {
         if let Some(gain) = self.edge_ringing {
             apply_edge_ringing(signal, gain, sample_rate);
         }
+        if let Some(strength) = self.head_switching_smear {
+            apply_head_wear_smear(signal, strength, rng);
+        }
         if let Some(amp) = self.luma_noise {
             apply_luma_noise(signal, amp, sample_rate, rng);
         }
         if let Some(rate) = self.tape_dropout_rate {
             apply_tape_dropout(signal, rate, self.tape_dropout_len, sample_rate, rng);
         }
-        // Original reception-path effects
         if let Some(amp) = self.noise {
             apply_noise(signal, amp, rng);
+        }
+        // Tape trail after noise so the rightward smear catches noise too
+        if let Some(strength) = self.tape_trail_smear {
+            apply_tape_trail_smear(signal, strength);
         }
         if !self.ghosts.is_empty() {
             apply_ghosting(signal, &self.ghosts, sample_rate, rng);
@@ -601,6 +626,181 @@ fn apply_luma_noise(
             let luma_level = ((signal[base + n] - BLANKING_V) / 0.66).clamp(0.0, 1.0);
             let noise_scale = 1.0 - 0.7 * luma_level;
             signal[base + n] += amplitude * noise_scale * noise_line[n];
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Head-wear smearing (symmetric box blur)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Simulate the horizontal smudging artifact caused by worn video heads and
+/// degraded tape oxide from repeated playback.
+///
+/// Real worn-tape smearing has a distinctive look:
+///   - It varies **slowly** from line to line (smooth vertical coherence),
+///     because the head-to-tape contact quality changes gradually as the
+///     head sweeps across the tape.
+///   - Some regions of the frame are clear while others are heavily smeared,
+///     producing "patches" or "bands" of blur.
+///   - The smeared regions shift slightly from frame to frame (random seed).
+///
+/// The box blur is applied only to the **luma** component (separated via
+/// the 2-sample comb) so the color subcarrier is preserved.
+///
+/// Implementation: a per-line running-average (box filter) whose kernel
+/// width is modulated by a sum of low-frequency sinusoids across line
+/// number, creating smooth bands of varying smear intensity.
+fn apply_head_wear_smear(signal: &mut [f32], strength: f32, rng: &mut impl Rng) {
+    let spl = SAMPLES_PER_LINE;
+    if signal.len() < TOTAL_LINES * spl {
+        return;
+    }
+
+    // Maximum blur radius in samples.  At strength=1.0 the worst lines get
+    // a ~32-sample box blur (~2.2 µs at 14.3 MHz), which is quite visible.
+    let max_radius = (strength * 32.0).max(1.0) as usize;
+
+    // Build a per-line smear-width map using 3 incommensurate sinusoids
+    // so the blur amount drifts smoothly with interesting, non-repeating
+    // variation across the frame.
+    let phase1: f32 = rng.random::<f32>() * std::f32::consts::TAU;
+    let phase2: f32 = rng.random::<f32>() * std::f32::consts::TAU;
+    let phase3: f32 = rng.random::<f32>() * std::f32::consts::TAU;
+
+    // Frequencies chosen so the "beats" span 40–120 lines
+    let freq1 = std::f32::consts::TAU / 73.0;
+    let freq2 = std::f32::consts::TAU / 127.0;
+    let freq3 = std::f32::consts::TAU / 41.0;
+
+    let mut luma = vec![0.0f32; spl];
+    let mut chroma = vec![0.0f32; spl];
+    let mut luma_active = vec![0.0f32; ACTIVE_SAMPLES];
+
+    for line in 0..TOTAL_LINES {
+        let t = line as f32;
+
+        // Envelope in [0, 1] — peaks are where the smear is worst
+        let env = ((freq1 * t + phase1).sin() * 0.5
+            + (freq2 * t + phase2).sin() * 0.3
+            + (freq3 * t + phase3).sin() * 0.2)
+            .clamp(0.0, 1.0);
+
+        let radius = (env * max_radius as f32) as usize;
+        if radius == 0 {
+            continue;
+        }
+
+        let base = line * spl;
+        if base + spl > signal.len() {
+            break;
+        }
+
+        // ── Separate luma and chroma via 2-sample comb ──
+        luma[0] = signal[base];
+        luma[1] = signal[base + 1];
+        chroma[0] = 0.0;
+        chroma[1] = 0.0;
+        for n in 2..spl {
+            let cur = signal[base + n];
+            let delayed = signal[base + n - 2];
+            luma[n] = (cur + delayed) * 0.5;
+            chroma[n] = (cur - delayed) * 0.5;
+        }
+
+        // ── Box-blur the luma active region only ──
+        let act_len = ACTIVE_SAMPLES;
+        luma_active[..act_len].copy_from_slice(&luma[ACTIVE_START..ACTIVE_START + act_len]);
+
+        // Prefix sums for O(1) box filter per sample
+        let mut prefix = vec![0.0f32; act_len + 1];
+        for i in 0..act_len {
+            prefix[i + 1] = prefix[i] + luma_active[i];
+        }
+
+        for i in 0..act_len {
+            let lo = if i >= radius { i - radius } else { 0 };
+            let hi = (i + radius + 1).min(act_len);
+            let count = (hi - lo) as f32;
+            luma[ACTIVE_START + i] = (prefix[hi] - prefix[lo]) / count;
+        }
+
+        // ── Recombine: blurred luma + original chroma ──
+        for n in 0..spl {
+            signal[base + n] = luma[n] + chroma[n];
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tape trailing (causal rightward smear)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Simulate the rightward-only horizontal smudge from worn VHS playback
+/// electronics and degraded tape.
+///
+/// Unlike the symmetric box blur of `apply_head_wear_smear`, this effect
+/// is **causal** — it only trails to the right.  This matches the real
+/// physics: the VHS head reads the tape in one direction and the limited
+/// playback bandwidth acts as a one-pole IIR low-pass filter that can only
+/// "remember" past (left-of) samples.  The result is:
+///
+///   - Sharp edges leave a decaying "comet tail" to the right.
+///   - Noise is smudged into soft horizontal streaks instead of dots.
+///
+/// The IIR is applied only to the **luma** component of the composite
+/// signal (separated via the 2-sample comb) so that the color subcarrier
+/// is preserved.  This prevents color washout and dot-crawl artifacts.
+///
+/// The effect is applied **uniformly** to every scanline because it models
+/// the playback circuit's bandwidth limitation, not head-to-tape contact
+/// variation (that's what `head_switching_smear` is for).
+///
+/// `strength` controls how heavy the trailing is (0.3 = subtle, 1.0 = heavy).
+fn apply_tape_trail_smear(signal: &mut [f32], strength: f32) {
+    let spl = SAMPLES_PER_LINE;
+    if signal.len() < TOTAL_LINES * spl {
+        return;
+    }
+
+    // α controls the IIR: y[n] = α·x[n] + (1−α)·y[n−1]
+    // Smaller α → heavier trailing.  Map strength 0–1 to α 0.85–0.15.
+    let alpha = 1.0 - strength.clamp(0.0, 1.0) * 0.70;
+    let one_minus_alpha = 1.0 - alpha;
+
+    let mut luma = vec![0.0f32; spl];
+    let mut chroma = vec![0.0f32; spl];
+
+    for line in 0..TOTAL_LINES {
+        let base = line * spl;
+        if base + spl > signal.len() {
+            break;
+        }
+
+        // ── Separate luma and chroma via 2-sample comb ──
+        luma[0] = signal[base];
+        luma[1] = signal[base + 1];
+        chroma[0] = 0.0;
+        chroma[1] = 0.0;
+        for n in 2..spl {
+            let cur = signal[base + n];
+            let delayed = signal[base + n - 2];
+            luma[n] = (cur + delayed) * 0.5;
+            chroma[n] = (cur - delayed) * 0.5;
+        }
+
+        // ── Causal IIR on luma only (active region) ──
+        let act_start = ACTIVE_START;
+        let act_end = ACTIVE_START + ACTIVE_SAMPLES;
+        let mut prev = luma[act_start];
+        for n in (act_start + 1)..act_end {
+            prev = alpha * luma[n] + one_minus_alpha * prev;
+            luma[n] = prev;
+        }
+
+        // ── Recombine: smeared luma + original chroma ──
+        for n in 0..spl {
+            signal[base + n] = luma[n] + chroma[n];
         }
     }
 }
