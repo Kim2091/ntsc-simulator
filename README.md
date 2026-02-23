@@ -2,134 +2,184 @@
 
 Simulate the NTSC composite video signal encoding and decoding pipeline. Process video or images through an accurate analog signal path to reproduce the characteristic artifacts of NTSC television — color bleeding, rainbow cross-color, dot crawl, and chroma/luma bandwidth limitations.
 
-Available in both **Python** and **Rust** — the Rust version offers significantly faster processing with identical output.
+Available in both **Rust** (recommended) and **Python**. The Rust version offers significantly faster processing with multithreaded parallelism via rayon.
 
 ## Examples
 
 | Source | NTSC Roundtrip | Degraded Signal |
 |:---:|:---:|:---:|
 | ![Source](examples/colorbars_source.png) | ![NTSC](examples/colorbars_ntsc.png) | ![Degraded](examples/colorbars_degraded.png) |
-| Clean SMPTE color bars | After encode/decode roundtrip | `--noise 0.05 --ghost 0.15 --attenuation 0.1 --jitter 0.5` |
+| Clean SMPTE color bars | After encode/decode roundtrip | With noise, ghosting, attenuation, and jitter |
 
 ## Features
 
 - **Roundtrip** video through the full encode/decode pipeline in memory
-- **Encode** video frames into a composite NTSC signal (saved as `.npy`)
-- **Decode** a previously exported composite signal back into video
-- **Telecine** simulation with 3:2 pulldown (24p film to 480i interlaced)
+- **Telecine** simulation with 3:2 pulldown (24p film → 480i interlaced)
 - **Image** processing through the NTSC signal path
 - **SMPTE color bars** test pattern generator
-- **Signal degradation effects**: noise (snow), ghosting, attenuation, horizontal jitter
+- **Physically-motivated signal degradation**: noise (snow), multipath ghosting, attenuation, horizontal jitter
+- **Realistic multipath ghosting model**: multiple reflections, phase shift (polarity inversion), HF rolloff, sub-sample delay interpolation, dynamic amplitude modulation
 - **Two comb filter modes**: horizontal 2-sample delay (default) and 1H line-delay
-- Parallel frame processing (multiprocessing in Python, rayon in Rust)
+- Parallel frame processing (rayon in Rust, multiprocessing in Python)
 
-## Requirements
+## Building (Rust)
 
-### Python
-
-- Python 3
-- [ffmpeg](https://ffmpeg.org/) (optional, for interlaced output and audio muxing)
-
-```bash
-pip install -r requirements.txt
-```
-
-Dependencies: `numpy`, `scipy`, `opencv-python`, `tqdm`
-
-### Rust
-
-- Rust toolchain (1.70+)
-- [ffmpeg](https://ffmpeg.org/) (for video I/O)
+Requires Rust 1.70+ and [ffmpeg](https://ffmpeg.org/) on your PATH (for video I/O).
 
 ```bash
 cd rust
 cargo build --release
 ```
 
+The binary is at `rust/target/release/ntsc-composite-simulator` (`.exe` on Windows).
+
 ## Usage
 
-### Python
-
-#### Roundtrip (video through NTSC and back)
+### Roundtrip video through NTSC
 
 ```bash
-python main.py roundtrip input.mp4 -o output.mp4
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4
 ```
 
 With telecine (3:2 pulldown, interlaced 480i output):
 
 ```bash
-python main.py roundtrip input.mp4 -o output.mp4 --telecine
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --telecine
 ```
 
-#### Encode video to composite signal
+### Process a single image
 
 ```bash
-python main.py encode input.mp4 -o signal.npy
+ntsc-composite-simulator image photo.png -o ntsc_photo.png
 ```
 
-#### Decode composite signal to video
+### Generate SMPTE color bars
 
 ```bash
-python main.py decode signal.npy -o output.mp4 --width 640 --height 480
+ntsc-composite-simulator colorbars -o colorbars.png --save-source source.png
 ```
 
-#### Process a single image
+### Batch processing
+
+Pass a directory as input and a directory as output:
 
 ```bash
-python main.py image photo.png -o ntsc_photo.png
+ntsc-composite-simulator image ./input_frames/ -o ./output_frames/
+ntsc-composite-simulator roundtrip ./videos/ -o ./processed/
 ```
 
-#### Generate SMPTE color bars
-
-```bash
-python main.py colorbars -o colorbars.npy --save-source bars.png
-```
-
-#### Simulate weak signal reception
+### Simulate weak signal reception
 
 ```bash
 # Subtle snow
-python main.py image photo.png -o noisy.png --noise 0.05
+ntsc-composite-simulator image photo.png -o noisy.png --noise 0.05
 
 # Moderate degradation — all effects combined
-python main.py roundtrip input.mp4 -o degraded.mp4 --noise 0.05 --ghost 0.15 --attenuation 0.1 --jitter 0.5
+ntsc-composite-simulator roundtrip input.mp4 -o degraded.mp4 \
+  --noise 0.05 --ghost 0.15 --attenuation 0.1 --jitter 0.5
 ```
 
-### Rust
+### Realistic multipath ghosting
 
-The Rust version supports the same commands and flags. Replace `python main.py` with the compiled binary:
+The ghosting model simulates real multipath propagation with multiple reflections, phase shifts, HF rolloff, and optional dynamic amplitude variation.
 
 ```bash
-# From the rust/ directory after building:
-./target/release/ntsc-composite-simulator roundtrip input.mp4 -o output.mp4
-./target/release/ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --telecine
-./target/release/ntsc-composite-simulator image photo.png -o ntsc_photo.png
-./target/release/ntsc-composite-simulator colorbars -o colorbars.png --save-source source.png
+# Single inverted ghost off a nearby building
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+  --ghost 0.25 --ghost-delay 1.5 --ghost-phase 180
+
+# Multiple reflections with dynamic amplitude drift
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+  --ghost 0.25 --ghost-delay 1.5 --ghost-phase 180 --ghost-dynamic \
+  --ghost-multi "0.10,4.2,0;0.05,8.0,180"
+
+# Subtle, barely-visible ghosting
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+  --ghost 0.06 --ghost-delay 2.0 \
+  --ghost-multi "0.03,4.5,0;0.015,8.0,180"
+
+# Heavy distant-antenna reception with soft ghosts and snow
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+  --ghost 0.35 --ghost-delay 2.0 --ghost-phase 180 --ghost-dynamic \
+  --ghost-multi "0.20,5.0,0;0.12,9.5,180;0.06,15.0,0" \
+  --ghost-rolloff-mhz 2.5 --noise 0.04
 ```
 
-### Options
+The `--ghost-multi` flag accepts semicolon-separated ghosts, each as `amplitude,delay_us,phase_deg`:
+
+| Parameter | Meaning |
+|---|---|
+| `amplitude` | Ghost strength 0–1 (relative to direct signal) |
+| `delay_us` | Propagation delay in microseconds |
+| `phase_deg` | Phase rotation in degrees (0 = in-phase, 180 = polarity inversion) |
+
+## Options Reference
+
+### General
 
 | Flag | Commands | Description |
 |---|---|---|
 | `-o, --output` | all | Output file path |
-| `--width` | decode, roundtrip, image | Output width (default: 640) |
-| `--height` | decode, roundtrip, image | Output height (default: 480) |
-| `--telecine` | roundtrip | Enable 3:2 pulldown telecine |
-| `--comb-1h` | decode, roundtrip, image | Use 1H line-delay comb filter instead of 2-sample delay |
-| `--crf` | decode, roundtrip | x264 CRF quality, 0=lossless, 51=worst (default: 17) |
-| `--preset` | decode, roundtrip | x264 encoding preset, e.g. `ultrafast`, `fast`, `slow` (default: fast) |
-| `--threads` | roundtrip | Number of worker processes (default: auto-detect) |
-| `--noise` | decode, roundtrip, image | Snow amplitude (e.g. 0.05=subtle, 0.2=heavy) |
-| `--ghost` | decode, roundtrip, image | Ghost amplitude 0-1 (multipath echo) |
-| `--ghost-delay` | decode, roundtrip, image | Ghost delay in microseconds (default: 2.0) |
-| `--attenuation` | decode, roundtrip, image | Signal attenuation 0-1 (washed-out picture) |
-| `--jitter` | decode, roundtrip, image | Horizontal jitter in samples (timing instability) |
-| `--signal` | image | Also export the composite signal as `.npy` (Python only) |
-| `--wav` | encode, image, colorbars | Export signal as a WAV file (Python only) |
+| `--width` | roundtrip, image, colorbars | Output width (default: 640) |
+| `--height` | roundtrip, image, colorbars | Output height (default: 480) |
+| `--comb-1h` | roundtrip, image, colorbars | Use 1H line-delay comb filter instead of 2-sample delay |
 | `--save-source` | colorbars | Save the source SMPTE pattern as PNG |
 
-Run `python main.py <command> -h` or `ntsc-composite-simulator <command> -h` for full details.
+### Video encoding
+
+| Flag | Commands | Description |
+|---|---|---|
+| `--telecine` | roundtrip | Enable 3:2 pulldown telecine |
+| `--crf` | roundtrip | x264 CRF quality, 0=lossless, 51=worst (default: 17) |
+| `--preset` | roundtrip | x264 encoding preset, e.g. `ultrafast`, `fast`, `slow` (default: fast) |
+| `--lossless` | roundtrip | Lossless output (FFV1 for .mkv, x264 QP 0 for .mp4) |
+| `--threads` | roundtrip | Number of parallel worker threads (default: all logical cores) |
+
+### Signal degradation
+
+| Flag | Commands | Description |
+|---|---|---|
+| `--noise` | roundtrip, image, colorbars | Snow amplitude (0.05 = subtle, 0.2 = heavy) |
+| `--attenuation` | roundtrip, image, colorbars | Signal attenuation 0–1 (0 = none, 1 = flat at blanking) |
+| `--jitter` | roundtrip, image, colorbars | Horizontal jitter std dev in subcarrier cycles |
+
+### Ghosting (multipath)
+
+| Flag | Commands | Description |
+|---|---|---|
+| `--ghost` | roundtrip, image, colorbars | Primary ghost amplitude 0–1 |
+| `--ghost-delay` | roundtrip, image, colorbars | Primary ghost delay in µs (default: 2.0) |
+| `--ghost-phase` | roundtrip, image, colorbars | Phase shift in degrees; 180 = polarity inversion (default: 0) |
+| `--ghost-rolloff-mhz` | roundtrip, image, colorbars | HF rolloff cutoff in MHz (default: 3.0) — lower = softer ghost |
+| `--ghost-dynamic` | roundtrip, image, colorbars | Enable slow amplitude modulation (environmental drift) |
+| `--ghost-dynamic-rate` | roundtrip, image, colorbars | Dynamic modulation rate in Hz (default: 0.5) |
+| `--ghost-multi` | roundtrip, image, colorbars | Additional ghosts as `"amp,delay,phase;..."` triples |
+
+Run `ntsc-composite-simulator <command> -h` for full details.
+
+## Python Version
+
+The Python version supports the same core pipeline plus raw signal export (`encode`/`decode` commands, `.npy` and `.wav` output).
+
+### Requirements
+
+- Python 3, [ffmpeg](https://ffmpeg.org/) (optional)
+- `pip install -r requirements.txt` (numpy, scipy, opencv-python, tqdm)
+
+### Commands
+
+```bash
+python main.py roundtrip input.mp4 -o output.mp4
+python main.py roundtrip input.mp4 -o output.mp4 --telecine
+python main.py image photo.png -o ntsc_photo.png
+python main.py colorbars -o colorbars.npy --save-source bars.png
+python main.py encode input.mp4 -o signal.npy
+python main.py decode signal.npy -o output.mp4 --width 640 --height 480
+```
+
+Additional Python-only flags: `--signal` (export composite as `.npy`), `--wav` (export as WAV).
+
+Run `python main.py <command> -h` for details.
 
 ## How It Works
 
@@ -149,11 +199,21 @@ Run `python main.py <command> -h` or `ntsc-composite-simulator <command> -h` for
 4. Low-pass filter the recovered chroma channels
 5. Convert YIQ back to RGB
 
+### Ghosting Model
+
+The multipath ghosting simulation models real-world signal reflections:
+
+1. **Multiple reflections** — each ghost is an independent delayed copy of the direct signal, not derived from already-ghosted data
+2. **Sub-sample delay** — linear interpolation between adjacent samples for precise delay positioning
+3. **HF rolloff** — single-pole IIR lowpass per ghost simulates high-frequency absorption by reflective surfaces
+4. **Phase shift** — cos(φ) gain rotation; exact at 0° (in-phase) and 180° (polarity inversion, the most common real-world cases)
+5. **Dynamic amplitude** — sum-of-sinusoids LFO envelope simulates environmental variation (swaying foliage, passing vehicles)
+
 ### Signal Specifications
 
 | Parameter | Value |
 |---|---|
-| Sample rate | 14,318,180 Hz (4 x F_SC) |
+| Sample rate | 14,318,180 Hz (4 × F_SC) |
 | Color subcarrier | 3,579,545 Hz |
 | Frame rate | 29.97 fps |
 | Lines per frame | 525 (480 visible) |
