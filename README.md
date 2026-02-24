@@ -2,8 +2,6 @@
 
 Simulate the NTSC composite video signal encoding and decoding pipeline. Process video or images through an accurate analog signal path to reproduce the characteristic artifacts of NTSC television — color bleeding, rainbow cross-color, dot crawl, and chroma/luma bandwidth limitations.
 
-Available in both **Rust** (recommended) and **Python**. The Rust version offers significantly faster processing with multithreaded parallelism via rayon.
-
 ## Examples
 
 | Source | NTSC Roundtrip | Degraded Signal |
@@ -19,10 +17,12 @@ Available in both **Rust** (recommended) and **Python**. The Rust version offers
 - **SMPTE color bars** test pattern generator
 - **Physically-motivated signal degradation**: noise (snow), multipath ghosting, attenuation, horizontal jitter
 - **Realistic multipath ghosting model**: multiple reflections, phase shift (polarity inversion), HF rolloff, sub-sample delay interpolation, dynamic amplitude modulation
+- **VHS tape-path simulation**: luma bandwidth limiting, color-under chroma processing, tape dropouts, edge ringing, luminance-dependent noise, head-wear smearing, and causal rightward trailing
+- **Range parameters**: all numeric effect arguments accept `min..max` ranges — a random value is sampled per file in batch mode for natural variation
 - **Two comb filter modes**: horizontal 2-sample delay (default) and 1H line-delay
-- Parallel frame processing (rayon in Rust, multiprocessing in Python)
+- Parallel frame processing via rayon
 
-## Building (Rust)
+## Building
 
 Requires Rust 1.70+ and [ffmpeg](https://ffmpeg.org/) on your PATH (for video I/O).
 
@@ -79,6 +79,27 @@ ntsc-composite-simulator roundtrip input.mp4 -o degraded.mp4 \
   --noise 0.05 --ghost 0.15 --attenuation 0.1 --jitter 0.5
 ```
 
+### Randomized ranges (batch variation)
+
+All numeric effect arguments accept a `min..max` range. When processing a batch of files, each file gets a fresh random sample from that range, giving natural variation across the batch.
+
+```bash
+# Each image gets a different noise level between 0.02 and 0.15
+ntsc-composite-simulator image ./frames/ -o ./out/ --noise 0.02..0.15
+
+# Vary multiple effects at once
+ntsc-composite-simulator roundtrip ./videos/ -o ./processed/ \
+  --noise 0.03..0.10 --ghost 0.1..0.4 --ghost-delay 1.0..5.0 \
+  --attenuation 0.05..0.2 --jitter 0.2..0.8
+
+# VHS batch with randomized wear
+ntsc-composite-simulator roundtrip ./videos/ -o ./processed/ \
+  --vhs-luma-bw 1.6..3.0 --color-under-bw 250..450 \
+  --luma-noise 0.02..0.08 --head-smear 0.3..0.7 --tape-trail 0.2..0.6
+```
+
+A single value (e.g. `--noise 0.05`) works exactly as before. When ranges are used, the sampled values are logged to stderr for reproducibility.
+
 ### Realistic multipath ghosting
 
 The ghosting model simulates real multipath propagation with multiple reflections, phase shifts, HF rolloff, and optional dynamic amplitude variation.
@@ -93,11 +114,6 @@ ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
   --ghost 0.25 --ghost-delay 1.5 --ghost-phase 180 --ghost-dynamic \
   --ghost-multi "0.10,4.2,0;0.05,8.0,180"
 
-# Subtle, barely-visible ghosting
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
-  --ghost 0.06 --ghost-delay 2.0 \
-  --ghost-multi "0.03,4.5,0;0.015,8.0,180"
-
 # Heavy distant-antenna reception with soft ghosts and snow
 ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
   --ghost 0.35 --ghost-delay 2.0 --ghost-phase 180 --ghost-dynamic \
@@ -105,13 +121,33 @@ ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
   --ghost-rolloff-mhz 2.5 --noise 0.04
 ```
 
-The `--ghost-multi` flag accepts semicolon-separated ghosts, each as `amplitude,delay_us,phase_deg`:
+The `--ghost-multi` flag accepts semicolon-separated ghosts, each as `amplitude,delay_us,phase_deg`. Each value can also be a `min..max` range (e.g. `--ghost-multi "0.1..0.3,2.0..5.0,0..180"`):
 
 | Parameter | Meaning |
 |---|---|
 | `amplitude` | Ghost strength 0–1 (relative to direct signal) |
 | `delay_us` | Propagation delay in microseconds |
 | `phase_deg` | Phase rotation in degrees (0 = in-phase, 180 = polarity inversion) |
+
+### VHS tape simulation
+
+```bash
+# Standard SP-quality VHS dub
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+  --vhs-luma-bw 3.0 --color-under-bw 400 --luma-noise 0.04 \
+  --edge-ringing 1.0
+
+# Worn EP-mode tape with dropouts, head smear, and trailing
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+  --vhs-luma-bw 1.6 --color-under-bw 300 --luma-noise 0.06 \
+  --tape-dropout-rate 8 --head-smear 0.5 --tape-trail 0.4
+
+# Heavily degraded multi-generation dub
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+  --vhs-luma-bw 1.6 --color-under-bw 250 --luma-noise 0.08 \
+  --edge-ringing 1.5 --tape-dropout-rate 15 \
+  --head-smear 0.7 --tape-trail 0.7 --noise 0.03
+```
 
 ## Options Reference
 
@@ -135,7 +171,9 @@ The `--ghost-multi` flag accepts semicolon-separated ghosts, each as `amplitude,
 | `--lossless` | roundtrip | Lossless output (FFV1 for .mkv, x264 QP 0 for .mp4) |
 | `--threads` | roundtrip | Number of parallel worker threads (default: all logical cores) |
 
-### Signal degradation
+### Signal degradation (reception)
+
+All numeric flags below accept either a single value (e.g. `0.05`) or a `min..max` range (e.g. `0.02..0.10`). With a range, each file in a batch gets a randomly sampled value.
 
 | Flag | Commands | Description |
 |---|---|---|
@@ -155,31 +193,20 @@ The `--ghost-multi` flag accepts semicolon-separated ghosts, each as `amplitude,
 | `--ghost-dynamic-rate` | roundtrip, image, colorbars | Dynamic modulation rate in Hz (default: 0.5) |
 | `--ghost-multi` | roundtrip, image, colorbars | Additional ghosts as `"amp,delay,phase;..."` triples |
 
+### VHS tape-path effects
+
+| Flag | Commands | Description |
+|---|---|---|
+| `--vhs-luma-bw` | roundtrip, image, colorbars | Luma bandwidth in MHz (SP ≈ 3.0, EP/SLP ≈ 1.6) |
+| `--color-under-bw` | roundtrip, image, colorbars | Color-under chroma bandwidth in kHz (typical 300–500) |
+| `--edge-ringing` | roundtrip, image, colorbars | Playback peaking / ringing gain (0.5–3.0) |
+| `--luma-noise` | roundtrip, image, colorbars | Luminance-dependent tape noise amplitude (0.02–0.10) |
+| `--tape-dropout-rate` | roundtrip, image, colorbars | Average dropouts per frame (2–20) |
+| `--tape-dropout-len` | roundtrip, image, colorbars | Average dropout length in µs (default: 15.0) |
+| `--head-smear` | roundtrip, image, colorbars | Worn-head symmetric luma blur (0.3–1.0); varies in bands across the frame |
+| `--tape-trail` | roundtrip, image, colorbars | Causal rightward luma smear (0.3–1.0); the classic worn-tape trailing effect |
+
 Run `ntsc-composite-simulator <command> -h` for full details.
-
-## Python Version
-
-The Python version supports the same core pipeline plus raw signal export (`encode`/`decode` commands, `.npy` and `.wav` output).
-
-### Requirements
-
-- Python 3, [ffmpeg](https://ffmpeg.org/) (optional)
-- `pip install -r requirements.txt` (numpy, scipy, opencv-python, tqdm)
-
-### Commands
-
-```bash
-python main.py roundtrip input.mp4 -o output.mp4
-python main.py roundtrip input.mp4 -o output.mp4 --telecine
-python main.py image photo.png -o ntsc_photo.png
-python main.py colorbars -o colorbars.npy --save-source bars.png
-python main.py encode input.mp4 -o signal.npy
-python main.py decode signal.npy -o output.mp4 --width 640 --height 480
-```
-
-Additional Python-only flags: `--signal` (export composite as `.npy`), `--wav` (export as WAV).
-
-Run `python main.py <command> -h` for details.
 
 ## How It Works
 
@@ -208,6 +235,18 @@ The multipath ghosting simulation models real-world signal reflections:
 3. **HF rolloff** — single-pole IIR lowpass per ghost simulates high-frequency absorption by reflective surfaces
 4. **Phase shift** — cos(φ) gain rotation; exact at 0° (in-phase) and 180° (polarity inversion, the most common real-world cases)
 5. **Dynamic amplitude** — sum-of-sinusoids LFO envelope simulates environmental variation (swaying foliage, passing vehicles)
+
+### VHS Tape-Path Model
+
+The VHS simulation models both the recording and playback signal paths:
+
+1. **Luma bandwidth** — FIR low-pass limits luma resolution, matching the FM deviation limits of the tape format (SP vs EP/SLP)
+2. **Color-under** — chroma is heterodyned down to 629 kHz, bandwidth-limited, and heterodyned back up, severely restricting color detail
+3. **Edge ringing** — unsharp-mask peaking with intentional Gibbs-phenomenon overshoot simulates the sharpness-enhancement circuit in playback decks
+4. **Luminance-dependent noise** — band-limited noise scaled by signal darkness (darker = noisier), matching real FM tape noise characteristics
+5. **Tape dropouts** — random horizontal streaks from oxide damage; short ones flash white, longer ones trigger the dropout compensator (previous-line hold)
+6. **Head-wear smear** — variable-width symmetric box blur on luma only, modulated in slow bands across the frame to simulate uneven head-to-tape contact
+7. **Tape trailing** — causal one-pole IIR on luma only, applied as the final processing step so everything on the tape (noise, dropouts, detail) gets the characteristic rightward decay tail of worn playback electronics
 
 ### Signal Specifications
 

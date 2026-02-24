@@ -13,6 +13,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::Rng;
 use rayon::prelude::*;
 
 use crate::constants::SAMPLE_RATE;
@@ -22,6 +23,68 @@ use crate::encoder::Encoder;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "ts", "mts", "m2ts", "mpg", "mpeg"];
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp"];
+
+// ────────────────────────────────────────────────────────────────────────────
+// Range parameter support
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A parameter value that can be either a single number (e.g. `0.05`) or a
+/// `min..max` range (e.g. `0.02..0.10`).  When a range is given, a random
+/// value is sampled uniformly for each file processed in a batch.
+#[derive(Clone, Copy, Debug)]
+struct RangeParam {
+    min: f32,
+    max: f32,
+}
+
+impl RangeParam {
+    /// Sample a value — returns `min` if fixed, otherwise uniform in [min, max].
+    fn sample<R: Rng>(self, rng: &mut R) -> f32 {
+        if (self.max - self.min).abs() < f32::EPSILON {
+            self.min
+        } else {
+            rng.random_range(self.min..=self.max)
+        }
+    }
+
+    /// Sample from an `Option<RangeParam>`.
+    fn sample_opt<R: Rng>(opt: Option<RangeParam>, rng: &mut R) -> Option<f32> {
+        opt.map(|r| r.sample(rng))
+    }
+
+    /// `true` if this is a genuine range (min ≠ max).
+    fn is_range(self) -> bool {
+        (self.max - self.min).abs() > f32::EPSILON
+    }
+}
+
+impl std::str::FromStr for RangeParam {
+    type Err = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        if let Some((a, b)) = s.split_once("..") {
+            let min: f32 = a.parse()?;
+            let max: f32 = b.parse()?;
+            if max < min {
+                return Err(format!("range max ({}) must be >= min ({})", max, min).into());
+            }
+            Ok(RangeParam { min, max })
+        } else {
+            let val: f32 = s.parse()?;
+            Ok(RangeParam { min: val, max: val })
+        }
+    }
+}
+
+impl std::fmt::Display for RangeParam {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_range() {
+            write!(f, "{}..{}", self.min, self.max)
+        } else {
+            write!(f, "{}", self.min)
+        }
+    }
+}
 
 /// List files in a directory filtered by extension (case-insensitive), sorted by name.
 fn iter_files(dir: &Path, extensions: &[&str]) -> Vec<PathBuf> {
@@ -59,123 +122,202 @@ struct Cli {
 }
 
 /// Shared signal degradation effect arguments.
+///
+/// All numeric parameters accept either a single value (e.g. `0.05`) or a
+/// `min..max` range (e.g. `0.02..0.10`).  When a range is given, a random
+/// value is sampled uniformly for each file processed in a batch.
 #[derive(clap::Args, Clone)]
 struct EffectsArgs {
-    /// Gaussian noise amplitude (e.g. 0.05 = subtle, 0.2 = heavy snow)
+    /// Gaussian noise amplitude (e.g. 0.05, or 0.02..0.2 for random range)
     #[arg(long)]
-    noise: Option<f32>,
-    /// Ghost amplitude 0-1 (creates a single ghost; use --ghost-multi for
-    /// multiple reflections)
+    noise: Option<RangeParam>,
+    /// Ghost amplitude 0-1 (e.g. 0.3, or 0.1..0.5 for random range)
     #[arg(long)]
-    ghost: Option<f32>,
-    /// Ghost delay in microseconds
+    ghost: Option<RangeParam>,
+    /// Ghost delay in microseconds (e.g. 2.0, or 1.0..5.0)
     #[arg(long, default_value = "2.0")]
-    ghost_delay: f32,
-    /// Ghost phase shift in degrees (0 = in-phase, 180 = polarity inversion)
+    ghost_delay: RangeParam,
+    /// Ghost phase shift in degrees (e.g. 0, or 0..180)
     #[arg(long, default_value = "0.0")]
-    ghost_phase: f32,
-    /// Ghost HF rolloff cutoff in MHz (default 3.0)
+    ghost_phase: RangeParam,
+    /// Ghost HF rolloff cutoff in MHz (e.g. 3.0, or 2.0..4.0)
     #[arg(long)]
-    ghost_rolloff_mhz: Option<f32>,
+    ghost_rolloff_mhz: Option<RangeParam>,
     /// Enable dynamic (time-varying) ghost amplitude
     #[arg(long, default_value = "false")]
     ghost_dynamic: bool,
-    /// Dynamic ghost modulation rate in Hz
+    /// Dynamic ghost modulation rate in Hz (e.g. 0.5, or 0.2..1.0)
     #[arg(long, default_value = "0.5")]
-    ghost_dynamic_rate: f32,
+    ghost_dynamic_rate: RangeParam,
     /// Additional ghosts as "amp,delay_us,phase_deg" triples separated by
-    /// semicolons.  Example: --ghost-multi "0.15,4.0,180;0.08,7.5,0"
+    /// semicolons.  Each value may be a range (min..max).
+    /// Example: --ghost-multi "0.1..0.3,2.0..5.0,0..180;0.08,7.5,0"
     #[arg(long)]
     ghost_multi: Option<String>,
-    /// Signal attenuation strength 0-1 (0 = none, 1 = flat at blanking)
+    /// Signal attenuation strength 0-1 (e.g. 0.3, or 0.1..0.5)
     #[arg(long)]
-    attenuation: Option<f32>,
-    /// Horizontal jitter std dev in subcarrier cycles
+    attenuation: Option<RangeParam>,
+    /// Horizontal jitter std dev in subcarrier cycles (e.g. 0.5, or 0.1..1.0)
     #[arg(long)]
-    jitter: Option<f32>,
+    jitter: Option<RangeParam>,
     // ── VHS tape-path effects ──
     /// VHS luma bandwidth in MHz (SP ≈ 3.0, EP/SLP ≈ 1.6)
     #[arg(long)]
-    vhs_luma_bw: Option<f32>,
+    vhs_luma_bw: Option<RangeParam>,
     /// Color-under chroma bandwidth in kHz (typical 300–500)
     #[arg(long)]
-    color_under_bw: Option<f32>,
+    color_under_bw: Option<RangeParam>,
     /// Average tape dropouts per frame (e.g. 2–20)
     #[arg(long)]
-    tape_dropout_rate: Option<f32>,
+    tape_dropout_rate: Option<RangeParam>,
     /// Average dropout length in microseconds
     #[arg(long, default_value = "15.0")]
-    tape_dropout_len: f32,
+    tape_dropout_len: RangeParam,
     /// Edge peaking / ringing gain (e.g. 0.5–3.0)
     #[arg(long)]
-    edge_ringing: Option<f32>,
+    edge_ringing: Option<RangeParam>,
     /// Luminance-dependent noise amplitude (e.g. 0.02–0.10)
     #[arg(long)]
-    luma_noise: Option<f32>,
+    luma_noise: Option<RangeParam>,
     /// Head-wear symmetric smear strength (0.3–1.0).  Worn-head box blur
     /// that varies in bands across the frame.
     #[arg(long)]
-    head_smear: Option<f32>,
+    head_smear: Option<RangeParam>,
     /// Tape trailing / causal rightward smear strength (0.3–1.0).  The
     /// classic worn-tape look where edges and noise leave a rightward
     /// “comet tail”.
     #[arg(long)]
-    tape_trail: Option<f32>,
+    tape_trail: Option<RangeParam>,
 }
 
 impl EffectsArgs {
-    fn to_signal_effects(&self) -> SignalEffects {
+    fn to_signal_effects<R: Rng>(&self, rng: &mut R) -> SignalEffects {
         let mut ghosts: Vec<GhostConfig> = Vec::new();
 
         // Primary ghost from --ghost
-        if let Some(amp) = self.ghost {
+        if let Some(amp_range) = self.ghost {
             ghosts.push(GhostConfig {
-                amplitude: amp,
-                delay_us: self.ghost_delay,
-                phase_shift: self.ghost_phase.to_radians(),
-                rolloff_hz: self.ghost_rolloff_mhz.map(|m| m as f64 * 1e6),
+                amplitude: amp_range.sample(rng),
+                delay_us: self.ghost_delay.sample(rng),
+                phase_shift: self.ghost_phase.sample(rng).to_radians(),
+                rolloff_hz: RangeParam::sample_opt(self.ghost_rolloff_mhz, rng)
+                    .map(|m| m as f64 * 1e6),
                 dynamic: self.ghost_dynamic,
-                dynamic_rate: self.ghost_dynamic_rate,
+                dynamic_rate: self.ghost_dynamic_rate.sample(rng),
             });
         }
 
-        // Extra ghosts from --ghost-multi
+        // Extra ghosts from --ghost-multi (each value supports min..max ranges)
         if let Some(ref multi) = self.ghost_multi {
             for entry in multi.split(';') {
                 let parts: Vec<&str> = entry.trim().split(',').collect();
                 if parts.len() >= 2 {
-                    let amp: f32 = parts[0].trim().parse().unwrap_or(0.0);
-                    let delay: f32 = parts[1].trim().parse().unwrap_or(2.0);
-                    let phase_deg: f32 = if parts.len() >= 3 {
-                        parts[2].trim().parse().unwrap_or(0.0)
+                    let amp_r: RangeParam = parts[0].trim().parse()
+                        .unwrap_or(RangeParam { min: 0.0, max: 0.0 });
+                    let delay_r: RangeParam = parts[1].trim().parse()
+                        .unwrap_or(RangeParam { min: 2.0, max: 2.0 });
+                    let phase_r: RangeParam = if parts.len() >= 3 {
+                        parts[2].trim().parse()
+                            .unwrap_or(RangeParam { min: 0.0, max: 0.0 })
                     } else {
-                        0.0
+                        RangeParam { min: 0.0, max: 0.0 }
                     };
                     ghosts.push(GhostConfig {
-                        amplitude: amp,
-                        delay_us: delay,
-                        phase_shift: phase_deg.to_radians(),
-                        rolloff_hz: self.ghost_rolloff_mhz.map(|m| m as f64 * 1e6),
+                        amplitude: amp_r.sample(rng),
+                        delay_us: delay_r.sample(rng),
+                        phase_shift: phase_r.sample(rng).to_radians(),
+                        rolloff_hz: RangeParam::sample_opt(self.ghost_rolloff_mhz, rng)
+                            .map(|m| m as f64 * 1e6),
                         dynamic: self.ghost_dynamic,
-                        dynamic_rate: self.ghost_dynamic_rate,
+                        dynamic_rate: self.ghost_dynamic_rate.sample(rng),
                     });
                 }
             }
         }
 
         SignalEffects {
-            noise: self.noise,
+            noise: RangeParam::sample_opt(self.noise, rng),
             ghosts,
-            attenuation: self.attenuation,
-            jitter: self.jitter,
-            vhs_luma_bw: self.vhs_luma_bw.map(|m| m * 1e6),
-            color_under_bw: self.color_under_bw.map(|k| k * 1e3),
-            tape_dropout_rate: self.tape_dropout_rate,
-            tape_dropout_len: self.tape_dropout_len,
-            edge_ringing: self.edge_ringing,
-            luma_noise: self.luma_noise,
-            head_switching_smear: self.head_smear,
-            tape_trail_smear: self.tape_trail,
+            attenuation: RangeParam::sample_opt(self.attenuation, rng),
+            jitter: RangeParam::sample_opt(self.jitter, rng),
+            vhs_luma_bw: RangeParam::sample_opt(self.vhs_luma_bw, rng).map(|m| m * 1e6),
+            color_under_bw: RangeParam::sample_opt(self.color_under_bw, rng).map(|k| k * 1e3),
+            tape_dropout_rate: RangeParam::sample_opt(self.tape_dropout_rate, rng),
+            tape_dropout_len: self.tape_dropout_len.sample(rng),
+            edge_ringing: RangeParam::sample_opt(self.edge_ringing, rng),
+            luma_noise: RangeParam::sample_opt(self.luma_noise, rng),
+            head_switching_smear: RangeParam::sample_opt(self.head_smear, rng),
+            tape_trail_smear: RangeParam::sample_opt(self.tape_trail, rng),
+        }
+    }
+
+    fn has_any_range(&self) -> bool {
+        let check = |o: Option<RangeParam>| o.map_or(false, |r| r.is_range());
+        check(self.noise)
+            || check(self.ghost)
+            || self.ghost_delay.is_range()
+            || self.ghost_phase.is_range()
+            || check(self.ghost_rolloff_mhz)
+            || self.ghost_dynamic_rate.is_range()
+            || check(self.attenuation)
+            || check(self.jitter)
+            || check(self.vhs_luma_bw)
+            || check(self.color_under_bw)
+            || check(self.tape_dropout_rate)
+            || self.tape_dropout_len.is_range()
+            || check(self.edge_ringing)
+            || check(self.luma_noise)
+            || check(self.head_smear)
+            || check(self.tape_trail)
+    }
+
+    fn log_sampled(&self, fx: &SignalEffects) {
+        if !self.has_any_range() { return; }
+        let mut parts: Vec<String> = Vec::new();
+        macro_rules! check_opt {
+            ($label:expr, $arg:expr, $val:expr) => {
+                if $arg.map_or(false, |r| r.is_range()) {
+                    if let Some(v) = $val {
+                        parts.push(format!("{}={:.4}", $label, v));
+                    }
+                }
+            };
+        }
+        macro_rules! check_req {
+            ($label:expr, $arg:expr, $val:expr) => {
+                if $arg.is_range() {
+                    parts.push(format!("{}={:.4}", $label, $val));
+                }
+            };
+        }
+        check_opt!("noise", self.noise, fx.noise);
+        if self.ghost.map_or(false, |r| r.is_range()) {
+            if let Some(g) = fx.ghosts.first() {
+                parts.push(format!("ghost={:.4}", g.amplitude));
+            }
+        }
+        if self.ghost_delay.is_range() {
+            if let Some(g) = fx.ghosts.first() {
+                parts.push(format!("ghost_delay={:.2}", g.delay_us));
+            }
+        }
+        if self.ghost_phase.is_range() {
+            if let Some(g) = fx.ghosts.first() {
+                parts.push(format!("ghost_phase={:.1}", g.phase_shift.to_degrees()));
+            }
+        }
+        check_opt!("atten", self.attenuation, fx.attenuation);
+        check_opt!("jitter", self.jitter, fx.jitter);
+        check_opt!("vhs_bw_mhz", self.vhs_luma_bw, fx.vhs_luma_bw.map(|v| v / 1e6));
+        check_opt!("color_under_khz", self.color_under_bw, fx.color_under_bw.map(|v| v / 1e3));
+        check_opt!("dropout_rate", self.tape_dropout_rate, fx.tape_dropout_rate);
+        check_req!("dropout_len", self.tape_dropout_len, fx.tape_dropout_len);
+        check_opt!("ringing", self.edge_ringing, fx.edge_ringing);
+        check_opt!("luma_noise", self.luma_noise, fx.luma_noise);
+        check_opt!("head_smear", self.head_smear, fx.head_switching_smear);
+        check_opt!("tape_trail", self.tape_trail, fx.tape_trail_smear);
+        if !parts.is_empty() {
+            eprintln!("  Randomized: {}", parts.join(", "));
         }
     }
 }
@@ -370,7 +512,9 @@ fn cmd_image(
     let out_w = width.map(|v| v as usize).unwrap_or(w);
     let out_h = height.map(|v| v as usize).unwrap_or(h);
 
-    let fx = effects_args.to_signal_effects();
+    let mut rng = rand::rng();
+    let fx = effects_args.to_signal_effects(&mut rng);
+    effects_args.log_sampled(&fx);
 
     if !prefix.is_empty() {
         eprintln!("{}", prefix);
@@ -466,7 +610,9 @@ fn cmd_colorbars(
         eprintln!("Source pattern saved: {}", src_path);
     }
 
-    let fx = effects_args.to_signal_effects();
+    let mut rng = rand::rng();
+    let fx = effects_args.to_signal_effects(&mut rng);
+    effects_args.log_sampled(&fx);
 
     let mut encoder = Encoder::new();
     let signal = encoder.encode_frame(&bars_rgb, w, h, 0);
@@ -508,7 +654,9 @@ fn cmd_roundtrip(
 ) -> Result<()> {
     let out_w = width as usize;
     let out_h = height as usize;
-    let fx = effects_args.to_signal_effects();
+    let mut rng = rand::rng();
+    let fx = effects_args.to_signal_effects(&mut rng);
+    effects_args.log_sampled(&fx);
     let effects_active = fx.is_active();
 
     let (in_w, in_h, fps, fps_raw, total_frames) = ffprobe_video(input)?;
@@ -678,7 +826,9 @@ fn cmd_roundtrip_telecine(
 ) -> Result<()> {
     let out_w = width as usize;
     let out_h = height as usize;
-    let fx = effects_args.to_signal_effects();
+    let mut rng = rand::rng();
+    let fx = effects_args.to_signal_effects(&mut rng);
+    effects_args.log_sampled(&fx);
     let effects_active = fx.is_active();
 
     let (in_w, in_h, _input_fps, _fps_raw, total_frames) = ffprobe_video(input)?;
