@@ -559,12 +559,18 @@ fn apply_tape_dropout(
 /// characteristic of VHS sharpness enhancement.
 fn apply_edge_ringing(signal: &mut [f32], strength: f32, _sample_rate: f64) {
     let spl = SAMPLES_PER_LINE;
+    if signal.len() < TOTAL_LINES * spl {
+        return;
+    }
 
     // The peaking filter extracts detail above ~1.5 MHz.  Using many taps
     // makes the ringing more pronounced (intentionally).
     let detail_lp = filters::design_lowpass(1.5e6, RINGING_FILTER_TAPS);
 
-    let mut blurred = vec![0.0f32; spl];
+    let mut luma = vec![0.0f32; spl];
+    let mut chroma = vec![0.0f32; spl];
+    let mut luma_active = vec![0.0f32; ACTIVE_SAMPLES];
+    let mut blurred_active = vec![0.0f32; ACTIVE_SAMPLES];
     let mut scratch = Vec::new();
 
     for line in 0..TOTAL_LINES {
@@ -573,13 +579,33 @@ fn apply_edge_ringing(signal: &mut [f32], strength: f32, _sample_rate: f64) {
             break;
         }
 
-        blurred.copy_from_slice(&signal[base..base + spl]);
-        apply_fir_inplace(&mut blurred, &detail_lp, &mut scratch);
+        // Separate luma/chroma so peaking does not boost chroma amplitude
+        // (which appears as color oversaturation).
+        luma[0] = signal[base];
+        luma[1] = signal[base + 1];
+        chroma[0] = 0.0;
+        chroma[1] = 0.0;
+        for n in 2..spl {
+            let cur = signal[base + n];
+            let delayed = signal[base + n - 2];
+            luma[n] = (cur + delayed) * 0.5;
+            chroma[n] = (cur - delayed) * 0.5;
+        }
 
-        // Unsharp-mask: output = signal + gain × (signal − blurred)
+        // Apply peaking only on active picture luma.
+        luma_active.copy_from_slice(&luma[ACTIVE_START..ACTIVE_START + ACTIVE_SAMPLES]);
+        blurred_active.copy_from_slice(&luma_active);
+        apply_fir_inplace(&mut blurred_active, &detail_lp, &mut scratch);
+
+        // Unsharp-mask: output = luma + gain × (luma − lowpass(luma))
+        for n in 0..ACTIVE_SAMPLES {
+            let detail = luma_active[n] - blurred_active[n];
+            luma[ACTIVE_START + n] = luma_active[n] + strength * detail;
+        }
+
+        // Recombine peaked luma with unchanged chroma.
         for n in 0..spl {
-            let detail = signal[base + n] - blurred[n];
-            signal[base + n] += strength * detail;
+            signal[base + n] = luma[n] + chroma[n];
         }
     }
 }
