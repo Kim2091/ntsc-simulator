@@ -56,7 +56,7 @@ target/release/ntsc-gui photo.png
 ```
 
 - **Settings panel** (left): pick a preset (VHS `lq`/`mq`/`hq`, DVD, VHS legacy, or your own) and a **Playback deck** profile next to it (the deck's values win where both set something), then fine-tune in collapsible groups that follow the signal chain: DVD, Tape, Colour, Noise & dropouts, Timing, Reception, Playback deck / capture, Input / decoder / output. Native DVD frames are shown at their display aspect. Every parameter has an on/off box, a slider with its unit, a tooltip explaining what it looks like, and a **range** toggle that turns the slider into min/max. Editing marks the preset as *modified*; **Reset group** and **Reset all** go back to the preset. **Save…** / **Load…** store presets as JSON, the same format as `--preset-file`.
-- **Preview** (centre): opens with SMPTE colour bars. **Open…** or drag and drop an image, a video (one frame is previewed; scrub with the time slider), or a preset `.json`. Views: **Split** (drag the divider), **Side by side**, **After**. Zoom: **Fit**, **1×**, **2×**, **4×** (nearest neighbour; drag to pan, double-click to centre).
+- **Preview** (centre): opens with SMPTE colour bars. **Open…** or drag and drop an image, a video (one frame is previewed; scrub with the time slider), or a preset `.json`. Views: **Split** (drag the divider), **Side by side**, **After**. Zoom: **Fit**, **1×**, **2×**, **4×** (nearest neighbour), or scroll over the image to zoom from 0.25× to 16× about the cursor; drag to pan, double-click to centre.
 - **Live rendering** runs in the background, 150 ms after the last change, always on the newest settings. The status bar shows the render time and the **sampled values** that the ranges resolved to. **Seed** + **Reroll** change the random draws; **Frame** steps through frames to see per-frame effects and, with temporal coherence on, the slow drift of the tape state.
 - **Toolbar**: **Copy CLI command** copies the exact equivalent `ntsc-composite-simulator` command line, **Save PNG…** saves the processed preview, and **Process…** runs the current settings over a file or a whole folder (images, or video roundtrip: lossless by default, optional lossy CRF, encoder preset, telecine) with a progress bar and **Cancel**. Processing uses the same library code as the CLI, so the output matches the CLI with the same settings.
 
@@ -513,6 +513,7 @@ The VHS simulation models both the recording and playback signal paths:
 
 Newest first.
 
+- **GUI wheel zoom**: scroll over the preview to zoom (0.25× to 16×) about the cursor.
 - **AV1 input fallback**: AV1 sources decode with libdav1d when ffmpeg has it, otherwise with hardware decoding, so files that libaom rejects (for example an unknown level index) still load; frame-grab errors now include ffmpeg's own message.
 - **Playback deck and capture stages**: line TBC, frame TBC with a new vertical-bounce effect, recursive deck noise reduction (sequential stage), deck sharpness control, motion-adaptive 3D comb (`--comb 2sample|1h|3d`), deck profiles (`--deck`, and a "Playback deck" dropdown in the GUI).
 - **DVD presets** (`dvd-hq`, `dvd-mq`, `dvd-mq-ee`, `dvd-lq`, `dvd-interlaced`); `--vhs-preset` renamed to `--preset` (old name kept as an alias); roundtrip's x264 `--preset` is now `--x264-preset`.

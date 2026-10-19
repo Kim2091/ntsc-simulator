@@ -472,7 +472,10 @@ impl App {
             ui.label("Zoom");
             for z in [Zoom::Fit, Zoom::X1, Zoom::X2, Zoom::X4] {
                 ui.selectable_value(&mut self.viewer.zoom, z, z.label())
-                    .on_hover_text("Nearest-neighbour zoom; drag the image to pan, double-click to centre");
+                    .on_hover_text("Nearest-neighbour zoom; scroll over the image to zoom, drag to pan, double-click to centre");
+            }
+            if let Zoom::Level(_) = self.viewer.zoom {
+                ui.label(egui::RichText::new(self.viewer.zoom.label()).strong());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Process…").on_hover_text("Run these settings over a file or folder").clicked() {

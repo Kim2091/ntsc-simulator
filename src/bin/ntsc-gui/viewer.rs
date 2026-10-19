@@ -16,15 +16,24 @@ pub enum Zoom {
     X1,
     X2,
     X4,
+    /// Any other wheel zoom step, as an index into `WHEEL_LEVELS`.
+    Level(usize),
 }
 
+/// Zoom factors (image pixels to screen pixels) the mouse wheel steps through.
+const WHEEL_LEVELS: [f32; 12] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0];
+
+/// Scroll distance in points that counts as one wheel step.
+const WHEEL_STEP: f32 = 40.0;
+
 impl Zoom {
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Zoom::Fit => "Fit",
-            Zoom::X1 => "1×",
-            Zoom::X2 => "2×",
-            Zoom::X4 => "4×",
+            Zoom::Fit => "Fit".into(),
+            Zoom::X1 => "1×".into(),
+            Zoom::X2 => "2×".into(),
+            Zoom::X4 => "4×".into(),
+            Zoom::Level(i) => format!("{}×", WHEEL_LEVELS[i]),
         }
     }
 
@@ -34,6 +43,18 @@ impl Zoom {
             Zoom::X1 => Some(1.0),
             Zoom::X2 => Some(2.0),
             Zoom::X4 => Some(4.0),
+            Zoom::Level(i) => Some(WHEEL_LEVELS[i]),
+        }
+    }
+
+    /// The wheel level `i`, using the named variants where they exist so
+    /// the toolbar buttons stay highlighted.
+    fn from_level(i: usize) -> Zoom {
+        match WHEEL_LEVELS[i] {
+            f if f == 1.0 => Zoom::X1,
+            f if f == 2.0 => Zoom::X2,
+            f if f == 4.0 => Zoom::X4,
+            _ => Zoom::Level(i),
         }
     }
 }
@@ -45,21 +66,27 @@ pub struct Viewer {
     pub pan: Vec2,
     /// Divider position as a fraction of the image width.
     pub split: f32,
+    /// Scroll not yet turned into a wheel zoom step.
+    scroll_acc: f32,
 }
 
 impl Default for Viewer {
     fn default() -> Self {
-        Self { mode: ViewMode::Split, zoom: Zoom::Fit, pan: Vec2::ZERO, split: 0.5 }
+        Self { mode: ViewMode::Split, zoom: Zoom::Fit, pan: Vec2::ZERO, split: 0.5, scroll_acc: 0.0 }
+    }
+}
+
+/// Screen points per image pixel for `zoom` inside `area`.
+fn scale_for(area: Rect, size: Vec2, zoom: Zoom, ppp: f32) -> f32 {
+    match zoom.factor() {
+        Some(f) => f / ppp,
+        None => (area.width() / size.x).min(area.height() / size.y),
     }
 }
 
 /// Where an image of `size` pixels lands inside `area`.
 fn place(area: Rect, size: Vec2, zoom: Zoom, pan: Vec2, ppp: f32) -> Rect {
-    let scale = match zoom.factor() {
-        // Image pixels to screen pixels, then to points.
-        Some(f) => f / ppp,
-        None => (area.width() / size.x).min(area.height() / size.y),
-    };
+    let scale = scale_for(area, size, zoom, ppp);
     let rect = Rect::from_center_size(area.center() + pan, size * scale);
     // Snap to the pixel grid so nearest-neighbour zoom stays crisp.
     let snap = |p: Pos2| Pos2::new((p.x * ppp).round() / ppp, (p.y * ppp).round() / ppp);
@@ -89,6 +116,23 @@ impl Viewer {
         painter.rect_filled(area, 0.0, Color32::from_gray(20));
         let ppp = ui.ctx().pixels_per_point();
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+
+        if response.hovered() {
+            // In side-by-side view each half zooms about its own centre.
+            let view = match self.mode {
+                ViewMode::SideBySide => {
+                    let half = (area.width() - 8.0) / 2.0;
+                    let left = Rect::from_min_size(area.min, Vec2::new(half, area.height()));
+                    let right = Rect::from_min_size(area.min + Vec2::new(half + 8.0, 0.0), Vec2::new(half, area.height()));
+                    match response.hover_pos() {
+                        Some(p) if right.contains(p) => right,
+                        _ => left,
+                    }
+                }
+                _ => area,
+            };
+            self.wheel_zoom(ui, &response, view, size, ppp);
+        }
 
         if self.zoom == Zoom::Fit {
             self.pan = Vec2::ZERO;
@@ -155,6 +199,54 @@ impl Viewer {
         }
         if response.double_clicked() {
             self.pan = Vec2::ZERO;
+        }
+    }
+
+    /// Step the zoom with the mouse wheel, keeping the image point under the
+    /// cursor in place.  `view` is the rectangle the image is centred in.
+    fn wheel_zoom(&mut self, ui: &egui::Ui, response: &egui::Response, view: Rect, size: Vec2, ppp: f32) {
+        // Raw wheel events: one mouse notch (a "line") is one zoom step,
+        // trackpad points accumulate.
+        let delta: f32 = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::MouseWheel { unit, delta, .. } => Some(match unit {
+                        egui::MouseWheelUnit::Point => delta.y,
+                        egui::MouseWheelUnit::Line => delta.y * WHEEL_STEP,
+                        egui::MouseWheelUnit::Page => delta.y * WHEEL_STEP * 3.0,
+                    }),
+                    _ => None,
+                })
+                .sum()
+        });
+        if delta == 0.0 {
+            return;
+        }
+        self.scroll_acc += delta;
+        let steps = (self.scroll_acc / WHEEL_STEP).trunc() as i32;
+        if steps == 0 {
+            return;
+        }
+        self.scroll_acc -= steps as f32 * WHEEL_STEP;
+
+        let old_scale = scale_for(view, size, self.zoom, ppp);
+        // Current factor in image pixels to screen pixels; "Fit" counts as
+        // whatever factor it is showing at.
+        let current = old_scale * ppp;
+        let mut i = match steps > 0 {
+            true => WHEEL_LEVELS.iter().position(|&f| f > current * 1.001).unwrap_or(WHEEL_LEVELS.len() - 1),
+            false => WHEEL_LEVELS.iter().rposition(|&f| f < current * 0.999).unwrap_or(0),
+        };
+        let extra = steps.unsigned_abs() as usize - 1;
+        i = if steps > 0 { (i + extra).min(WHEEL_LEVELS.len() - 1) } else { i.saturating_sub(extra) };
+
+        self.zoom = Zoom::from_level(i);
+        let new_scale = scale_for(view, size, self.zoom, ppp);
+        let pan = if self.zoom == Zoom::Fit { Vec2::ZERO } else { self.pan };
+        if let Some(cursor) = response.hover_pos() {
+            let from_centre = cursor - view.center() - pan;
+            self.pan = cursor - view.center() - from_centre * (new_scale / old_scale);
         }
     }
 }
