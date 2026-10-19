@@ -26,7 +26,7 @@ Simulate the NTSC composite video signal encoding and decoding pipeline. Process
 
 ## Building
 
-Requires Rust 1.95+ (for the GUI; the CLI alone builds with older versions) and [ffmpeg](https://ffmpeg.org/) on your PATH (for video I/O).
+Requires Rust 1.95+ (for the GUI; the CLI alone builds with older versions) and [ffmpeg](https://ffmpeg.org/) on your PATH (for video I/O). ffmpeg/ffprobe are only ever run as separate programs; they are not linked into or shipped with this project.
 
 From the repository root:
 
@@ -58,7 +58,7 @@ target/release/ntsc-gui photo.png
 - **Settings panel** (left): pick a preset (VHS `lq`/`mq`/`hq`, VHS legacy, or your own), then fine-tune in collapsible groups that follow the signal chain: Tape, Colour, Noise & dropouts, Timing, Reception, Decoder / output. Every parameter has an on/off box, a slider with its unit, a tooltip explaining what it looks like, and a **range** toggle that turns the slider into min/max. Editing marks the preset as *modified*; **Reset group** and **Reset all** go back to the preset. **Save…** / **Load…** store presets as JSON, the same format as `--preset-file`.
 - **Preview** (centre): opens with SMPTE colour bars. **Open…** or drag and drop an image, a video (one frame is previewed; scrub with the time slider), or a preset `.json`. Views: **Split** (drag the divider), **Side by side**, **After**. Zoom: **Fit**, **1×**, **2×**, **4×** (nearest neighbour; drag to pan, double-click to centre).
 - **Live rendering** runs in the background, 150 ms after the last change, always on the newest settings. The status bar shows the render time and the **sampled values** that the ranges resolved to. **Seed** + **Reroll** change the random draws; **Frame** steps through frames to see per-frame effects and, with temporal coherence on, the slow drift of the tape state.
-- **Toolbar**: **Copy CLI command** copies the exact equivalent `ntsc-composite-simulator` command line, **Save PNG…** saves the processed preview, and **Process…** runs the current settings over a file or a whole folder (images, or video roundtrip with CRF / lossless / encoder preset / telecine) with a progress bar and **Cancel**. Processing uses the same library code as the CLI, so the output matches the CLI with the same settings.
+- **Toolbar**: **Copy CLI command** copies the exact equivalent `ntsc-composite-simulator` command line, **Save PNG…** saves the processed preview, and **Process…** runs the current settings over a file or a whole folder (images, or video roundtrip: lossless by default, optional lossy CRF, encoder preset, telecine) with a progress bar and **Cancel**. Processing uses the same library code as the CLI, so the output matches the CLI with the same settings.
 
 Optional start-up arguments: `--preset <name>`, `--view split|side|after`, `--zoom fit|1|2|4`, `--process`, `--screenshot <png>` (save a window screenshot once the preview has rendered, then exit).
 
@@ -67,14 +67,26 @@ Optional start-up arguments: `--preset <name>`, `--view split|side|after`, `--zo
 ### Roundtrip video through NTSC
 
 ```bash
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv
 ```
 
 With telecine (3:2 pulldown, interlaced 480i output):
 
 ```bash
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --telecine
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --telecine
 ```
+
+### Output quality and colour
+
+Video output is **lossless and RGB-exact by default**: `.mkv` (the default `output.mkv`) is written as FFV1 with an 8-bit RGB pixel format, `.mp4`/`.mov` as x264 RGB at QP 0. Decoding the file back to RGB gives exactly the frames the simulator produced. The old default, x264 4:2:0 at CRF 17, halves the colour resolution and smooths away the fine noise and artefacts this tool generates, which matters when the output is used as training data. It is still available with `--lossy` (and `--crf`, `--preset`).
+
+Input video is converted to RGB with the source's colour matrix and range: taken from the stream's tags when present, otherwise BT.709 for HD (720 lines or more) and BT.601 for SD, limited range except for full-range (JPEG) formats. Override with `--input-matrix 601|709` and `--input-range limited|full`. `extract-frame` saves one frame with the same conversion:
+
+```bash
+ntsc-composite-simulator extract-frame input.mp4 -o frame.png --time 12.5
+```
+
+Outputs are tagged as RGB with SMPTE 170M primaries and transfer (the NTSC decode), full range.
 
 ### Process a single image
 
@@ -135,16 +147,16 @@ The ghosting model simulates real multipath propagation with multiple reflection
 
 ```bash
 # Single inverted ghost off a nearby building
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv \
   --ghost 0.25 --ghost-delay 1.5 --ghost-phase 180
 
 # Multiple reflections with dynamic amplitude drift
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv \
   --ghost 0.25 --ghost-delay 1.5 --ghost-phase 180 --ghost-dynamic \
   --ghost-multi "0.10,4.2,0;0.05,8.0,180"
 
 # Heavy distant-antenna reception with soft ghosts and snow
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv \
   --ghost 0.35 --ghost-delay 2.0 --ghost-phase 180 --ghost-dynamic \
   --ghost-multi "0.20,5.0,0;0.12,9.5,180;0.06,15.0,0" \
   --ghost-rolloff-mhz 2.5 --noise 0.04
@@ -162,17 +174,17 @@ The `--ghost-multi` flag accepts semicolon-separated ghosts, each as `amplitude,
 
 ```bash
 # Standard SP-quality VHS dub
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv \
   --vhs-luma-bw 3.0 --color-under-bw 400 --luma-noise 0.04 \
   --edge-ringing 1.0
 
 # Worn EP-mode tape with dropouts, head smear, and trailing
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv \
   --vhs-luma-bw 1.6 --color-under-bw 300 --luma-noise 0.06 \
   --tape-dropout-rate 8 --head-smear 0.5 --tape-trail 0.4
 
 # Heavily degraded multi-generation dub
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv \
   --vhs-luma-bw 1.6 --color-under-bw 250 --luma-noise 0.08 \
   --edge-ringing 1.5 --tape-dropout-rate 15 \
   --head-smear 0.7 --tape-trail 0.7 --noise 0.03
@@ -189,13 +201,13 @@ ntsc-composite-simulator image photo.png -o vhs.png \
 
 ```bash
 # Worn EP-mode tape
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --vhs-preset lq
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --vhs-preset lq
 
 # Typical tape, but without the closed-caption dashes
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --vhs-preset mq --vbi-data 0
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --vhs-preset mq --vbi-data 0
 
 # The original tape-path-only look
-ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --vhs-preset legacy-mq
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --vhs-preset legacy-mq
 ```
 
 There are two families:
@@ -260,9 +272,11 @@ There are two families:
 | Flag | Commands | Description |
 |---|---|---|
 | `--telecine` | roundtrip | Enable 3:2 pulldown telecine |
-| `--crf` | roundtrip | x264 CRF quality, 0=lossless, 51=worst (default: 17) |
+| `--lossy` | roundtrip | Lossy x264 4:2:0 output at `--crf` instead of the lossless default |
+| `--crf` | roundtrip | x264 CRF quality with `--lossy`, 0=lossless, 51=worst (default: 17) |
 | `--preset` | roundtrip | x264 encoding preset, e.g. `ultrafast`, `fast`, `slow` (default: fast) |
-| `--lossless` | roundtrip | Lossless output (FFV1 for .mkv, x264 QP 0 for .mp4) |
+| `--input-matrix` | roundtrip, extract-frame | Source colour matrix: `auto` (tag, else BT.709 for HD / BT.601 for SD), `601`, `709` |
+| `--input-range` | roundtrip, extract-frame | Source range: `auto` (tag, else limited), `limited`, `full` |
 | `--threads` | roundtrip | Number of parallel worker threads (default: all logical cores) |
 
 ### Signal degradation (reception)

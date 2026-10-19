@@ -112,7 +112,7 @@ impl Group {
             Group::NoiseDropouts => "Noise & dropouts",
             Group::Timing => "Timing",
             Group::Reception => "Reception",
-            Group::Output => "Decoder / output",
+            Group::Output => "Input / decoder / output",
         }
     }
 }
@@ -130,6 +130,8 @@ pub enum Kind {
     Flag,
     /// Free text.
     Text,
+    /// One of a fixed list of options; `default` applies when unset.
+    Choice { options: &'static [&'static str], default: &'static str },
 }
 
 /// Description of one parameter, shared by the CLI and the GUI.
@@ -404,6 +406,25 @@ pub static SPECS: &[ParamSpec] = &[
         kind: num(0.0, 1.0, 1.0),
     },
     ParamSpec {
+        id: "input-matrix",
+        label: "Input colour matrix",
+        help: "Colour matrix used to convert source video to RGB. auto: the stream's colour tag if present, \
+               otherwise BT.709 for HD (720 lines or more) and BT.601 for SD. Wrong matrices shift hues slightly \
+               (e.g. greens and reds).",
+        unit: "",
+        group: Group::Output,
+        kind: Kind::Choice { options: &["auto", "601", "709"], default: "auto" },
+    },
+    ParamSpec {
+        id: "input-range",
+        label: "Input range",
+        help: "Value range of source video. auto: the stream's tag if present, otherwise limited (16–235) \
+               except for full-range (JPEG) pixel formats. A wrong range makes the picture washed out or crushed.",
+        unit: "",
+        group: Group::Output,
+        kind: Kind::Choice { options: &["auto", "limited", "full"], default: "auto" },
+    },
+    ParamSpec {
         id: "legacy-burst-phase",
         label: "Legacy burst phase",
         help: "Decode with the inverted burst phase estimate of older builds. With --seed, reproduces output from builds before fb47e5c exactly.",
@@ -443,6 +464,7 @@ pub struct ParamValues {
     pub numbers: BTreeMap<&'static str, RangeParam>,
     pub flags: BTreeMap<&'static str, bool>,
     pub texts: BTreeMap<&'static str, String>,
+    pub choices: BTreeMap<&'static str, &'static str>,
     /// Seed for every random choice; `None` = fresh entropy each run.
     pub seed: Option<u64>,
 }
@@ -467,9 +489,23 @@ impl ParamValues {
         self.texts.get(id).map(String::as_str)
     }
 
+    /// The chosen option for `id`: the set value, else the spec default.
+    pub fn choice(&self, id: &str) -> &'static str {
+        if let Some(v) = self.choices.get(id) {
+            return v;
+        }
+        match spec(id).map(|s| s.kind) {
+            Some(Kind::Choice { default, .. }) => default,
+            _ => "",
+        }
+    }
+
     /// `true` if `id` was set explicitly (not just defaulted).
     pub fn is_set(&self, id: &str) -> bool {
-        self.numbers.contains_key(id) || self.flags.contains_key(id) || self.texts.contains_key(id)
+        self.numbers.contains_key(id)
+            || self.flags.contains_key(id)
+            || self.texts.contains_key(id)
+            || self.choices.contains_key(id)
     }
 
     /// Set a value from its text form (as on the command line).  Flags
@@ -492,6 +528,14 @@ impl ParamValues {
             Kind::Text => {
                 self.texts.insert(spec.id, value.to_string());
             }
+            Kind::Choice { options, .. } => {
+                let v = value.trim();
+                let opt = options
+                    .iter()
+                    .find(|o| o.eq_ignore_ascii_case(v))
+                    .ok_or_else(|| format!("--{}: '{}' is not one of {}", id, v, options.join(", ")))?;
+                self.choices.insert(spec.id, opt);
+            }
         }
         Ok(())
     }
@@ -507,6 +551,9 @@ impl ParamValues {
         }
         for (k, v) in &other.texts {
             self.texts.entry(k).or_insert_with(|| v.clone());
+        }
+        for (k, v) in &other.choices {
+            self.choices.entry(k).or_insert(v);
         }
         if self.seed.is_none() {
             self.seed = other.seed;
@@ -712,6 +759,12 @@ impl ParamValues {
                     if let Some(t) = self.texts.get(spec.id) {
                         args.push(format!("--{}", spec.id));
                         args.push(t.clone());
+                    }
+                }
+                Kind::Choice { .. } => {
+                    if let Some(c) = self.choices.get(spec.id) {
+                        args.push(format!("--{}", spec.id));
+                        args.push(c.to_string());
                     }
                 }
             }

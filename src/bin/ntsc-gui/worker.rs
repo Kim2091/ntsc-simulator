@@ -100,10 +100,11 @@ pub fn grab_frame_async(
     ctx: egui::Context,
     path: PathBuf,
     time_s: f64,
+    values: ParamValues,
 ) -> Receiver<Result<SourceImage, String>> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        let r = pipeline::grab_video_frame(&path, time_s)
+        let r = pipeline::grab_video_frame(&path, time_s, &values)
             .map(|(rgb, w, h)| SourceImage { rgb, w, h })
             .map_err(|e| format!("{:#}", e));
         let _ = tx.send(r);

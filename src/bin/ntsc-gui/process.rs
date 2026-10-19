@@ -73,7 +73,7 @@ pub struct ProcessDialog {
     output: String,
     kind: JobKind,
     crf: u32,
-    lossless: bool,
+    lossy: bool,
     telecine: bool,
     x264_preset: String,
     job: Option<Job>,
@@ -89,7 +89,7 @@ impl Default for ProcessDialog {
             output: String::new(),
             kind: JobKind::Image,
             crf: 17,
-            lossless: false,
+            lossy: false,
             telecine: false,
             x264_preset: "fast".into(),
             job: None,
@@ -119,7 +119,7 @@ fn suggest_output(input: &Path, kind: JobKind) -> PathBuf {
     }
     let ext = match kind {
         JobKind::Image => "png".to_string(),
-        JobKind::Video => input.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mp4".into()),
+        JobKind::Video => "mkv".to_string(),
     };
     parent.join(format!("{}_ntsc.{}", stem, ext))
 }
@@ -216,10 +216,11 @@ impl ProcessDialog {
                         if self.kind == JobKind::Video {
                             ui.label("Quality");
                             ui.horizontal(|ui| {
-                                ui.add_enabled(!self.lossless, egui::Slider::new(&mut self.crf, 0..=51).text("CRF"))
-                                    .on_hover_text("x264 CRF: 0 = lossless, 17 = visually lossless, 51 = worst");
-                                ui.checkbox(&mut self.lossless, "Lossless")
-                                    .on_hover_text("FFV1 for .mkv, x264 QP 0 for .mp4");
+                                ui.checkbox(&mut self.lossy, "Lossy (x264 4:2:0)").on_hover_text(
+                                    "Off (default): lossless RGB, FFV1 in .mkv or x264 RGB QP 0 in .mp4, so nothing                                      the simulation produces is lost. On: smaller x264 4:2:0 files at the CRF below,                                      which halves colour resolution and smooths noise.",
+                                );
+                                ui.add_enabled(self.lossy, egui::Slider::new(&mut self.crf, 0..=51).text("CRF"))
+                                    .on_hover_text("x264 CRF: 17 = visually lossless, 51 = worst");
                             });
                             ui.end_row();
                             ui.label("Encoder");
@@ -309,7 +310,8 @@ impl ProcessDialog {
             comb_1h: s.comb_1h,
             crf: self.crf,
             preset: self.x264_preset.clone(),
-            lossless: self.lossless,
+            lossy: self.lossy,
+            raw_copy: None,
             threads: None,
             telecine: self.telecine,
         };

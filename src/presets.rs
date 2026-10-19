@@ -219,6 +219,11 @@ pub fn preset_to_json(preset: &Preset) -> String {
                     params.insert(spec.id.to_string(), serde_json::Value::String(t.clone()));
                 }
             }
+            Kind::Choice { .. } => {
+                if let Some(c) = v.choices.get(spec.id) {
+                    params.insert(spec.id.to_string(), serde_json::Value::String(c.to_string()));
+                }
+            }
         }
     }
     let file = PresetFile { name: Some(preset.name.clone()), params, seed: preset.values.seed };

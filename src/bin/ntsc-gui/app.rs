@@ -292,7 +292,7 @@ impl App {
             let fps = pipeline::ffprobe_video(path).map(|v| v.2).unwrap_or(29.97);
             let time = (duration * 0.1).min(10.0);
             self.source = Source::Video { path: path.to_path_buf(), duration, fps, time };
-            self.grab = Some(grab_frame_async(ctx.clone(), path.to_path_buf(), time));
+            self.grab = Some(grab_frame_async(ctx.clone(), path.to_path_buf(), time, self.current_values()));
             self.frame = (time * fps).round() as u64;
             self.status = Some((true, format!("Loading frame from {}…", path.display())));
         } else {
@@ -580,6 +580,7 @@ impl App {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let values = self.current_values();
         if let Source::Video { duration, fps, time, path } = &mut self.source {
             if *duration > 0.0 {
                 let mut t = *time;
@@ -593,7 +594,7 @@ impl App {
                 *time = t;
                 if r.drag_stopped() || (r.changed() && !r.dragged()) {
                     self.frame = (t * *fps).round() as u64;
-                    self.grab = Some(grab_frame_async(ui.ctx().clone(), path.clone(), t));
+                    self.grab = Some(grab_frame_async(ui.ctx().clone(), path.clone(), t, values.clone()));
                 }
             }
         }

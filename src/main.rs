@@ -47,6 +47,9 @@ impl Args for EffectArgs {
                     .action(ArgAction::Set),
                 Kind::Flag => arg.action(ArgAction::SetTrue),
                 Kind::Text => arg.value_name("TEXT").action(ArgAction::Set),
+                Kind::Choice { options, .. } => arg
+                    .value_parser(PossibleValuesParser::new(options.iter().copied()))
+                    .action(ArgAction::Set),
             };
             cmd = cmd.arg(arg);
         }
@@ -109,6 +112,11 @@ impl FromArgMatches for EffectArgs {
                         values.texts.insert(spec.id, t.clone());
                     }
                 }
+                Kind::Choice { .. } => {
+                    if let Some(c) = m.get_one::<String>(spec.id) {
+                        values.set_from_str(spec.id, c).expect("validated by clap");
+                    }
+                }
             }
         }
         values.seed = m.get_one::<u64>("seed").copied();
@@ -166,8 +174,8 @@ enum Commands {
     Roundtrip {
         /// Input video file or directory of videos
         input: PathBuf,
-        /// Output video file
-        #[arg(short, long, default_value = "output.mp4")]
+        /// Output video file. Lossless RGB by default: .mkv/.avi (FFV1) or .mp4/.mov (x264 RGB)
+        #[arg(short, long, default_value = "output.mkv")]
         output: PathBuf,
         /// Output width
         #[arg(long, default_value = "640")]
@@ -178,15 +186,22 @@ enum Commands {
         /// Use 1H line-delay comb filter
         #[arg(long)]
         comb_1h: bool,
-        /// x264 CRF quality (0=lossless, 51=worst)
+        /// Lossy output: x264 4:2:0 at --crf. Halves chroma resolution and smooths
+        /// noise, so it is no longer the default.
+        #[arg(long)]
+        lossy: bool,
+        /// x264 CRF quality with --lossy (0=lossless, 51=worst)
         #[arg(long, default_value = "17")]
         crf: u32,
-        /// x264 preset
+        /// x264 preset (speed) for --lossy and lossless .mp4
         #[arg(long, default_value = "fast")]
         preset: String,
-        /// Lossless output (FFV1 for .mkv, x264 QP 0 for .mp4)
-        #[arg(long)]
+        /// Lossless output (the default now; kept for compatibility)
+        #[arg(long, hide = true)]
         lossless: bool,
+        /// Also write the raw RGB24 frames given to the encoder (bit-exactness checks)
+        #[arg(long, hide = true)]
+        raw_copy: Option<PathBuf>,
         /// Number of parallel worker threads (default: all logical cores)
         #[arg(long)]
         threads: Option<usize>,
@@ -195,6 +210,24 @@ enum Commands {
         telecine: bool,
         #[command(flatten)]
         effects: EffectArgs,
+    },
+    /// Extract one frame of a video as an RGB PNG, with the same colour
+    /// conversion as `roundtrip` (no effects)
+    ExtractFrame {
+        /// Input video file
+        input: PathBuf,
+        /// Output PNG
+        #[arg(short, long, default_value = "frame.png")]
+        output: PathBuf,
+        /// Time in seconds
+        #[arg(long, default_value = "0")]
+        time: f64,
+        /// Colour matrix: auto, 601 or 709
+        #[arg(long, default_value = "auto")]
+        input_matrix: String,
+        /// Range: auto, limited or full
+        #[arg(long, default_value = "auto")]
+        input_range: String,
     },
     /// Generate SMPTE color bars through the NTSC pipeline
     Colorbars {
@@ -286,10 +319,24 @@ fn main() -> Result<()> {
             pipeline::process_images(&input, &output, width, height, comb_1h, &effects.resolve()?, &progress)
         }
         Commands::Roundtrip {
-            input, output, width, height, comb_1h, crf, preset, lossless, threads, telecine, effects,
+            input, output, width, height, comb_1h, lossy, crf, preset, lossless, raw_copy, threads, telecine, effects,
         } => {
-            let opts = VideoOptions { width, height, comb_1h, crf, preset, lossless, threads, telecine };
+            let _ = lossless;
+            let opts = VideoOptions { width, height, comb_1h, crf, preset, lossy, raw_copy, threads, telecine };
             pipeline::process_videos(&input, &output, &opts, &effects.resolve()?, &progress)
+        }
+        Commands::ExtractFrame { input, output, time, input_matrix, input_range } => {
+            let mut values = ParamValues::default();
+            values.set_from_str("input-matrix", &input_matrix).map_err(anyhow::Error::msg)?;
+            values.set_from_str("input-range", &input_range).map_err(anyhow::Error::msg)?;
+            let colour = pipeline::input_colour(&input, &values);
+            let (rgb, w, h) = pipeline::grab_video_frame(&input, time, &values)?;
+            image::RgbImage::from_raw(w as u32, h as u32, rgb)
+                .context("bad frame")?
+                .save(&output)
+                .with_context(|| format!("cannot save {}", output.display()))?;
+            eprintln!("{} ({}x{}, {}) -> {}", input.display(), w, h, colour.description, output.display());
+            Ok(())
         }
         Commands::Colorbars { output, save_source, width, height, comb_1h, effects } => {
             pipeline::process_colorbars(

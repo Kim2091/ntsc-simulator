@@ -269,12 +269,16 @@ pub struct VideoOptions {
     pub width: u32,
     pub height: u32,
     pub comb_1h: bool,
-    /// x264 CRF quality (0 = lossless, 51 = worst).
+    /// x264 CRF quality (0 = lossless, 51 = worst); only with `lossy`.
     pub crf: u32,
     /// x264 preset, e.g. "fast".
     pub preset: String,
-    /// FFV1 for .mkv, x264 QP 0 for .mp4.
-    pub lossless: bool,
+    /// Lossy x264 4:2:0 output (`crf`, `preset`).  The default is lossless
+    /// RGB: FFV1 in .mkv/.avi, x264 RGB QP 0 in .mp4/.mov.
+    pub lossy: bool,
+    /// Also write the exact RGB24 frames sent to the encoder to this file
+    /// (for verifying that the output is bit-exact).
+    pub raw_copy: Option<PathBuf>,
     /// Parallel worker threads (default: all logical cores).
     pub threads: Option<usize>,
     /// 3:2 pulldown (24p film to 29.97 fps interlaced).
@@ -289,7 +293,8 @@ impl Default for VideoOptions {
             comb_1h: false,
             crf: 17,
             preset: "fast".into(),
-            lossless: false,
+            lossy: false,
+            raw_copy: None,
             threads: None,
             telecine: false,
         }
@@ -427,8 +432,9 @@ fn roundtrip(
     progress.log(&format!("Output: {} ({}x{} @ {:.3} fps)", output.display(), out_w, out_h, fps));
 
     let frame_bytes = in_w * in_h * 3;
-    let mut reader = spawn_ffmpeg_reader(input)?;
-    let mut writer = spawn_ffmpeg_writer(output, out_w, out_h, &fps_raw, &opts.preset, opts.crf, false, opts.lossless)?;
+    let mut reader = spawn_ffmpeg_reader(input, values, progress)?;
+    let mut writer = spawn_ffmpeg_writer(output, out_w, out_h, &fps_raw, opts, false)?;
+    let mut raw_copy = open_raw_copy(opts)?;
     let mut reader_buf = std::io::BufReader::new(reader.stdout.take().unwrap());
     let mut writer_buf = std::io::BufWriter::new(writer.stdin.take().unwrap());
 
@@ -476,6 +482,9 @@ fn roundtrip(
 
         for result in &results {
             writer_buf.write_all(result).context("write failed")?;
+            if let Some(raw) = raw_copy.as_mut() {
+                raw.write_all(result)?;
+            }
         }
 
         frame_num += batch_count as u32;
@@ -515,8 +524,9 @@ fn roundtrip_telecine(
     progress.log(&format!("Output: {} ({}x{} @ 29.97 fps interlaced TFF)", output.display(), out_w, out_h));
 
     let frame_bytes = in_w * in_h * 3;
-    let mut reader = spawn_ffmpeg_reader(input)?;
-    let mut writer = spawn_ffmpeg_writer(output, out_w, out_h, "30000/1001", &opts.preset, opts.crf, true, opts.lossless)?;
+    let mut reader = spawn_ffmpeg_reader(input, values, progress)?;
+    let mut writer = spawn_ffmpeg_writer(output, out_w, out_h, "30000/1001", opts, true)?;
+    let mut raw_copy = open_raw_copy(opts)?;
     let mut reader_buf = std::io::BufReader::new(reader.stdout.take().unwrap());
     let mut writer_buf = std::io::BufWriter::new(writer.stdin.take().unwrap());
 
@@ -587,6 +597,9 @@ fn roundtrip_telecine(
 
         for result in &results {
             writer_buf.write_all(result).context("write failed")?;
+            if let Some(raw) = raw_copy.as_mut() {
+                raw.write_all(result)?;
+            }
         }
 
         film_idx += film_buf.len() as u32;
@@ -613,10 +626,90 @@ fn roundtrip_telecine(
 // ffmpeg helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-fn spawn_ffmpeg_reader(input: &Path) -> Result<std::process::Child> {
+/// How the source video is converted to RGB.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputColour {
+    /// ffmpeg colour matrix name (`bt601`, `bt709`, `bt2020`), or `None`
+    /// for sources that are already RGB or grey.
+    pub matrix: Option<&'static str>,
+    /// `tv` (limited) or `pc` (full).
+    pub range: &'static str,
+    /// Human-readable summary, e.g. "BT.709 limited (tagged)".
+    pub description: String,
+}
+
+impl InputColour {
+    /// The ffmpeg filter chain that converts to RGB24.
+    pub fn filter(&self) -> String {
+        match self.matrix {
+            Some(m) => format!(
+                "scale=in_color_matrix={}:in_range={}:out_range=pc:flags=bicubic+accurate_rnd+full_chroma_int,format=rgb24",
+                m, self.range
+            ),
+            None => "format=rgb24".to_string(),
+        }
+    }
+}
+
+/// Probe a video's pixel format and colour tags and decide how to convert
+/// it to RGB, honouring the `input-matrix` / `input-range` overrides.
+///
+/// Without tags, SD (< 720 lines) is taken as BT.601 and HD as BT.709;
+/// the range defaults to limited except for full-range (`yuvj*`) formats.
+pub fn input_colour(path: &Path, values: &ParamValues) -> InputColour {
+    let mut info = std::collections::HashMap::new();
+    if let Ok(out) = tool_command("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries",
+               "stream=pix_fmt,color_space,color_range,height", "-of", "default=nw=1"])
+        .arg(path)
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some((k, v)) = line.split_once('=') {
+                info.insert(k.trim().to_string(), v.trim().to_string());
+            }
+        }
+    }
+    let get = |k: &str| info.get(k).map(String::as_str).unwrap_or("unknown");
+    let pix_fmt = get("pix_fmt");
+    let height: u32 = get("height").parse().unwrap_or(480);
+    let is_rgb = ["rgb", "bgr", "gbr", "argb", "abgr", "gray", "pal8", "ya8"]
+        .iter()
+        .any(|p| pix_fmt.starts_with(p));
+
+    let (matrix, m_note) = match values.choice("input-matrix") {
+        "601" => (Some("bt601"), "BT.601 (forced)"),
+        "709" => (Some("bt709"), "BT.709 (forced)"),
+        _ if is_rgb => (None, "RGB source"),
+        _ => match get("color_space") {
+            "bt709" => (Some("bt709"), "BT.709 (tagged)"),
+            "smpte170m" | "bt470bg" | "fcc" => (Some("bt601"), "BT.601 (tagged)"),
+            "bt2020nc" | "bt2020c" => (Some("bt2020"), "BT.2020 (tagged)"),
+            _ if height >= 720 => (Some("bt709"), "BT.709 (untagged HD)"),
+            _ => (Some("bt601"), "BT.601 (untagged SD)"),
+        },
+    };
+    let (range, r_note) = match values.choice("input-range") {
+        "limited" => ("tv", "limited (forced)"),
+        "full" => ("pc", "full (forced)"),
+        _ => match get("color_range") {
+            "tv" => ("tv", "limited (tagged)"),
+            "pc" => ("pc", "full (tagged)"),
+            _ if pix_fmt.starts_with("yuvj") => ("pc", "full (JPEG format)"),
+            _ => ("tv", "limited (untagged)"),
+        },
+    };
+    let description = if matrix.is_some() { format!("{}, {}", m_note, r_note) } else { m_note.to_string() };
+    InputColour { matrix, range, description }
+}
+
+fn spawn_ffmpeg_reader(input: &Path, values: &ParamValues, progress: &dyn Progress) -> Result<std::process::Child> {
+    let colour = input_colour(input, values);
+    progress.log(&format!("  Input colour: {}", colour.description));
     tool_command("ffmpeg")
         .arg("-i")
         .arg(input)
+        .args(["-vf", &colour.filter()])
         .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "error", "pipe:1"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -624,16 +717,64 @@ fn spawn_ffmpeg_reader(input: &Path) -> Result<std::process::Child> {
         .context("Failed to spawn ffmpeg reader. Is ffmpeg installed?")
 }
 
-#[allow(clippy::too_many_arguments)]
+fn open_raw_copy(opts: &VideoOptions) -> Result<Option<std::io::BufWriter<std::fs::File>>> {
+    opts.raw_copy
+        .as_ref()
+        .map(|p| {
+            std::fs::File::create(p)
+                .map(std::io::BufWriter::new)
+                .with_context(|| format!("cannot create {}", p.display()))
+        })
+        .transpose()
+}
+
+/// `true` if this ffmpeg build has the named encoder.
+fn has_encoder(name: &str) -> bool {
+    tool_command("ffmpeg")
+        .args(["-hide_banner", "-h", &format!("encoder={}", name)])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("Encoder {}", name)))
+        .unwrap_or(false)
+}
+
+/// Codec arguments for the output file.
+///
+/// The default is lossless and RGB-exact, because 4:2:0 YUV at CRF 17
+/// halves the chroma resolution and smooths away the noise and fine
+/// artefacts this tool simulates: FFV1 (`bgr0`) for .mkv/.avi/.nut and
+/// x264's RGB encoder at QP 0 for .mp4/.mov.  `--lossy` gives the old
+/// x264 4:2:0 CRF output.
+pub fn writer_codec_args(output: &Path, opts: &VideoOptions) -> Result<Vec<String>> {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    if opts.lossy {
+        let mut a = s(&["-c:v", "libx264", "-preset", &opts.preset, "-crf", &opts.crf.to_string(), "-pix_fmt", "yuv420p"]);
+        a.extend(s(&["-colorspace", "smpte170m", "-color_primaries", "smpte170m", "-color_trc", "smpte170m", "-color_range", "tv"]));
+        return Ok(a);
+    }
+    let ext = output.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let mut a = match ext.as_str() {
+        "mkv" | "avi" | "nut" => s(&["-c:v", "ffv1", "-level", "3", "-g", "1", "-pix_fmt", "bgr0"]),
+        "mp4" | "mov" => {
+            if !has_encoder("libx264rgb") {
+                bail!("lossless .{} output needs ffmpeg's libx264rgb encoder, which this ffmpeg lacks; \
+                       use .mkv (FFV1) or --lossy", ext);
+            }
+            s(&["-c:v", "libx264rgb", "-preset", &opts.preset, "-qp", "0", "-pix_fmt", "rgb24"])
+        }
+        _ => bail!("lossless output needs .mkv, .avi or .nut (FFV1) or .mp4/.mov (x264 RGB); use --lossy for .{}", ext),
+    };
+    // Our RGB comes from an NTSC (SMPTE 170M) decode.
+    a.extend(s(&["-colorspace", "rgb", "-color_primaries", "smpte170m", "-color_trc", "smpte170m", "-color_range", "pc"]));
+    Ok(a)
+}
+
 fn spawn_ffmpeg_writer(
     output: &Path,
     out_w: usize,
     out_h: usize,
     fps: &str,
-    preset: &str,
-    crf: u32,
+    opts: &VideoOptions,
     interlaced: bool,
-    lossless: bool,
 ) -> Result<std::process::Child> {
     let mut args: Vec<String> = vec![
         "-y".into(), "-f".into(), "rawvideo".into(), "-pix_fmt".into(), "rgb24".into(),
@@ -643,18 +784,7 @@ fn spawn_ffmpeg_writer(
     if interlaced {
         args.extend(["-vf", "setfield=tff", "-flags", "+ilme+ildct", "-top", "1"].map(String::from));
     }
-    let is_mkv = output.extension().is_some_and(|e| e.eq_ignore_ascii_case("mkv"));
-    if lossless {
-        if is_mkv {
-            // FFV1 lossless in MKV
-            args.extend(["-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv444p"].map(String::from));
-        } else {
-            // x264 lossless (QP 0) in MP4
-            args.extend(["-c:v", "libx264", "-preset", preset, "-qp", "0", "-pix_fmt", "yuv444p"].map(String::from));
-        }
-    } else {
-        args.extend(["-c:v".into(), "libx264".into(), "-preset".into(), preset.into(), "-crf".into(), crf.to_string(), "-pix_fmt".into(), "yuv420p".into()]);
-    }
+    args.extend(writer_codec_args(output, opts)?);
     args.extend(["-v".into(), "error".into()]);
 
     tool_command("ffmpeg")
@@ -704,12 +834,15 @@ pub fn video_duration(path: &Path) -> Option<f64> {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
-/// Grab one RGB frame at `time_s` seconds: (pixels, width, height).
-pub fn grab_video_frame(path: &Path, time_s: f64) -> Result<(Vec<u8>, usize, usize)> {
+/// Grab one RGB frame at `time_s` seconds, converted with the same colour
+/// handling as the video reader: (pixels, width, height).
+pub fn grab_video_frame(path: &Path, time_s: f64, values: &ParamValues) -> Result<(Vec<u8>, usize, usize)> {
     let (w, h, ..) = ffprobe_video(path)?;
+    let colour = input_colour(path, values);
     let output = tool_command("ffmpeg")
         .args(["-v", "error", "-ss", &format!("{:.3}", time_s.max(0.0)), "-i"])
         .arg(path)
+        .args(["-vf", &colour.filter()])
         .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
         .output()
         .context("Failed to run ffmpeg. Is ffmpeg installed?")?;

@@ -22,7 +22,11 @@ fn default_state(spec: &ParamSpec) -> ParamState {
         Kind::Number { typical, .. } => typical,
         _ => 0.0,
     };
-    ParamState { enabled: false, range: false, min: typical, max: typical, text: String::new() }
+    let text = match spec.kind {
+        Kind::Choice { default, .. } => default.to_string(),
+        _ => String::new(),
+    };
+    ParamState { enabled: false, range: false, min: typical, max: typical, text }
 }
 
 /// All parameter states, in the order of [`SPECS`].
@@ -51,6 +55,10 @@ impl ParamEditor {
                             st.text = t.to_string();
                         }
                     }
+                    Kind::Choice { .. } => {
+                        st.text = values.choice(spec.id).to_string();
+                        st.enabled = values.choices.contains_key(spec.id);
+                    }
                 }
                 st
             })
@@ -62,6 +70,12 @@ impl ParamEditor {
     pub fn to_values(&self) -> ParamValues {
         let mut v = ParamValues::default();
         for (spec, st) in SPECS.iter().zip(&self.states) {
+            if let Kind::Choice { default, .. } = spec.kind {
+                if st.enabled || st.text != default {
+                    let _ = v.set_from_str(spec.id, &st.text);
+                }
+                continue;
+            }
             if !st.enabled {
                 continue;
             }
@@ -80,6 +94,7 @@ impl ParamEditor {
                         v.texts.insert(spec.id, st.text.trim().to_string());
                     }
                 }
+                Kind::Choice { .. } => unreachable!(),
             }
         }
         v
@@ -183,6 +198,26 @@ fn param_ui(ui: &mut egui::Ui, spec: &ParamSpec, st: &mut ParamState) {
         }
         Kind::Flag => {
             ui.checkbox(&mut st.enabled, spec.label).on_hover_text(&tip);
+        }
+        Kind::Choice { options, .. } => {
+            ui.horizontal(|ui| {
+                ui.label(spec.label).on_hover_text(&tip);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt(spec.id)
+                        .selected_text(st.text.as_str())
+                        .width(130.0)
+                        .show_ui(ui, |ui| {
+                            for o in options {
+                                if ui.selectable_label(st.text == *o, *o).clicked() {
+                                    st.text = o.to_string();
+                                    st.enabled = true;
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(&tip);
+                });
+            });
         }
         Kind::Text => {
             ui.horizontal(|ui| {
