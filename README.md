@@ -193,6 +193,7 @@ ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --vhs-preset mq --vbi
 | `--height` | roundtrip, image, colorbars | Output height (default: 480) |
 | `--comb-1h` | roundtrip, image, colorbars | Use 1H line-delay comb filter instead of 2-sample delay |
 | `--save-source` | colorbars | Save the source SMPTE pattern as PNG |
+| `--seed` | roundtrip, image, colorbars | Seed for all random choices (sampled ranges and per-frame effects), for exactly reproducible output; in batch mode each file gets its own seed derived from it |
 
 ### Video encoding
 

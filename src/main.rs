@@ -13,7 +13,8 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
 use crate::constants::SAMPLE_RATE;
@@ -83,6 +84,28 @@ impl std::fmt::Display for RangeParam {
         } else {
             write!(f, "{}", self.min)
         }
+    }
+}
+
+/// SplitMix64 finaliser: spreads the bits of `x` over the whole word.
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Combine a seed with an index into a new, well-mixed seed.
+fn mix_seed(seed: u64, index: u64) -> u64 {
+    splitmix64(seed ^ splitmix64(index))
+}
+
+/// RNG for the effects of one frame: derived from the seed and the frame
+/// number when a seed is given, otherwise fresh entropy.
+fn frame_rng(seed: Option<u64>, frame: u64) -> StdRng {
+    match seed {
+        Some(seed) => StdRng::seed_from_u64(mix_seed(mix_seed(seed, 0x5EED), frame)),
+        None => StdRng::from_rng(&mut rand::rng()),
     }
 }
 
@@ -188,6 +211,11 @@ struct EffectsArgs {
     /// “comet tail”.
     #[arg(long)]
     tape_trail: Option<RangeParam>,
+    /// Seed for every random choice (sampled ranges and per-frame effects),
+    /// so a run can be reproduced exactly.  In batch mode each file gets
+    /// its own seed derived from this one.
+    #[arg(long)]
+    seed: Option<u64>,
     /// Head-switching noise strength (0–1).  Tears the bottom lines of
     /// each field: rightward displacement and a dark, noisy switching line.
     #[arg(long)]
@@ -226,6 +254,21 @@ fn rp(s: &str) -> RangeParam {
 }
 
 impl EffectsArgs {
+    /// RNG for the per-file sampling of range parameters.
+    fn file_rng(&self) -> StdRng {
+        match self.seed {
+            Some(seed) => StdRng::seed_from_u64(seed),
+            None => StdRng::from_rng(&mut rand::rng()),
+        }
+    }
+
+    /// Copy of these arguments for file `index` of a batch, with its own seed.
+    fn for_file(&self, index: usize) -> EffectsArgs {
+        let mut args = self.clone();
+        args.seed = self.seed.map(|s| mix_seed(s, index as u64 + 1));
+        args
+    }
+
     /// Fill every VHS flag the user did not pass with the preset's value.
     fn apply_vhs_preset(&mut self) {
         let Some(preset) = self.vhs_preset else { return };
@@ -516,7 +559,7 @@ fn main() -> Result<()> {
                         path.file_name().unwrap().to_string_lossy());
                     cmd_image(
                         &path.to_string_lossy(), &out_path.to_string_lossy(),
-                        width, height, comb_1h, &effects, &prefix,
+                        width, height, comb_1h, &effects.for_file(i), &prefix,
                     )?;
                 }
                 Ok(())
@@ -560,9 +603,9 @@ fn main() -> Result<()> {
                     let inp = path.to_string_lossy();
                     let outp = out_path.to_string_lossy();
                     if telecine {
-                        cmd_roundtrip_telecine(&inp, &outp, width, height, comb_1h, crf, &preset, lossless, threads, &effects, &prefix)?;
+                        cmd_roundtrip_telecine(&inp, &outp, width, height, comb_1h, crf, &preset, lossless, threads, &effects.for_file(i), &prefix)?;
                     } else {
-                        cmd_roundtrip(&inp, &outp, width, height, comb_1h, crf, &preset, lossless, threads, &effects, &prefix)?;
+                        cmd_roundtrip(&inp, &outp, width, height, comb_1h, crf, &preset, lossless, threads, &effects.for_file(i), &prefix)?;
                     }
                 }
                 Ok(())
@@ -603,7 +646,7 @@ fn cmd_image(
     let out_w = width.map(|v| v as usize).unwrap_or(w);
     let out_h = height.map(|v| v as usize).unwrap_or(h);
 
-    let mut rng = rand::rng();
+    let mut rng = effects_args.file_rng();
     let fx = effects_args.to_signal_effects(&mut rng);
     effects_args.log_sampled(&fx);
 
@@ -620,7 +663,7 @@ fn cmd_image(
     // Apply effects if any are active
     let signal_ref: &[f32] = if fx.is_active() {
         let mut buf = signal.to_vec();
-        let mut rng = rand::rng();
+        let mut rng = frame_rng(effects_args.seed, 0);
         fx.apply(&mut buf, SAMPLE_RATE, &mut rng);
         // Leak into a temporary that lives long enough — use a boxed slice
         // We need owned data for decode; just decode from the vec.
@@ -701,7 +744,7 @@ fn cmd_colorbars(
         eprintln!("Source pattern saved: {}", src_path);
     }
 
-    let mut rng = rand::rng();
+    let mut rng = effects_args.file_rng();
     let fx = effects_args.to_signal_effects(&mut rng);
     effects_args.log_sampled(&fx);
 
@@ -710,7 +753,7 @@ fn cmd_colorbars(
 
     let decoded = if fx.is_active() {
         let mut buf = signal.to_vec();
-        let mut rng = rand::rng();
+        let mut rng = frame_rng(effects_args.seed, 0);
         fx.apply(&mut buf, SAMPLE_RATE, &mut rng);
         let mut decoder = Decoder::new();
         decoder.decode_frame(&buf, w, h, comb_1h).to_vec()
@@ -745,7 +788,7 @@ fn cmd_roundtrip(
 ) -> Result<()> {
     let out_w = width as usize;
     let out_h = height as usize;
-    let mut rng = rand::rng();
+    let mut rng = effects_args.file_rng();
     let fx = effects_args.to_signal_effects(&mut rng);
     effects_args.log_sampled(&fx);
     let effects_active = fx.is_active();
@@ -829,7 +872,7 @@ fn cmd_roundtrip(
                                 let mut sb_ref = sb.borrow_mut();
                                 sb_ref.resize(signal.len(), 0.0);
                                 sb_ref.copy_from_slice(signal);
-                                let mut rng = rand::rng();
+                                let mut rng = frame_rng(effects_args.seed, *fnum as u64);
                                 fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);
                                 let mut dec_ref = dec.borrow_mut();
                                 dec_ref.decode_frame(&sb_ref, out_w, out_h, comb_1h).to_vec()
@@ -889,7 +932,7 @@ fn cmd_roundtrip_telecine(
 ) -> Result<()> {
     let out_w = width as usize;
     let out_h = height as usize;
-    let mut rng = rand::rng();
+    let mut rng = effects_args.file_rng();
     let fx = effects_args.to_signal_effects(&mut rng);
     effects_args.log_sampled(&fx);
     let effects_active = fx.is_active();
@@ -1003,7 +1046,7 @@ fn cmd_roundtrip_telecine(
                                 let mut sb_ref = sb.borrow_mut();
                                 sb_ref.resize(signal.len(), 0.0);
                                 sb_ref.copy_from_slice(signal);
-                                let mut rng = rand::rng();
+                                let mut rng = frame_rng(effects_args.seed, *fnum as u64);
                                 fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);
                                 let mut dec_ref = dec.borrow_mut();
                                 dec_ref.decode_frame(&sb_ref, out_w, out_h, comb_1h).to_vec()
