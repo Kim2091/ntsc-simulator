@@ -207,9 +207,7 @@ fn analog_frame(
         encode(enc, Wire::Luma, buf, f1, f2, fnum);
         encode(enc, Wire::Chroma, buf_c, f1, f2, fnum);
         if effects_active {
-            let rng = frame_rng(values.seed, fnum as u64);
-            fx.apply_wire(buf, SAMPLE_RATE, &mut rng.clone(), fnum as u64, Wire::Luma);
-            fx.apply_wire(buf_c, SAMPLE_RATE, &mut rng.clone(), fnum as u64, Wire::Chroma);
+            fx.apply_svideo(buf, buf_c, SAMPLE_RATE, &mut frame_rng(values.seed, fnum as u64), fnum as u64);
         }
         dec.decode_svideo(buf, buf_c, out_w, out_h, legacy).to_vec()
     } else {

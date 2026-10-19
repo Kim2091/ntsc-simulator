@@ -225,25 +225,38 @@ impl SignalEffects {
     ///
     /// `frame` is the frame number within the file; it drives the drifting
     /// tape state when `temporal_coherence` is above zero.
-    pub fn apply(&self, signal: &mut [f32], sample_rate: f64, rng: &mut impl Rng, frame: u64) {
+    pub fn apply(&self, signal: &mut [f32], sample_rate: f64, rng: &mut (impl Rng + Clone), frame: u64) {
         self.apply_wire(signal, sample_rate, rng, frame, Wire::Composite);
     }
 
     /// Apply the effects to one wire of the signal.
     ///
-    /// For S-Video the Y and C wires are processed separately with clones
-    /// of the same RNG.  Luma-domain effects (luma bandwidth, ringing,
-    /// smear, luma noise, caption data, trail) only change the Y wire and
+    /// For S-Video the Y and C wires are processed with clones of the same
+    /// RNG.  Luma-domain effects (luma bandwidth, ringing, smear, luma
+    /// noise, caption data, trail) only change the Y wire and
     /// chroma-domain effects (colour-under, chroma path, top band) only
     /// the C wire; effects that draw random numbers still run (on a
     /// scratch copy) on the other wire, so both wires see the same
     /// dropouts, jitter, wobble and head switching.  Composite runs
-    /// everything, exactly as `apply`.
-    pub fn apply_wire(&self, signal: &mut [f32], sample_rate: f64, rng: &mut impl Rng, frame: u64, wire: Wire) {
-        let luma_on = wire != Wire::Chroma;
-        let chroma_on = wire != Wire::Luma;
-        // The S-Video Y wire carries no chroma: luma effects act on all of it.
-        let y_wire = wire == Wire::Luma;
+    /// everything, exactly as `apply`.  [`Self::apply_svideo`] gives the
+    /// same result for both wires with less work.
+    pub fn apply_wire(&self, signal: &mut [f32], sample_rate: f64, rng: &mut (impl Rng + Clone), frame: u64, wire: Wire) {
+        self.apply_wires(&mut [(signal, wire)], sample_rate, rng, frame);
+    }
+
+    /// Apply the effects to both S-Video wires.  The result is identical
+    /// to `apply_wire` on each wire with a clone of `rng`: no effect's
+    /// random draws depend on the signal, so one RNG can serve both wires,
+    /// and an effect that belongs to one wire only runs on that wire.
+    pub fn apply_svideo(&self, y: &mut [f32], c: &mut [f32], sample_rate: f64, rng: &mut (impl Rng + Clone), frame: u64) {
+        self.apply_wires(&mut [(y, Wire::Luma), (c, Wire::Chroma)], sample_rate, rng, frame);
+    }
+
+    /// Run every effect on each of `wires` it belongs to.  An effect that
+    /// draws random numbers runs on each target wire from the same RNG
+    /// state; if no wire takes it, it runs on a scratch copy so the RNG
+    /// still advances as it would on a wire.
+    fn apply_wires<R: Rng + Clone>(&self, wires: &mut [(&mut [f32], Wire)], sample_rate: f64, rng: &mut R, frame: u64) {
         // A line TBC re-times every line from its sync and burst: it removes
         // most line-to-line timing error but not the noise at the head
         // switch.  A frame TBC holds the picture vertically.
@@ -254,103 +267,135 @@ impl SignalEffects {
             frame,
             coherence: self.temporal_coherence.clamp(0.0, 1.0),
         };
-        // Closed-caption data is on the tape before any tape-path limits.
-        // On a wire an effect does not belong to, run it on a scratch copy
-        // so the RNG advances identically on both wires.
+        let luma_on = |w: Wire| w != Wire::Chroma;
+        let chroma_on = |w: Wire| w != Wire::Luma;
+        let all = |_: Wire| true;
         let mut scratch: Vec<f32> = Vec::new();
-        macro_rules! on {
-            ($active:expr, |$s:ident| $body:expr) => {
-                if $active {
-                    let $s: &mut [f32] = signal;
-                    $body;
-                } else {
+        // Run `f(signal, wire, rng)` on the wires `active` selects, each
+        // from the current RNG state, leaving `rng` advanced past it.
+        let mut run = |wires: &mut [(&mut [f32], Wire)],
+                       rng: &mut R,
+                       active: &dyn Fn(Wire) -> bool,
+                       f: &mut dyn FnMut(&mut [f32], Wire, &mut R)| {
+            let targets: Vec<usize> = (0..wires.len()).filter(|&i| active(wires[i].1)).collect();
+            match targets.split_last() {
+                None => {
                     scratch.clear();
-                    scratch.extend_from_slice(signal);
-                    let $s: &mut [f32] = &mut scratch;
-                    $body;
+                    scratch.extend_from_slice(wires[0].0);
+                    f(&mut scratch, wires[0].1, rng);
                 }
-            };
-        }
+                Some((&last, rest)) => {
+                    for &i in rest {
+                        f(wires[i].0, wires[i].1, &mut rng.clone());
+                    }
+                    f(wires[last].0, wires[last].1, rng);
+                }
+            }
+        };
+        // Effects without random draws.
+        let each = |wires: &mut [(&mut [f32], Wire)], f: &mut dyn FnMut(&mut [f32], Wire)| {
+            for (signal, wire) in wires.iter_mut() {
+                f(signal, *wire);
+            }
+        };
+
+        // Closed-caption data is on the tape before any tape-path limits.
         if let Some(strength) = self.vbi_data {
             let _p = profile::scope("fx vbi-data");
-            on!(luma_on, |s| apply_vbi_data(s, strength, sample_rate, rng));
+            run(wires, rng, &luma_on, &mut |s, _, rng| apply_vbi_data(s, strength, sample_rate, rng));
         }
         // VHS tape-path effects
         if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {
             let _p = profile::scope("fx tape path (luma/colour-under bw)");
-            let luma_bw = if luma_on { self.vhs_luma_bw } else { None };
-            let chroma_bw = if chroma_on { self.color_under_bw } else { None };
-            apply_vhs_tape_path(signal, luma_bw, chroma_bw, sample_rate, y_wire);
+            each(wires, &mut |s, w| {
+                let luma_bw = if luma_on(w) { self.vhs_luma_bw } else { None };
+                let chroma_bw = if chroma_on(w) { self.color_under_bw } else { None };
+                apply_vhs_tape_path(s, luma_bw, chroma_bw, sample_rate, w == Wire::Luma);
+            });
         }
         let chroma_cfg = self.chroma_path_config();
         if chroma_cfg.is_active() {
             let _p = profile::scope("fx chroma path");
-            on!(chroma_on, |s| apply_chroma_path(s, &chroma_cfg, sample_rate, rng));
+            run(wires, rng, &chroma_on, &mut |s, _, rng| apply_chroma_path(s, &chroma_cfg, sample_rate, rng));
         }
         if let Some(gain) = self.edge_ringing {
             let _p = profile::scope("fx edge ringing");
-            if luma_on {
-                apply_edge_ringing(signal, gain, sample_rate, y_wire);
-            }
+            each(wires, &mut |s, w| {
+                if luma_on(w) {
+                    apply_edge_ringing(s, gain, sample_rate, w == Wire::Luma);
+                }
+            });
         }
-        if let Some(s) = self.deck_sharpness {
+        if let Some(sharpness) = self.deck_sharpness {
             let _p = profile::scope("fx deck sharpness");
-            if luma_on {
-                apply_deck_sharpness(signal, s, y_wire);
-            }
+            each(wires, &mut |s, w| {
+                if luma_on(w) {
+                    apply_deck_sharpness(s, sharpness, w == Wire::Luma);
+                }
+            });
         }
         if let Some(strength) = self.head_switching_smear {
             let _p = profile::scope("fx head smear");
-            on!(luma_on, |s| apply_head_wear_smear(s, strength, rng, &clock, y_wire));
+            run(wires, rng, &luma_on, &mut |s, w, rng| {
+                apply_head_wear_smear(s, strength, rng, &clock, w == Wire::Luma)
+            });
         }
         if let Some(amp) = self.luma_noise {
             let _p = profile::scope("fx luma noise");
-            on!(luma_on, |s| apply_luma_noise(s, amp, sample_rate, rng));
+            run(wires, rng, &luma_on, &mut |s, _, rng| apply_luma_noise(s, amp, sample_rate, rng));
         }
         if let Some(rate) = self.tape_dropout_rate {
             let _p = profile::scope("fx dropout");
-            apply_tape_dropout(signal, rate, self.tape_dropout_len, sample_rate, rng);
+            run(wires, rng, &all, &mut |s, _, rng| {
+                apply_tape_dropout(s, rate, self.tape_dropout_len, sample_rate, rng)
+            });
         }
         if let Some(amp) = self.wobble {
             let _p = profile::scope("fx wobble");
-            apply_wobble(signal, amp * (1.0 - 0.95 * tbc), self.wobble_rate, rng, &clock);
+            run(wires, rng, &all, &mut |s, _, rng| {
+                apply_wobble(s, amp * (1.0 - 0.95 * tbc), self.wobble_rate, rng, &clock)
+            });
         }
         if let Some(amp) = self.v_jitter {
             let _p = profile::scope("fx v-jitter");
-            apply_v_jitter(signal, amp * (1.0 - ftbc), rng, &clock);
+            run(wires, rng, &all, &mut |s, _, rng| apply_v_jitter(s, amp * (1.0 - ftbc), rng, &clock));
         }
         if let Some(strength) = self.top_band {
             let _p = profile::scope("fx top band");
-            on!(chroma_on, |s| apply_top_band(s, strength, rng, &clock));
+            run(wires, rng, &chroma_on, &mut |s, _, rng| apply_top_band(s, strength, rng, &clock));
         }
         if let Some(strength) = self.head_switch {
             let _p = profile::scope("fx head switch");
-            apply_head_switch(signal, strength, self.head_switch_lines, 1.0 - 0.75 * tbc, rng, &clock);
+            run(wires, rng, &all, &mut |s, _, rng| {
+                apply_head_switch(s, strength, self.head_switch_lines, 1.0 - 0.75 * tbc, rng, &clock)
+            });
         }
         if let Some(amp) = self.noise {
             let _p = profile::scope("fx noise");
-            apply_noise(signal, amp, rng);
+            run(wires, rng, &all, &mut |s, _, rng| apply_noise(s, amp, rng));
         }
         if !self.ghosts.is_empty() {
             let _p = profile::scope("fx ghosting");
-            apply_ghosting(signal, &self.ghosts, sample_rate, rng);
+            run(wires, rng, &all, &mut |s, _, rng| apply_ghosting(s, &self.ghosts, sample_rate, rng));
         }
         if let Some(strength) = self.attenuation {
             let _p = profile::scope("fx attenuation");
-            apply_attenuation(signal, strength);
+            each(wires, &mut |s, _| apply_attenuation(s, strength));
         }
         if let Some(amp) = self.jitter {
             let _p = profile::scope("fx jitter");
-            apply_jitter(signal, (amp * (1.0 - 0.95 * tbc)).max(1e-6), rng);
+            run(wires, rng, &all, &mut |s, _, rng| apply_jitter(s, (amp * (1.0 - 0.95 * tbc)).max(1e-6), rng));
         }
         // Tape trail is the very last step — the playback head's bandwidth
         // limit smears everything that's on the tape (noise, dropouts,
         // ghosts, etc.) rightward on readout.
         if let Some(strength) = self.tape_trail_smear {
             let _p = profile::scope("fx tape trail");
-            if luma_on {
-                apply_tape_trail_smear(signal, strength, y_wire);
-            }
+            each(wires, &mut |s, w| {
+                if luma_on(w) {
+                    apply_tape_trail_smear(s, strength, w == Wire::Luma);
+                }
+            });
         }
     }
 }
@@ -2268,6 +2313,47 @@ mod tests {
         apply_chroma_path(&mut sig, &off, crate::constants::SAMPLE_RATE, &mut rng);
         apply_wobble(&mut sig, 0.0, 1.0, &mut rng, &TapeClock::off());
         assert_eq!(sig, orig);
+    }
+
+    #[test]
+    fn svideo_matches_separate_wires() {
+        let fx = SignalEffects {
+            noise: Some(0.01),
+            ghosts: vec![GhostConfig { dynamic: true, ..GhostConfig::default() }],
+            jitter: Some(0.5),
+            vhs_luma_bw: Some(2.0e6),
+            color_under_bw: Some(400e3),
+            tape_dropout_rate: Some(20.0),
+            tape_dropout_len: 15.0,
+            edge_ringing: Some(0.3),
+            luma_noise: Some(0.03),
+            head_switching_smear: Some(0.5),
+            tape_trail_smear: Some(0.7),
+            head_switch: Some(0.9),
+            head_switch_lines: DEFAULT_HEAD_SWITCH_LINES,
+            top_band: Some(0.7),
+            vbi_data: Some(0.7),
+            chroma_noise: Some(0.03),
+            chroma_phase_noise: Some(3.0),
+            chroma_vblur: Some(0.6),
+            chroma_delay: Some(2.0),
+            chroma_delay_v: Some(1.0),
+            wobble: Some(1.5),
+            wobble_rate: 1.0,
+            temporal_coherence: 0.5,
+            tape_seed: 3,
+            v_jitter: Some(2.0),
+            deck_sharpness: Some(0.5),
+            ..SignalEffects::default()
+        };
+        let sr = crate::constants::SAMPLE_RATE;
+        let (y0, c0) = (test_signal(), encode_flat([200, 60, 40]));
+        let (mut y1, mut c1) = (y0.clone(), c0.clone());
+        fx.apply_wire(&mut y1, sr, &mut StdRng::seed_from_u64(11), 4, Wire::Luma);
+        fx.apply_wire(&mut c1, sr, &mut StdRng::seed_from_u64(11), 4, Wire::Chroma);
+        let (mut y2, mut c2) = (y0, c0);
+        fx.apply_svideo(&mut y2, &mut c2, sr, &mut StdRng::seed_from_u64(11), 4);
+        assert!(y1 == y2 && c1 == c2);
     }
 
     #[test]
