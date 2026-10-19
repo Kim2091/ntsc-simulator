@@ -254,6 +254,14 @@ struct EffectsArgs {
     /// Vertical chroma delay in field lines (typical 0–1, rounded)
     #[arg(long)]
     chroma_delay_v: Option<RangeParam>,
+    /// Time-base wobble: peak horizontal displacement in output pixels
+    /// (typical 0.5–3).  Smooth across lines, unlike --jitter.
+    #[arg(long)]
+    wobble: Option<RangeParam>,
+    /// Wobble frequency scale (1.0 = periods of ~20–300 lines; higher =
+    /// faster wobble)
+    #[arg(long, default_value = "1.0")]
+    wobble_rate: RangeParam,
     /// VHS quality preset.  Fills in every VHS flag that is not given
     /// explicitly; explicit flags always win.
     #[arg(long, value_enum)]
@@ -396,6 +404,8 @@ impl EffectsArgs {
             chroma_vblur: RangeParam::sample_opt(self.chroma_vblur, rng),
             chroma_delay: RangeParam::sample_opt(self.chroma_delay, rng),
             chroma_delay_v: RangeParam::sample_opt(self.chroma_delay_v, rng),
+            wobble: RangeParam::sample_opt(self.wobble, rng),
+            wobble_rate: self.wobble.map_or(1.0, |_| self.wobble_rate.sample(rng)),
         }
     }
 
@@ -426,6 +436,8 @@ impl EffectsArgs {
             || check(self.chroma_vblur)
             || check(self.chroma_delay)
             || check(self.chroma_delay_v)
+            || check(self.wobble)
+            || (self.wobble.is_some() && self.wobble_rate.is_range())
     }
 
     fn log_sampled(&self, fx: &SignalEffects) {
@@ -482,6 +494,10 @@ impl EffectsArgs {
         check_opt!("chroma_vblur", self.chroma_vblur, fx.chroma_vblur);
         check_opt!("chroma_delay", self.chroma_delay, fx.chroma_delay);
         check_opt!("chroma_delay_v", self.chroma_delay_v, fx.chroma_delay_v);
+        check_opt!("wobble", self.wobble, fx.wobble);
+        if self.wobble.is_some() {
+            check_req!("wobble_rate", self.wobble_rate, fx.wobble_rate);
+        }
         if !parts.is_empty() {
             eprintln!("  Randomized: {}", parts.join(", "));
         }

@@ -138,6 +138,11 @@ pub struct SignalEffects {
     pub chroma_delay: Option<f32>,
     /// Vertical chroma delay in field lines (rounded).  `None` = off.
     pub chroma_delay_v: Option<f32>,
+    /// Time-base wobble: peak horizontal displacement in output pixels at
+    /// 640 wide.  `None` = off.
+    pub wobble: Option<f32>,
+    /// Frequency scale of the wobble components (1.0 = default periods).
+    pub wobble_rate: f32,
 }
 
 /// Default number of active lines per field affected by head switching.
@@ -164,6 +169,7 @@ impl SignalEffects {
             || self.chroma_vblur.is_some()
             || self.chroma_delay.is_some()
             || self.chroma_delay_v.is_some()
+            || self.wobble.is_some()
     }
 
     /// Settings for the playback chroma path; zero turns a stage off.
@@ -189,7 +195,7 @@ impl SignalEffects {
     ///   4. Head-wear smearing — worn head / degraded oxide blur
     ///   5. Luminance-dependent noise — tape media noise
     ///   6. Tape dropout — physical oxide damage
-    ///   7. Top chroma band / head switching — playback timing events
+    ///   7. Wobble / top chroma band / head switching — playback timing events
     ///   8. Gaussian noise — reception snow
     ///   9. Ghosting / attenuation / jitter — reception effects
     ///  10. Tape trailing — **last**: causal rightward luma smudge from
@@ -219,6 +225,9 @@ impl SignalEffects {
         }
         if let Some(rate) = self.tape_dropout_rate {
             apply_tape_dropout(signal, rate, self.tape_dropout_len, sample_rate, rng);
+        }
+        if let Some(amp) = self.wobble {
+            apply_wobble(signal, amp, self.wobble_rate, rng);
         }
         if let Some(strength) = self.top_band {
             apply_top_band(signal, strength, rng);
@@ -1126,7 +1135,7 @@ fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng) {
 /// heads are never perfectly aligned, so the lines read after the switch
 /// have a time-base jump the TV cannot follow at once:
 ///   - Each of the last `lines` active lines of the field is shifted to the
-///     right by a fractional number of samples (linear interpolation).  The
+///     right by a fractional number of samples (see `shift_segment`).  The
 ///     shift grows toward the bottom as `max_shift·((k+1)/N)^1.5`, with a
 ///     little per-line jitter.  The exposed left part is filled with
 ///     blanking, which decodes as black.
@@ -1149,7 +1158,6 @@ fn apply_head_switch(signal: &mut [f32], strength: f32, lines: usize, rng: &mut 
     }
 
     let noise_lp = filters::design_lowpass(4.5e6, 15);
-    let mut src = vec![0.0f32; ACTIVE_SAMPLES];
     let mut noise = vec![0.0f32; ACTIVE_SAMPLES];
     let mut scratch = Vec::new();
 
@@ -1165,25 +1173,11 @@ fn apply_head_switch(signal: &mut [f32], strength: f32, lines: usize, rng: &mut 
         for k in 0..n_lines {
             let line_base = (switch_line + k) * spl;
             let base = line_base + ACTIVE_START;
-            let row = &mut signal[base..base + ACTIVE_SAMPLES];
 
             // ── Time-base jump: fractional rightward shift ──
             let ramp = ((k + 1) as f32 / n_lines as f32).powf(1.5);
             let shift = (max_shift * ramp + 0.6 * strength * randn(rng)).max(0.0);
-            let whole = shift.floor() as usize;
-            let frac = shift - whole as f32;
-            src.copy_from_slice(row);
-            let at = |i: isize| -> f32 {
-                if i < 0 {
-                    BLANKING_V
-                } else {
-                    src[i as usize]
-                }
-            };
-            for (j, out) in row.iter_mut().enumerate() {
-                let i = j as isize - whole as isize;
-                *out = (1.0 - frac) * at(i) + frac * at(i - 1);
-            }
+            shift_segment(&mut signal[line_base..line_base + spl], ACTIVE_START, spl, shift);
 
             // ── Burst moves with the line, minus a residual timing error ──
             let residual = burst_error * ramp + 0.1 * strength * randn(rng);
@@ -1474,25 +1468,117 @@ fn apply_chroma_path(
     }
 }
 
-/// Shift `line[lo..hi]` right by `shift` samples with linear interpolation.
-/// Samples that would come from before `lo` read as blanking.
+// ────────────────────────────────────────────────────────────────────────────
+// Time-base wobble
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Periods (in lines) and weights of the sinusoidal wobble components.
+const WOBBLE_COMPONENTS: [((f32, f32), f32); 3] =
+    [((20.0, 45.0), 0.2), ((60.0, 140.0), 0.3), ((150.0, 300.0), 0.5)];
+
+/// Weight and line-to-line correlation of the random-walk component.
+const WOBBLE_WALK_WEIGHT: f32 = 0.3;
+const WOBBLE_WALK_CORR: f32 = 0.97;
+
+/// Simulate correlated time-base error (wobble) from tape stretch, capstan
+/// flutter and head-drum speed variation.
+///
+/// Unlike `apply_jitter`, which moves lines independently by whole
+/// subcarrier cycles, the displacement here is smooth from line to line:
+///   - three sinusoids across the lines of the frame, with periods of about
+///     20–45, 60–140 and 150–300 lines (scaled by `rate`), random phases,
+///     and weights favouring the slow components;
+///   - a mean-reverting random walk (an AR(1) process with a correlation of
+///     0.97 per line) for irregular drift.
+///
+/// Lines are taken in time order (absolute line number), so the wobble
+/// continues from field 1 into field 2.  Each visible line is shifted by a
+/// fractional number of samples together with its burst, so the decoder
+/// stays locked to the chroma and hue is preserved, as on a real TV that
+/// follows the time-base error of each line.
+///
+/// `amp_px` is the peak displacement in output pixels at 640 wide.
+fn apply_wobble(signal: &mut [f32], amp_px: f32, rate: f32, rng: &mut impl Rng) {
+    let spl = SAMPLES_PER_LINE;
+    if amp_px == 0.0 || signal.len() < TOTAL_LINES * spl {
+        return;
+    }
+    let amp = amp_px * ACTIVE_SAMPLES as f32 / 640.0;
+
+    let mut comps = [(0.0f32, 0.0f32, 0.0f32); 3];
+    for (c, &((lo, hi), weight)) in comps.iter_mut().zip(&WOBBLE_COMPONENTS) {
+        let period = lo + (hi - lo) * rng.random::<f32>();
+        let phase = rng.random::<f32>() * std::f32::consts::TAU;
+        *c = (std::f32::consts::TAU * rate / period, phase, weight);
+    }
+
+    let fresh = (1.0 - WOBBLE_WALK_CORR * WOBBLE_WALK_CORR).sqrt();
+    let mut walk = randn(rng);
+    let burst_lo = FRONT_PORCH_SAMPLES + HSYNC_SAMPLES;
+    let norm = 1.0 / (1.0 + WOBBLE_WALK_WEIGHT);
+
+    for line in 0..TOTAL_LINES {
+        walk = WOBBLE_WALK_CORR * walk + fresh * randn(rng);
+        let visible = FIELD_ACTIVE_LINES.iter().any(|&(a, b)| (a..b).contains(&line));
+        if !visible {
+            continue;
+        }
+        let t = line as f32;
+        let mut d = WOBBLE_WALK_WEIGHT * walk;
+        for &(w, phase, weight) in &comps {
+            d += weight * (w * t + phase).sin();
+        }
+        let base = line * spl;
+        shift_segment(&mut signal[base..base + spl], burst_lo, spl, amp * norm * d);
+    }
+}
+
+/// Half-width of the fractional-delay kernel used by `shift_segment`.
+const SHIFT_HALF_TAPS: isize = 8;
+
+/// Shift `line[lo..hi]` right by `shift` samples (negative = left).
+/// Samples that would come from outside the segment read as blanking.
+///
+/// The fractional part uses a 16-tap Lanczos (windowed-sinc) kernel.
+/// Linear interpolation would not do: at 4×fsc it scales the subcarrier by
+/// `sqrt((1−f)² + f²)`, down to −3 dB at half a sample, so lines with
+/// different fractional shifts would decode with different saturation.
 fn shift_segment(line: &mut [f32], lo: usize, hi: usize, shift: f32) {
     if shift.abs() < 1e-6 {
         return;
     }
     let src: Vec<f32> = line[lo..hi].to_vec();
     let at = |i: isize| -> f32 {
-        if i < 0 {
+        if i < 0 || i as usize >= src.len() {
             BLANKING_V
         } else {
-            src[(i as usize).min(src.len() - 1)]
+            src[i as usize]
         }
     };
     let whole = shift.floor() as isize;
     let frac = shift - whole as f32;
+
+    // out[j] = Σ_m src[j − whole − m] · L(m − frac)
+    let sinc = |x: f32| {
+        if x.abs() < 1e-6 {
+            1.0
+        } else {
+            let px = std::f32::consts::PI * x;
+            px.sin() / px
+        }
+    };
+    let a = SHIFT_HALF_TAPS as f32;
+    let taps: Vec<(isize, f32)> = (1 - SHIFT_HALF_TAPS..=SHIFT_HALF_TAPS)
+        .map(|m| {
+            let x = m as f32 - frac;
+            (m, if x.abs() < a { sinc(x) * sinc(x / a) } else { 0.0 })
+        })
+        .collect();
+    let norm = 1.0 / taps.iter().map(|&(_, w)| w).sum::<f32>();
+
     for (j, out) in line[lo..hi].iter_mut().enumerate() {
-        let i = j as isize - whole;
-        *out = (1.0 - frac) * at(i) + frac * at(i - 1);
+        let i0 = j as isize - whole;
+        *out = norm * taps.iter().map(|&(m, w)| w * at(i0 - m)).sum::<f32>();
     }
 }
 
@@ -1695,6 +1781,41 @@ mod tests {
     }
 
     #[test]
+    fn wobble_moves_lines_but_keeps_hue() {
+        // Grey left half, red right half: the luma edge shows the wobble.
+        let pixels: Vec<u8> = (0..640 * 480)
+            .flat_map(|i| if i % 640 < 320 { [60u8, 60, 60] } else { [200, 40, 40] })
+            .collect();
+        let orig = crate::encoder::Encoder::new().encode_frame(&pixels, 640, 480, 0).to_vec();
+        let mut sig = orig.clone();
+        let mut rng = StdRng::seed_from_u64(10);
+        apply_wobble(&mut sig, 6.0, 1.0, &mut rng);
+
+        let mut dec = crate::decoder::Decoder::new();
+        let out = dec.decode_frame(&sig, 640, 480, false, false).to_vec();
+        // Edge position per row: first pixel whose red channel passes 130.
+        let edges: Vec<f32> = (20..460)
+            .map(|y| (200..450).find(|&x| out[(y * 640 + x) * 3] > 130).unwrap() as f32)
+            .collect();
+        let mean = edges.iter().sum::<f32>() / edges.len() as f32;
+        let std = (edges.iter().map(|e| (e - mean).powi(2)).sum::<f32>() / edges.len() as f32).sqrt();
+        assert!(std > 1.0, "edge did not move: std {std}");
+        // Neighbouring rows of one field move together (smooth, not jitter).
+        let step: f32 = edges.windows(3).map(|w| (w[2] - w[0]).abs()).sum::<f32>() / edges.len() as f32;
+        assert!(step < 1.0, "wobble not smooth: mean step {step}");
+
+        // The burst moves with the line, so the red keeps its hue.
+        let hue = |rgb: [f32; 3]| {
+            let i: f32 = (0..3).map(|c| crate::constants::RGB_TO_YIQ[1][c] * rgb[c]).sum();
+            let q: f32 = (0..3).map(|c| crate::constants::RGB_TO_YIQ[2][c] * rgb[c]).sum();
+            q.atan2(i).to_degrees()
+        };
+        let a = hue(decode_mean(&orig, 500, 240, 8));
+        let b = hue(decode_mean(&sig, 500, 240, 8));
+        assert!((a - b).abs() < 3.0, "hue {a} vs {b}");
+    }
+
+    #[test]
     fn zero_strength_is_noop() {
         let orig = test_signal();
         let mut rng = StdRng::seed_from_u64(1);
@@ -1704,6 +1825,7 @@ mod tests {
         apply_vbi_data(&mut sig, 0.0, crate::constants::SAMPLE_RATE, &mut rng);
         let off = ChromaPathConfig::default();
         apply_chroma_path(&mut sig, &off, crate::constants::SAMPLE_RATE, &mut rng);
+        apply_wobble(&mut sig, 0.0, 1.0, &mut rng);
         assert_eq!(sig, orig);
     }
 
