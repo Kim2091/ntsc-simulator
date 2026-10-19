@@ -11,6 +11,7 @@ Simulate the NTSC composite video signal encoding and decoding pipeline. Process
 
 ## Features
 
+- **GUI** (`ntsc-gui`) with live before/after preview, presets, and batch processing
 - **Roundtrip** video through the full encode/decode pipeline in memory
 - **Telecine** simulation with 3:2 pulldown (24p film → 480i interlaced)
 - **Image** processing through the NTSC signal path
@@ -25,7 +26,7 @@ Simulate the NTSC composite video signal encoding and decoding pipeline. Process
 
 ## Building
 
-Requires Rust 1.70+ and [ffmpeg](https://ffmpeg.org/) on your PATH (for video I/O).
+Requires Rust 1.95+ (for the GUI; the CLI alone builds with older versions) and [ffmpeg](https://ffmpeg.org/) on your PATH (for video I/O).
 
 From the repository root:
 
@@ -33,9 +34,33 @@ From the repository root:
 cargo build --release
 ```
 
-The binary is at `target/release/ntsc-composite-simulator` (`.exe` on Windows).
+This builds two binaries in `target/release/` (`.exe` on Windows):
 
-The crate is a library (`src/lib.rs`: encoder, decoder, effects, the shared parameter model in `params.rs`, presets, and the processing pipeline in `pipeline.rs`) with the command-line tool as a thin front end in `src/main.rs`. Every effect parameter (flag name, help text, unit, range, default, group) is defined once in `src/params.rs`; the CLI flags are generated from that table.
+- `ntsc-composite-simulator` — the command-line tool
+- `ntsc-gui` — the GUI with live preview (see [GUI](#gui))
+
+To build only the command-line tool, without the GUI dependencies:
+
+```bash
+cargo build --release --no-default-features
+```
+
+The crate is a library (`src/lib.rs`: encoder, decoder, effects, the shared parameter model in `params.rs`, presets, and the processing pipeline in `pipeline.rs`) with two thin front ends: the CLI in `src/main.rs` and the GUI in `src/bin/ntsc-gui/` (behind the default `gui` feature). Every effect parameter (flag name, label, help text, unit, slider range, default, group) is defined once in `src/params.rs`; the CLI flags and the GUI controls are both generated from that table.
+
+## GUI
+
+```bash
+cargo run --release --bin ntsc-gui
+# or open a file straight away
+target/release/ntsc-gui photo.png
+```
+
+- **Settings panel** (left): pick a preset (VHS `lq`/`mq`/`hq`, VHS legacy, or your own), then fine-tune in collapsible groups that follow the signal chain: Tape, Colour, Noise & dropouts, Timing, Reception, Decoder / output. Every parameter has an on/off box, a slider with its unit, a tooltip explaining what it looks like, and a **range** toggle that turns the slider into min/max. Editing marks the preset as *modified*; **Reset group** and **Reset all** go back to the preset. **Save…** / **Load…** store presets as JSON, the same format as `--preset-file`.
+- **Preview** (centre): opens with SMPTE colour bars. **Open…** or drag and drop an image, a video (one frame is previewed; scrub with the time slider), or a preset `.json`. Views: **Split** (drag the divider), **Side by side**, **After**. Zoom: **Fit**, **1×**, **2×**, **4×** (nearest neighbour; drag to pan, double-click to centre).
+- **Live rendering** runs in the background, 150 ms after the last change, always on the newest settings. The status bar shows the render time and the **sampled values** that the ranges resolved to. **Seed** + **Reroll** change the random draws; **Frame** steps through frames to see per-frame effects and, with temporal coherence on, the slow drift of the tape state.
+- **Toolbar**: **Copy CLI command** copies the exact equivalent `ntsc-composite-simulator` command line, **Save PNG…** saves the processed preview, and **Process…** runs the current settings over a file or a whole folder (images, or video roundtrip with CRF / lossless / encoder preset / telecine) with a progress bar and **Cancel**. Processing uses the same library code as the CLI, so the output matches the CLI with the same settings.
+
+Optional start-up arguments: `--preset <name>`, `--view split|side|after`, `--zoom fit|1|2|4`, `--process`, `--screenshot <png>` (save a window screenshot once the preview has rendered, then exit).
 
 ## Usage
 
@@ -290,6 +315,33 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 | `--preset-file` | roundtrip, image, colorbars | JSON preset file; fills in flags not given explicitly, before `--vhs-preset` |
 
 Run `ntsc-composite-simulator <command> -h` for full details.
+
+## Third-party licences
+
+Direct dependencies:
+
+| Crate | Licence | Used for |
+|---|---|---|
+| `realfft` | MIT | FFT filtering |
+| `rayon` | MIT OR Apache-2.0 | parallel frame processing |
+| `clap` | MIT OR Apache-2.0 | command-line parsing |
+| `image` | MIT OR Apache-2.0 | image I/O |
+| `indicatif` | MIT | CLI progress bars |
+| `anyhow` | MIT OR Apache-2.0 | error handling |
+| `rand`, `rand_distr` | MIT OR Apache-2.0 | random numbers |
+| `serde`, `serde_json` | MIT OR Apache-2.0 | preset files |
+| `eframe` (egui) | MIT OR Apache-2.0 | GUI (`gui` feature) |
+| `rfd` | MIT | GUI file dialogs (`gui` feature) |
+
+The GUI embeds egui's default fonts (`epaint_default_fonts`): Ubuntu-Light (Ubuntu Font Licence 1.0), Noto Emoji (SIL Open Font License 1.1), Hack (MIT) and emoji-icon-font (MIT). One transitive crate, `self_cell`, is dual-licensed Apache-2.0 OR GPL-2.0-only and is used under Apache-2.0.
+
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) lists every crate that can end up in a release build, with its licence and the licence texts. Ship it with any binaries. Regenerate it after changing dependencies:
+
+```bash
+python tools/third_party_licenses.py > THIRD_PARTY_LICENSES.md
+```
+
+Crates whose package contains no licence file get their text from `licenses/overrides/` (egui's LICENSE-MIT and LICENSE-APACHE from its repository), or are listed with their licence expression and repository.
 
 ## How It Works
 

@@ -122,9 +122,10 @@ impl Group {
 pub enum Kind {
     /// A number or `min..max` range.  `min`/`max` are the slider limits
     /// (the CLI accepts any value).  `default` applies when the parameter
-    /// is not set; `None` means the effect is off.  `integer` values are
-    /// rounded where they are used.
-    Number { min: f32, max: f32, default: Option<f32>, integer: bool },
+    /// is not set; `None` means the effect is off.  `typical` is a sensible
+    /// starting value when the user turns the effect on.  `integer` values
+    /// are rounded where they are used.
+    Number { min: f32, max: f32, default: Option<f32>, typical: f32, integer: bool },
     /// An on/off switch.
     Flag,
     /// Free text.
@@ -146,12 +147,12 @@ pub struct ParamSpec {
     pub kind: Kind,
 }
 
-const fn num(min: f32, max: f32) -> Kind {
-    Kind::Number { min, max, default: None, integer: false }
+const fn num(min: f32, max: f32, typical: f32) -> Kind {
+    Kind::Number { min, max, default: None, typical, integer: false }
 }
 
 const fn num_def(min: f32, max: f32, default: f32) -> Kind {
-    Kind::Number { min, max, default: Some(default), integer: false }
+    Kind::Number { min, max, default: Some(default), typical: default, integer: false }
 }
 
 /// All effect parameters, in signal-chain order.
@@ -163,7 +164,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "VHS luma bandwidth in MHz (SP ≈ 3.0, EP/SLP ≈ 1.6). Lower values blur fine horizontal detail.",
         unit: "MHz",
         group: Group::Tape,
-        kind: num(0.5, 4.2),
+        kind: num(0.5, 4.2, 3.0),
     },
     ParamSpec {
         id: "color-under-bw",
@@ -171,7 +172,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Colour-under chroma bandwidth in kHz (typical 300–500). Lower values smear colour sideways past edges.",
         unit: "kHz",
         group: Group::Tape,
-        kind: num(100.0, 1000.0),
+        kind: num(100.0, 1000.0, 400.0),
     },
     ParamSpec {
         id: "edge-ringing",
@@ -179,7 +180,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Playback peaking / sharpening gain (0.5–3.0). Adds bright and dark halos beside sharp edges.",
         unit: "",
         group: Group::Tape,
-        kind: num(0.0, 3.0),
+        kind: num(0.0, 3.0, 0.3),
     },
     ParamSpec {
         id: "head-smear",
@@ -187,7 +188,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Worn-head symmetric luma blur (0.3–1.0). Soft horizontal smudging that varies in bands down the frame.",
         unit: "",
         group: Group::Tape,
-        kind: num(0.0, 1.0),
+        kind: num(0.0, 1.0, 0.2),
     },
     ParamSpec {
         id: "tape-trail",
@@ -195,7 +196,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Causal rightward luma smear (0.3–1.0). Edges and noise leave a comet tail to the right, the classic worn-tape look.",
         unit: "",
         group: Group::Tape,
-        kind: num(0.0, 1.0),
+        kind: num(0.0, 1.0, 0.6),
     },
     // ── Colour ──
     ParamSpec {
@@ -204,7 +205,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Colour-under chroma noise, std dev of I/Q noise (subtle 0.01–0.03, heavy 0.06). Horizontal colour blotches in flat areas.",
         unit: "",
         group: Group::Colour,
-        kind: num(0.0, 0.1),
+        kind: num(0.0, 0.1, 0.02),
     },
     ParamSpec {
         id: "chroma-phase-noise",
@@ -212,7 +213,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Per-line hue jitter, std dev in degrees (subtle 1–3). Lines flicker slightly in hue.",
         unit: "°",
         group: Group::Colour,
-        kind: num(0.0, 15.0),
+        kind: num(0.0, 15.0, 2.0),
     },
     ParamSpec {
         id: "chroma-vblur",
@@ -220,7 +221,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Playback 1H chroma comb (0–1). Colour is mixed with the line above, softening colour edges vertically.",
         unit: "",
         group: Group::Colour,
-        kind: num(0.0, 1.0),
+        kind: num(0.0, 1.0, 0.6),
     },
     ParamSpec {
         id: "chroma-delay",
@@ -228,7 +229,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Horizontal chroma delay relative to luma in output pixels at 640 wide (typical 1–4, positive = right). Colour sits beside its object.",
         unit: "px",
         group: Group::Colour,
-        kind: num(-4.0, 8.0),
+        kind: num(-4.0, 8.0, 2.0),
     },
     ParamSpec {
         id: "chroma-delay-v",
@@ -236,7 +237,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Vertical chroma delay in field lines (typical 0–1; 1 field line = 2 output rows). Colour sits below its object.",
         unit: "lines",
         group: Group::Colour,
-        kind: Kind::Number { min: 0.0, max: 3.0, default: None, integer: true },
+        kind: Kind::Number { min: 0.0, max: 3.0, default: None, typical: 1.0, integer: true },
     },
     // ── Noise & dropouts ──
     ParamSpec {
@@ -245,7 +246,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Luminance-dependent tape noise amplitude (0.02–0.10). Grainy noise, stronger in dark areas.",
         unit: "",
         group: Group::NoiseDropouts,
-        kind: num(0.0, 0.1),
+        kind: num(0.0, 0.1, 0.025),
     },
     ParamSpec {
         id: "tape-dropout-rate",
@@ -253,7 +254,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Average tape dropouts per frame (2–20). Short white streaks or repeated line segments.",
         unit: "/frame",
         group: Group::NoiseDropouts,
-        kind: num(0.0, 30.0),
+        kind: num(0.0, 30.0, 2.0),
     },
     ParamSpec {
         id: "tape-dropout-len",
@@ -270,7 +271,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Random horizontal line jitter, std dev in subcarrier cycles (0.1–1.0). Lines jump sideways independently.",
         unit: "cycles",
         group: Group::Timing,
-        kind: num(0.0, 3.0),
+        kind: num(0.0, 3.0, 0.3),
     },
     ParamSpec {
         id: "wobble",
@@ -278,7 +279,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Time-base wobble: peak horizontal displacement in output pixels (typical 0.5–3). Vertical edges bend in slow waves.",
         unit: "px",
         group: Group::Timing,
-        kind: num(0.0, 6.0),
+        kind: num(0.0, 6.0, 1.0),
     },
     ParamSpec {
         id: "wobble-rate",
@@ -294,7 +295,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Head-switching noise (0–1). The bottom lines tear to the right with a dark, speckled switching line.",
         unit: "",
         group: Group::Timing,
-        kind: num(0.0, 1.0),
+        kind: num(0.0, 1.0, 0.6),
     },
     ParamSpec {
         id: "head-switch-lines",
@@ -302,7 +303,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Active lines per field torn by head switching (default 6, i.e. 12 rows at 480).",
         unit: "lines",
         group: Group::Timing,
-        kind: Kind::Number { min: 1.0, max: 20.0, default: None, integer: true },
+        kind: Kind::Number { min: 1.0, max: 20.0, default: None, typical: 6.0, integer: true },
     },
     ParamSpec {
         id: "top-band",
@@ -310,7 +311,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Faint blue/purple bands on the first lines of each field (0–1), as the deck's chroma loop settles.",
         unit: "",
         group: Group::Timing,
-        kind: num(0.0, 1.0),
+        kind: num(0.0, 1.0, 0.4),
     },
     ParamSpec {
         id: "vbi-data",
@@ -318,7 +319,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Closed-caption data on lines 21/284 (0–1). A row of short light dashes near the top of the picture.",
         unit: "",
         group: Group::Timing,
-        kind: num(0.0, 1.0),
+        kind: num(0.0, 1.0, 0.5),
     },
     // ── Reception ──
     ParamSpec {
@@ -327,7 +328,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Gaussian RF noise amplitude (0.05 = subtle, 0.2 = heavy snow).",
         unit: "",
         group: Group::Reception,
-        kind: num(0.0, 0.3),
+        kind: num(0.0, 0.3, 0.05),
     },
     ParamSpec {
         id: "ghost",
@@ -335,7 +336,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Primary multipath ghost amplitude (0–1). A faint delayed copy of the picture to the right.",
         unit: "",
         group: Group::Reception,
-        kind: num(0.0, 1.0),
+        kind: num(0.0, 1.0, 0.2),
     },
     ParamSpec {
         id: "ghost-delay",
@@ -359,7 +360,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Ghost HF rolloff cutoff in MHz (default 3.0). Lower values make the ghost softer.",
         unit: "MHz",
         group: Group::Reception,
-        kind: num(0.5, 4.2),
+        kind: num(0.5, 4.2, 3.0),
     },
     ParamSpec {
         id: "ghost-dynamic",
@@ -391,7 +392,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "Signal attenuation (0–1). Lowers contrast and saturation toward blanking.",
         unit: "",
         group: Group::Reception,
-        kind: num(0.0, 1.0),
+        kind: num(0.0, 1.0, 0.1),
     },
     // ── Decoder / output ──
     ParamSpec {
@@ -400,7 +401,7 @@ pub static SPECS: &[ParamSpec] = &[
         help: "How slowly the tape state drifts in video (0–1). 0 re-rolls head-smear bands, wobble, head-switch shape and top-band tint every frame; 1 makes them drift slowly like a real tape.",
         unit: "",
         group: Group::Output,
-        kind: num(0.0, 1.0),
+        kind: num(0.0, 1.0, 1.0),
     },
     ParamSpec {
         id: "legacy-burst-phase",
