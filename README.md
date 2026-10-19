@@ -35,6 +35,8 @@ cargo build --release
 
 The binary is at `target/release/ntsc-composite-simulator` (`.exe` on Windows).
 
+The crate is a library (`src/lib.rs`: encoder, decoder, effects, the shared parameter model in `params.rs`, presets, and the processing pipeline in `pipeline.rs`) with the command-line tool as a thin front end in `src/main.rs`. Every effect parameter (flag name, help text, unit, range, default, group) is defined once in `src/params.rs`; the CLI flags are generated from that table.
+
 ## Usage
 
 ### Roundtrip video through NTSC
