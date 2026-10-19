@@ -144,8 +144,46 @@ impl Encoder {
         self.encode_signal_from_yiq(frame_number)
     }
 
+    /// Encode both S-Video wires of a frame (`f2` gives field 2 its own
+    /// source) into `y_out` and `c_out`.  The source is resampled and
+    /// band-limited once for both wires, so this matches two
+    /// `encode_frame` calls exactly at lower cost.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_svideo(
+        &mut self,
+        f1_rgb: &[u8],
+        f2_rgb: Option<&[u8]>,
+        width: usize,
+        height: usize,
+        frame_number: u32,
+        y_out: &mut Vec<f32>,
+        c_out: &mut Vec<f32>,
+    ) {
+        {
+            let _p = profile::scope("encode resample");
+            self.update_interp_tables(width, height);
+            self.resample_yiq_field1(f1_rgb, width);
+            self.resample_yiq_field2(f2_rgb.unwrap_or(f1_rgb), width);
+        }
+        self.bandlimit_yiq();
+        let wire = self.wire;
+        for (w, out) in [(Wire::Luma, y_out), (Wire::Chroma, c_out)] {
+            self.wire = w;
+            let s = self.modulate(frame_number);
+            out.clear();
+            out.extend_from_slice(s);
+        }
+        self.wire = wire;
+    }
+
     /// Build composite signal from the already-filled y/i/q planes.
     fn encode_signal_from_yiq(&mut self, frame_number: u32) -> &[f32] {
+        self.bandlimit_yiq();
+        self.modulate(frame_number)
+    }
+
+    /// Band-limit the y/i/q planes in place.
+    fn bandlimit_yiq(&mut self) {
         let _p = profile::scope("encode filter/modulate");
         // Bandwidth-limit: pad, filter, unpad for Y, I, Q
         pad_edge_into(&self.y_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD, &mut self.padded_buf);
@@ -159,7 +197,12 @@ impl Encoder {
         pad_edge_into(&self.q_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD, &mut self.padded_buf);
         filters::filter_rows_sequential(&self.active_filters.q_channel, &mut self.padded_buf, PADDED_ACTIVE, &mut self.fft_scratch);
         unpad_into(&self.padded_buf, VISIBLE_LINES, PADDED_ACTIVE, PAD, &mut self.q_all);
+    }
 
+    /// Modulate the band-limited y/i/q planes onto `self.wire` and build
+    /// the full signal.  The planes are left unchanged.
+    fn modulate(&mut self, frame_number: u32) -> &[f32] {
+        let _p = profile::scope("encode filter/modulate");
         // Generate carriers using LUT and modulate chroma
         let frame_phase = std::f32::consts::PI * frame_number as f32;
 
@@ -464,4 +507,26 @@ fn write_blanking_structure(signal: &mut [f32]) {
 
     fill_blanking(signal, 270);
     write_eq(signal, 270, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn svideo_encode_matches_separate_wires() {
+        let (w, h) = (320, 240);
+        let f1: Vec<u8> = (0..w * h * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let f2: Vec<u8> = (0..w * h * 3).map(|i| (i * 13 % 241) as u8).collect();
+        let mut enc = Encoder::new();
+        let mut wire = |wire: Wire| {
+            enc.wire = wire;
+            enc.encode_frame_interlaced(&f1, w, h, &f2, 3).to_vec()
+        };
+        let (y1, c1) = (wire(Wire::Luma), wire(Wire::Chroma));
+        let mut enc = Encoder::new();
+        let (mut y2, mut c2) = (Vec::new(), Vec::new());
+        enc.encode_svideo(&f1, Some(&f2), w, h, 3, &mut y2, &mut c2);
+        assert!(y1 == y2 && c1 == c2);
+    }
 }

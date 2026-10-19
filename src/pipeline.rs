@@ -204,8 +204,7 @@ fn analog_frame(
         enc.wire = Wire::Composite;
     };
     if values.choice("video-out") == "svideo" {
-        encode(enc, Wire::Luma, buf, f1, f2, fnum);
-        encode(enc, Wire::Chroma, buf_c, f1, f2, fnum);
+        enc.encode_svideo(f1, f2, in_w, in_h, fnum, buf, buf_c);
         if effects_active {
             fx.apply_svideo(buf, buf_c, SAMPLE_RATE, &mut frame_rng(values.seed, fnum as u64), fnum as u64);
         }
