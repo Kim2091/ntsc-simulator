@@ -450,6 +450,13 @@ impl App {
         });
     }
 
+    /// Put the processed preview frame on the clipboard, at its output size.
+    fn copy_preview(&mut self, ctx: &egui::Context) {
+        let Some((rgb, w, h)) = &self.after_rgb else { return };
+        ctx.copy_image(egui::ColorImage::from_rgb([*w, *h], rgb));
+        self.status = Some((true, format!("Copied the {}×{} frame to the clipboard", w, h)));
+    }
+
     // ── UI ───────────────────────────────────────────────────────────────
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -488,6 +495,12 @@ impl App {
                 }
                 if ui.add_enabled(self.after_rgb.is_some(), egui::Button::new("Save PNG…")).on_hover_text("Save the processed preview").clicked() {
                     self.save_preview_png();
+                }
+                if ui.add_enabled(self.after_rgb.is_some(), egui::Button::new("Copy frame"))
+                    .on_hover_text("Copy the processed preview frame to the clipboard (Ctrl+C)")
+                    .clicked()
+                {
+                    self.copy_preview(ui.ctx());
                 }
                 if ui.button("Copy CLI command").on_hover_text("Copy the equivalent ntsc-composite-simulator command line").clicked() {
                     let cmd = self.cli_command();
@@ -769,6 +782,12 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.handle_drops(&ctx);
         self.poll_grab(&ctx);
+
+        // Ctrl+C copies the frame unless a text field has focus.
+        let copy = !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+        if copy {
+            self.copy_preview(&ctx);
+        }
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);

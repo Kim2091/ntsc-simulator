@@ -137,6 +137,15 @@ impl Viewer {
         if self.zoom == Zoom::Fit {
             self.pan = Vec2::ZERO;
         }
+        // Keep the frame centred along any axis where it is smaller than the
+        // view, and stop it being dragged past its edges where it is larger.
+        let view = match self.mode {
+            ViewMode::SideBySide => Rect::from_min_size(area.min, Vec2::new((area.width() - 8.0) / 2.0, area.height())),
+            _ => area,
+        };
+        let shown = size * scale_for(view, size, self.zoom, ppp);
+        let limit = ((shown - view.size()) / 2.0).max(Vec2::ZERO);
+        self.pan = self.pan.clamp(-limit, limit);
 
         match self.mode {
             ViewMode::SideBySide => {
@@ -200,6 +209,8 @@ impl Viewer {
         if response.double_clicked() {
             self.pan = Vec2::ZERO;
         }
+        // Apply the same limit to this frame's drag.
+        self.pan = self.pan.clamp(-limit, limit);
     }
 
     /// Step the zoom with the mouse wheel, keeping the image point under the
