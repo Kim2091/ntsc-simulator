@@ -172,7 +172,7 @@ impl Decoder {
                 sin_corr += burst_val * sin_lut[n & 3];
             }
 
-            self.burst_phases[vis] = sin_corr.atan2(cos_corr) - std::f32::consts::PI;
+            self.burst_phases[vis] = std::f32::consts::PI - sin_corr.atan2(cos_corr);
         }
 
         // Zero out chroma in blanking region

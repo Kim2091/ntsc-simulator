@@ -18,7 +18,10 @@
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
 
-use crate::constants::{ACTIVE_SAMPLES, ACTIVE_START, BLANKING_V, SAMPLES_PER_LINE, TOTAL_LINES};
+use crate::constants::{
+    ACTIVE_SAMPLES, ACTIVE_START, BLANKING_V, BURST_SAMPLES, BURST_START, COMPOSITE_SCALE, FSC,
+    FRONT_PORCH_SAMPLES, HSYNC_SAMPLES, I_PHASE_RAD, Q_PHASE_RAD, SAMPLES_PER_LINE, TOTAL_LINES,
+};
 use crate::filters;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -66,6 +69,7 @@ impl Default for GhostConfig {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Configurable signal degradation effects.
+#[derive(Clone, Debug)]
 pub struct SignalEffects {
     /// Gaussian noise amplitude (e.g. 0.05 = subtle, 0.2 = heavy snow)
     pub noise: Option<f32>,
@@ -108,7 +112,24 @@ pub struct SignalEffects {
     /// tail" trailing to the right — the classic worn-tape look.
     /// `None` = no trailing smear.
     pub tape_trail_smear: Option<f32>,
+    /// Head-switching noise strength (0–1).  Tears the last few active
+    /// lines of each field: a time-base jump that displaces them to the
+    /// right, plus a dark, noisy switching line.  `None` = off.
+    pub head_switch: Option<f32>,
+    /// Number of active lines per field affected by head switching.
+    pub head_switch_lines: usize,
+    /// Top-of-frame chroma band strength (0–1).  Tints the first few active
+    /// lines of each field blue/purple, as the deck's chroma phase loop
+    /// settles after the vertical interval.  `None` = off.
+    pub top_band: Option<f32>,
+    /// Closed-caption data strength (0–1) on lines 21 and 284.  The
+    /// waveform is blended over the picture on those lines, so it shows
+    /// as short light dashes near the top of the frame.  `None` = off.
+    pub vbi_data: Option<f32>,
 }
+
+/// Default number of active lines per field affected by head switching.
+pub const DEFAULT_HEAD_SWITCH_LINES: usize = 6;
 
 impl SignalEffects {
     pub fn is_active(&self) -> bool {
@@ -123,23 +144,32 @@ impl SignalEffects {
             || self.luma_noise.is_some()
             || self.head_switching_smear.is_some()
             || self.tape_trail_smear.is_some()
+            || self.head_switch.is_some()
+            || self.top_band.is_some()
+            || self.vbi_data.is_some()
     }
 
     /// Apply all active effects to the signal in-place.
     ///
     /// Processing order:
-    ///   1. VHS tape-path (luma BW + color-under) — fundamental recording limits
-    ///   2. Edge ringing — playback circuit detail enhancement
-    ///   3. Head-wear smearing — worn head / degraded oxide blur
-    ///   4. Luminance-dependent noise — tape media noise
-    ///   5. Tape dropout — physical oxide damage
-    ///   6. Gaussian noise — reception snow
-    ///   7. Ghosting / attenuation / jitter — reception effects
-    ///   8. Tape trailing — **last**: causal rightward luma smudge from
+    ///   1. VBI closed-caption data — part of the recorded broadcast signal
+    ///   2. VHS tape-path (luma BW + color-under) — fundamental recording limits
+    ///   3. Edge ringing — playback circuit detail enhancement
+    ///   4. Head-wear smearing — worn head / degraded oxide blur
+    ///   5. Luminance-dependent noise — tape media noise
+    ///   6. Tape dropout — physical oxide damage
+    ///   7. Top chroma band / head switching — playback timing events
+    ///   8. Gaussian noise — reception snow
+    ///   9. Ghosting / attenuation / jitter — reception effects
+    ///  10. Tape trailing — **last**: causal rightward luma smudge from
     ///      playback electronics.  Everything on the tape (noise, dropouts,
     ///      ghosts) passes through this bottleneck on readout.
     pub fn apply(&self, signal: &mut [f32], sample_rate: f64, rng: &mut impl Rng) {
-        // VHS tape-path effects (must come first)
+        // Closed-caption data is on the tape before any tape-path limits.
+        if let Some(strength) = self.vbi_data {
+            apply_vbi_data(signal, strength, sample_rate, rng);
+        }
+        // VHS tape-path effects
         if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {
             apply_vhs_tape_path(signal, self.vhs_luma_bw, self.color_under_bw, sample_rate);
         }
@@ -154,6 +184,12 @@ impl SignalEffects {
         }
         if let Some(rate) = self.tape_dropout_rate {
             apply_tape_dropout(signal, rate, self.tape_dropout_len, sample_rate, rng);
+        }
+        if let Some(strength) = self.top_band {
+            apply_top_band(signal, strength, rng);
+        }
+        if let Some(strength) = self.head_switch {
+            apply_head_switch(signal, strength, self.head_switch_lines, rng);
         }
         if let Some(amp) = self.noise {
             apply_noise(signal, amp, rng);
@@ -831,5 +867,446 @@ fn apply_tape_trail_smear(signal: &mut [f32], strength: f32) {
         for n in 0..spl {
             signal[base + n] = luma[n] + chroma[n];
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Shared helpers for the field-timing effects
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Voltage of one IRE unit (blanking = 0 IRE, sync tip = −40 IRE).
+const IRE_V: f32 = BLANKING_V / 40.0;
+
+/// First and one-past-last absolute line of the active picture in each field.
+const FIELD_ACTIVE_LINES: [(usize, usize); 2] = [(20, 260), (283, 523)];
+
+/// Draw a standard-normal sample.
+fn randn(rng: &mut impl Rng) -> f32 {
+    Normal::new(0.0f32, 1.0).unwrap().sample(rng)
+}
+
+/// Measure the colorburst phase of one line.
+///
+/// The burst is modelled as `A·cos(π/2·n + φ)` with `n` the sample index
+/// within the line; the return value is `φ`.  Correlating against
+/// `cos(π/2·n)` gives `A/2·cos φ` per sample, and against `sin(π/2·n)`
+/// gives `−A/2·sin φ`.
+fn measure_burst_phase(line: &[f32]) -> f32 {
+    let cos_lut: [f32; 4] = [1.0, 0.0, -1.0, 0.0];
+    let sin_lut: [f32; 4] = [0.0, 1.0, 0.0, -1.0];
+    let mut c = 0.0f32;
+    let mut s = 0.0f32;
+    for n in BURST_START..BURST_START + BURST_SAMPLES {
+        let v = line[n] - BLANKING_V;
+        c += v * cos_lut[n & 3];
+        s += v * sin_lut[n & 3];
+    }
+    (-s).atan2(c)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Closed-caption (line 21) data
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Closed-caption lines: line 21 of field 1 and line 284 of field 2.
+const VBI_DATA_LINES: [usize; 2] = [21, 284];
+
+/// Write a line-21 closed-caption waveform on lines 21 and 284.
+///
+/// EIA-608 data is sent at 32 × the line rate (≈ 503 kHz).  Each line
+/// carries, starting 10.5 µs after the leading edge of horizontal sync:
+///   - 7 cycles of clock run-in, a sine between 0 and 50 IRE,
+///   - two 0 bits and a 1 start bit,
+///   - two 7-bit characters with odd parity, sent LSB first as NRZ at
+///     0 / 50 IRE.
+///
+/// These lines lie inside the picture area here, so the waveform shows as
+/// a row of short light dashes near the top of the frame.  `strength`
+/// blends it over the picture on those lines (1.0 = full replacement).
+/// The characters are random printable ASCII, new for every frame.
+fn apply_vbi_data(signal: &mut [f32], strength: f32, sample_rate: f64, rng: &mut impl Rng) {
+    let spl = SAMPLES_PER_LINE;
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= 0.0 || signal.len() < TOTAL_LINES * spl {
+        return;
+    }
+
+    let line_rate = 2.0 * FSC / 455.0;
+    let bit_samples = (sample_rate / (32.0 * line_rate)) as f32; // ≈ 28.4
+    let start = FRONT_PORCH_SAMPLES + (10.5e-6 * sample_rate).round() as usize;
+    let high_v = 50.0 * IRE_V;
+
+    // The 1.5 MHz lowpass gives the data edges a finite rise time.
+    let edge_lp = filters::design_lowpass(1.5e6, 31);
+    let mut wave = vec![0.0f32; ACTIVE_SAMPLES];
+    let mut scratch = Vec::new();
+
+    for &line in &VBI_DATA_LINES {
+        // Bit sequence after the run-in: 0, 0, start 1, then two bytes.
+        let mut bits: Vec<bool> = vec![false, false, true];
+        for _ in 0..2 {
+            let ch: u8 = rng.random_range(0x20u8..0x7F);
+            let parity = ch.count_ones() % 2 == 0; // makes the total odd
+            for b in 0..7 {
+                bits.push((ch >> b) & 1 == 1);
+            }
+            bits.push(parity);
+        }
+
+        for (j, w) in wave.iter_mut().enumerate() {
+            let n = ACTIVE_START + j;
+            let level = if n < start {
+                0.0
+            } else {
+                let t = (n - start) as f32 / bit_samples;
+                if t < 7.0 {
+                    0.5 * high_v * (1.0 - (std::f32::consts::TAU * t).cos())
+                } else {
+                    match bits.get((t - 7.0) as usize) {
+                        Some(true) => high_v,
+                        _ => 0.0,
+                    }
+                }
+            };
+            *w = BLANKING_V + level;
+        }
+        apply_fir_inplace(&mut wave, &edge_lp, &mut scratch);
+
+        let base = line * spl + ACTIVE_START;
+        for (j, &w) in wave.iter().enumerate() {
+            let s = &mut signal[base + j];
+            *s += strength * (w - *s);
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Top-of-frame chroma band
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Simulate the blue/purple chroma bands at the top of a VHS picture.
+///
+/// After each vertical interval the deck's chroma phase loop needs a few
+/// lines to settle, so the first active lines of each field carry a hue
+/// error and a slight blue/purple cast.  For the first `M` active lines of
+/// each field (M = 3–6, growing with `strength`):
+///   1. Chroma is separated with the 2-sample comb and demodulated to
+///      baseband with the 4×fsc LUTs.
+///   2. The baseband vector is rotated by a random angle, and a bias in the
+///      −I/+Q direction (blue-violet) is added, in the line's burst frame.
+///   3. Only the difference is remodulated and added back, so luma and the
+///      untouched part of the chroma are preserved exactly.
+///   4. A slight luma lift with low-frequency streak noise is added.
+///
+/// All of it decays with the line index.  Angles, bias and decay are random
+/// for every frame and field.
+fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng) {
+    let spl = SAMPLES_PER_LINE;
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= 0.0 || signal.len() < TOTAL_LINES * spl {
+        return;
+    }
+
+    let band_lines = (3.0 + 3.0 * strength).round() as usize;
+
+    let cos_lut: [f32; 4] = [1.0, 0.0, -1.0, 0.0];
+    let nsin_lut: [f32; 4] = [0.0, -1.0, 0.0, 1.0];
+
+    // Baseband lowpass: keeps the hue rotation from acting on luma detail
+    // that leaks into the comb's chroma output.
+    let bb_lp = filters::design_lowpass(1.3e6, 31);
+    let streak_lp = filters::design_lowpass(0.4e6, 61);
+
+    let mut i_bb = vec![0.0f32; ACTIVE_SAMPLES];
+    let mut q_bb = vec![0.0f32; ACTIVE_SAMPLES];
+    let mut streak = vec![0.0f32; ACTIVE_SAMPLES];
+    let mut scratch = Vec::new();
+
+    for &(first, _) in &FIELD_ACTIVE_LINES {
+        // Per-field random state.
+        let rot0 = randn(rng) * 0.35 * strength + 0.25 * strength;
+        let hue = (105.0f32 + 12.0 * randn(rng)).to_radians();
+        let bias = strength * 0.05 * (0.7 + 0.6 * rng.random::<f32>());
+        let lift = strength * 0.02 * (0.5 + rng.random::<f32>());
+
+        for k in 0..band_lines {
+            let line = first + k;
+            let base = line * spl;
+            let decay = (1.0 - k as f32 / band_lines as f32).powf(1.5);
+            if decay <= 0.0 {
+                continue;
+            }
+
+            // ── Demodulate the comb chroma of the active region ──
+            for j in 0..ACTIVE_SAMPLES {
+                let n = ACTIVE_START + j;
+                let chroma = (signal[base + n] - signal[base + n - 2]) * 0.5;
+                i_bb[j] = 2.0 * chroma * cos_lut[n & 3];
+                q_bb[j] = 2.0 * chroma * nsin_lut[n & 3];
+            }
+            apply_fir_inplace(&mut i_bb, &bb_lp, &mut scratch);
+            apply_fir_inplace(&mut q_bb, &bb_lp, &mut scratch);
+
+            // ── Bias vector in this line's burst frame ──
+            // The I carrier sits at burst phase − π + 123°, Q at
+            // burst phase − π + 33°.  The bias is (cos hue)·I + (sin hue)·Q.
+            let phi_b = measure_burst_phase(&signal[base..base + spl]);
+            let th_i = phi_b - std::f32::consts::PI + I_PHASE_RAD;
+            let th_q = phi_b - std::f32::consts::PI + Q_PHASE_RAD;
+            let b = bias * decay * COMPOSITE_SCALE;
+            let (bi, bq) = (b * hue.cos(), b * hue.sin());
+            let bias_i = bi * th_i.cos() + bq * th_q.cos();
+            let bias_q = bi * th_i.sin() + bq * th_q.sin();
+
+            let rot = rot0 * decay;
+            let (rc, rs) = (rot.cos(), rot.sin());
+
+            // ── Luma streaks: slow horizontal noise riding on the lift ──
+            for s in streak.iter_mut() {
+                *s = randn(rng);
+            }
+            apply_fir_inplace(&mut streak, &streak_lp, &mut scratch);
+
+            // ── Add the remodulated difference and the luma lift ──
+            for j in 0..ACTIVE_SAMPLES {
+                let n = ACTIVE_START + j;
+                let (i0, q0) = (i_bb[j], q_bb[j]);
+                let di = i0 * rc - q0 * rs - i0 + bias_i;
+                let dq = i0 * rs + q0 * rc - q0 + bias_q;
+                let d_chroma = di * cos_lut[n & 3] + dq * nsin_lut[n & 3];
+                let d_luma = decay * (lift + strength * 0.03 * streak[j]);
+                signal[base + n] += d_chroma + d_luma;
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Head-switching noise
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Simulate VHS head-switching noise at the bottom of each field.
+///
+/// The head drum swaps heads a few lines before vertical sync.  The two
+/// heads are never perfectly aligned, so the lines read after the switch
+/// have a time-base jump the TV cannot follow at once:
+///   - Each of the last `lines` active lines of the field is shifted to the
+///     right by a fractional number of samples (linear interpolation).  The
+///     shift grows toward the bottom as `max_shift·((k+1)/N)^1.5`, with a
+///     little per-line jitter.  The exposed left part is filled with
+///     blanking, which decodes as black.
+///   - The burst moves with the line, but with a small residual timing
+///     error that grows toward the bottom (up to about one sample, i.e.
+///     ~90° of subcarrier phase).  The decoder references hue to the burst,
+///     so this residual shows as colour fringes on the displaced lines.
+///   - The first affected line is the switching line itself: over part of
+///     its width the signal drops toward blanking and carries strong
+///     wideband noise and bright impulses, which decode as a dark line
+///     with coloured speckles.
+///
+/// `max_shift` is about 28 samples (≈ 2 µs) at strength 1 and varies
+/// randomly for every frame and field.
+fn apply_head_switch(signal: &mut [f32], strength: f32, lines: usize, rng: &mut impl Rng) {
+    let spl = SAMPLES_PER_LINE;
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= 0.0 || lines == 0 || signal.len() < TOTAL_LINES * spl {
+        return;
+    }
+
+    let noise_lp = filters::design_lowpass(4.5e6, 15);
+    let mut src = vec![0.0f32; ACTIVE_SAMPLES];
+    let mut noise = vec![0.0f32; ACTIVE_SAMPLES];
+    let mut scratch = Vec::new();
+
+    for &(first, end) in &FIELD_ACTIVE_LINES {
+        let n_lines = lines.min(end - first);
+        let switch_line = end - n_lines;
+        let max_shift = strength * 28.0 * (0.75 + 0.5 * rng.random::<f32>());
+        // Residual burst timing error at the bottom line, in samples
+        // (one sample = 90° of subcarrier phase).
+        let sign = if rng.random::<bool>() { 1.0 } else { -1.0 };
+        let burst_error = sign * strength * (0.4 + 0.5 * rng.random::<f32>());
+
+        for k in 0..n_lines {
+            let line_base = (switch_line + k) * spl;
+            let base = line_base + ACTIVE_START;
+            let row = &mut signal[base..base + ACTIVE_SAMPLES];
+
+            // ── Time-base jump: fractional rightward shift ──
+            let ramp = ((k + 1) as f32 / n_lines as f32).powf(1.5);
+            let shift = (max_shift * ramp + 0.6 * strength * randn(rng)).max(0.0);
+            let whole = shift.floor() as usize;
+            let frac = shift - whole as f32;
+            src.copy_from_slice(row);
+            let at = |i: isize| -> f32 {
+                if i < 0 {
+                    BLANKING_V
+                } else {
+                    src[i as usize]
+                }
+            };
+            for (j, out) in row.iter_mut().enumerate() {
+                let i = j as isize - whole as isize;
+                *out = (1.0 - frac) * at(i) + frac * at(i - 1);
+            }
+
+            // ── Burst moves with the line, minus a residual timing error ──
+            let residual = burst_error * ramp + 0.1 * strength * randn(rng);
+            let burst_lo = FRONT_PORCH_SAMPLES + HSYNC_SAMPLES;
+            shift_segment(&mut signal[line_base..line_base + spl], burst_lo, ACTIVE_START, shift - residual);
+            let row = &mut signal[base..base + ACTIVE_SAMPLES];
+
+            // ── Switching line: dark, noisy burst over part of the line ──
+            if k == 0 {
+                let len = ((0.3 + 0.4 * rng.random::<f32>()) * (0.5 + 0.5 * strength)
+                    * ACTIVE_SAMPLES as f32) as usize;
+                let start = (rng.random::<f32>() * (ACTIVE_SAMPLES - len) as f32) as usize;
+                let depth = 0.6 + 0.3 * rng.random::<f32>();
+                let ramp_len = 12.0f32;
+
+                for s in noise.iter_mut() {
+                    *s = randn(rng);
+                }
+                apply_fir_inplace(&mut noise, &noise_lp, &mut scratch);
+
+                for j in start..start + len {
+                    // Raised-cosine edges so the burst fades in and out.
+                    let d = ((j - start).min(start + len - 1 - j)) as f32;
+                    let env = if d < ramp_len {
+                        0.5 - 0.5 * (std::f32::consts::PI * d / ramp_len).cos()
+                    } else {
+                        1.0
+                    };
+                    let mut v = row[j] + depth * env * (BLANKING_V - row[j]);
+                    v += env * strength * 0.18 * noise[j];
+                    if rng.random::<f32>() < 0.04 * strength {
+                        v += env * (0.25 + 0.25 * rng.random::<f32>());
+                    }
+                    row[j] = v;
+                }
+            }
+        }
+    }
+}
+
+/// Shift `line[lo..hi]` right by `shift` samples with linear interpolation.
+/// Samples that would come from before `lo` read as blanking.
+fn shift_segment(line: &mut [f32], lo: usize, hi: usize, shift: f32) {
+    if shift.abs() < 1e-6 {
+        return;
+    }
+    let src: Vec<f32> = line[lo..hi].to_vec();
+    let at = |i: isize| -> f32 {
+        if i < 0 {
+            BLANKING_V
+        } else {
+            src[(i as usize).min(src.len() - 1)]
+        }
+    };
+    let whole = shift.floor() as isize;
+    let frac = shift - whole as f32;
+    for (j, out) in line[lo..hi].iter_mut().enumerate() {
+        let i = j as isize - whole;
+        *out = (1.0 - frac) * at(i) + frac * at(i - 1);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tests
+// ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    /// A full frame of picture-like random levels with a colorburst on every
+    /// line, so the effects have real content to change.
+    fn test_signal() -> Vec<f32> {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut sig = vec![BLANKING_V; TOTAL_LINES * SAMPLES_PER_LINE];
+        for line in 0..TOTAL_LINES {
+            let base = line * SAMPLES_PER_LINE;
+            for n in BURST_START..BURST_START + BURST_SAMPLES {
+                let c = [1.0f32, 0.0, -1.0, 0.0][n & 3];
+                sig[base + n] = BLANKING_V - 0.14 * c;
+            }
+            for n in ACTIVE_START..SAMPLES_PER_LINE {
+                sig[base + n] = 0.4 + 0.4 * rng.random::<f32>();
+            }
+        }
+        sig
+    }
+
+    fn changed_lines(a: &[f32], b: &[f32]) -> Vec<usize> {
+        (0..TOTAL_LINES)
+            .filter(|&l| {
+                let r = l * SAMPLES_PER_LINE..(l + 1) * SAMPLES_PER_LINE;
+                a[r.clone()] != b[r]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn zero_strength_is_noop() {
+        let orig = test_signal();
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut sig = orig.clone();
+        apply_head_switch(&mut sig, 0.0, DEFAULT_HEAD_SWITCH_LINES, &mut rng);
+        apply_top_band(&mut sig, 0.0, &mut rng);
+        apply_vbi_data(&mut sig, 0.0, crate::constants::SAMPLE_RATE, &mut rng);
+        assert_eq!(sig, orig);
+    }
+
+    #[test]
+    fn head_switch_touches_only_last_lines_of_each_field() {
+        let orig = test_signal();
+        let n = 6;
+        let mut rng = StdRng::seed_from_u64(2);
+        let mut sig = orig.clone();
+        apply_head_switch(&mut sig, 1.0, n, &mut rng);
+        let expected: Vec<usize> = (260 - n..260).chain(523 - n..523).collect();
+        assert_eq!(changed_lines(&orig, &sig), expected);
+        // Front porch and sync stay untouched on the affected lines.
+        let sync_end = FRONT_PORCH_SAMPLES + HSYNC_SAMPLES;
+        for &l in &expected {
+            let base = l * SAMPLES_PER_LINE;
+            assert_eq!(sig[base..base + sync_end], orig[base..base + sync_end]);
+        }
+    }
+
+    #[test]
+    fn vbi_writes_only_lines_21_and_284() {
+        let orig = test_signal();
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut sig = orig.clone();
+        apply_vbi_data(&mut sig, 1.0, crate::constants::SAMPLE_RATE, &mut rng);
+        assert_eq!(changed_lines(&orig, &sig), vec![21, 284]);
+    }
+
+    #[test]
+    fn top_band_touches_only_first_lines_of_each_field() {
+        let orig = test_signal();
+        let mut rng = StdRng::seed_from_u64(4);
+        let mut sig = orig.clone();
+        apply_top_band(&mut sig, 1.0, &mut rng);
+        let expected: Vec<usize> = (20..26).chain(283..289).collect();
+        assert_eq!(changed_lines(&orig, &sig), expected);
+    }
+
+    #[test]
+    fn burst_phase_matches_encoder_convention() {
+        // The encoder writes the burst as −cos(π/2·n + line_phase).
+        let line_phase = 0.7f32;
+        let mut line = vec![BLANKING_V; SAMPLES_PER_LINE];
+        for n in BURST_START..BURST_START + BURST_SAMPLES {
+            let phi = std::f32::consts::FRAC_PI_2 * n as f32 + line_phase;
+            line[n] = BLANKING_V - 0.14 * phi.cos();
+        }
+        let measured = measure_burst_phase(&line);
+        let expected = line_phase + std::f32::consts::PI;
+        let diff = (measured - expected).rem_euclid(std::f32::consts::TAU);
+        assert!(diff < 1e-3 || diff > std::f32::consts::TAU - 1e-3, "{measured} vs {expected}");
     }
 }

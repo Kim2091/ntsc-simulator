@@ -17,7 +17,8 @@ Simulate the NTSC composite video signal encoding and decoding pipeline. Process
 - **SMPTE color bars** test pattern generator
 - **Physically-motivated signal degradation**: noise (snow), multipath ghosting, attenuation, horizontal jitter
 - **Realistic multipath ghosting model**: multiple reflections, phase shift (polarity inversion), HF rolloff, sub-sample delay interpolation, dynamic amplitude modulation
-- **VHS tape-path simulation**: luma bandwidth limiting, color-under chroma processing, tape dropouts, edge ringing, luminance-dependent noise, head-wear smearing, and causal rightward trailing
+- **VHS tape-path simulation**: luma bandwidth limiting, color-under chroma processing, tape dropouts, edge ringing, luminance-dependent noise, head-wear smearing, causal rightward trailing, head-switching noise, top-of-frame chroma bands, and closed-caption data lines
+- **VHS quality presets**: `--vhs-preset lq|mq|hq` sets every VHS effect at once
 - **Range parameters**: all numeric effect arguments accept `min..max` ranges — a random value is sampled per file in batch mode for natural variation
 - **Two comb filter modes**: horizontal 2-sample delay (default) and 1H line-delay
 - Parallel frame processing via rayon
@@ -148,7 +149,38 @@ ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 \
   --vhs-luma-bw 1.6 --color-under-bw 250 --luma-noise 0.08 \
   --edge-ringing 1.5 --tape-dropout-rate 15 \
   --head-smear 0.7 --tape-trail 0.7 --noise 0.03
+
+# Head-switching tear at the bottom, blue/purple bands and caption dashes at the top
+ntsc-composite-simulator image photo.png -o vhs.png \
+  --vhs-luma-bw 3.0 --color-under-bw 400 \
+  --head-switch 0.7 --head-switch-lines 6 --top-band 0.5 --vbi-data 0.5
 ```
+
+#### Quality presets
+
+`--vhs-preset` fills in every VHS flag you did not pass. Flags you pass explicitly always win, so a preset is a starting point:
+
+```bash
+# Worn EP-mode tape
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --vhs-preset lq
+
+# Typical tape, but without the closed-caption dashes
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --vhs-preset mq --vbi-data 0
+```
+
+| Flag | `lq` | `mq` | `hq` |
+|---|---|---|---|
+| `--vhs-luma-bw` | 1.6 | 3 | 3 |
+| `--color-under-bw` | 400..450 | 400..450 | 300..400 |
+| `--edge-ringing` | 0.3..0.4 | 0.25..0.35 | 0.2..0.3 |
+| `--luma-noise` | 0.025..0.035 | 0.02..0.03 | 0.015..0.025 |
+| `--tape-dropout-rate` | 1 | 0..1 | 0 |
+| `--head-smear` | 0.2..0.3 | 0.15..0.2 | 0.1..0.15 |
+| `--tape-trail` | 0.75..0.9 | 0.6..0.75 | 0.5..0.7 |
+| `--head-switch` | 0.8..1.0 | 0.55..0.7 | 0.35..0.45 |
+| `--head-switch-lines` | 7 | 6 | 5 |
+| `--top-band` | 0.6..0.8 | 0.4..0.55 | 0.2..0.3 |
+| `--vbi-data` | 0.6..0.8 | 0.4..0.55 | 0.25..0.35 |
 
 ## Options Reference
 
@@ -206,6 +238,11 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 | `--tape-dropout-len` | roundtrip, image, colorbars | Average dropout length in µs (default: 15.0) |
 | `--head-smear` | roundtrip, image, colorbars | Worn-head symmetric luma blur (0.3–1.0); varies in bands across the frame |
 | `--tape-trail` | roundtrip, image, colorbars | Causal rightward luma smear (0.3–1.0); the classic worn-tape trailing effect |
+| `--head-switch` | roundtrip, image, colorbars | Head-switching noise at the bottom of each field (0–1): rightward tear, black left edge, dark speckled switching line |
+| `--head-switch-lines` | roundtrip, image, colorbars | Active lines per field torn by head switching (default: 6, i.e. 12 rows at 480) |
+| `--top-band` | roundtrip, image, colorbars | Faint blue/purple chroma bands on the first lines of each field (0–1) |
+| `--vbi-data` | roundtrip, image, colorbars | Closed-caption data on lines 21/284, visible as short light dashes near the top (0–1) |
+| `--vhs-preset` | roundtrip, image, colorbars | `lq`, `mq` or `hq`: fills in all VHS flags not given explicitly |
 
 Run `ntsc-composite-simulator <command> -h` for full details.
 
@@ -247,7 +284,10 @@ The VHS simulation models both the recording and playback signal paths:
 4. **Luminance-dependent noise** — band-limited noise scaled by signal darkness (darker = noisier), matching real FM tape noise characteristics
 5. **Tape dropouts** — random horizontal streaks from oxide damage; short ones flash white, longer ones trigger the dropout compensator (previous-line hold)
 6. **Head-wear smear** — variable-width symmetric box blur on luma only, modulated in slow bands across the frame to simulate uneven head-to-tape contact
-7. **Tape trailing** — causal one-pole IIR on luma only, applied as the final processing step so everything on the tape (noise, dropouts, detail) gets the characteristic rightward decay tail of worn playback electronics
+7. **Closed-caption data** — an EIA-608 line-21 waveform (7 cycles of 503 kHz clock run-in, start bits, two random 7-bit characters with odd parity as 50 IRE NRZ) is written on lines 21 and 284 before the tape path, so it is band-limited like the rest of the recording
+8. **Top chroma bands** — on the first 3–6 active lines of each field the chroma is demodulated, rotated by a random angle and biased toward −I/+Q (blue/purple) in the line's burst frame, with a slight luma lift, all decaying down the field; this models the deck's chroma phase loop settling after the vertical interval
+9. **Head switching** — the last few active lines of each field get a time-base jump: they are shifted right by a fractional, growing number of samples, exposing black on the left, and the burst moves with them apart from a small residual error that shows as colour fringes; the switching line itself drops toward black over part of its width and carries wideband noise and bright speckles
+10. **Tape trailing** — causal one-pole IIR on luma only, applied as the final processing step so everything on the tape (noise, dropouts, detail) gets the characteristic rightward decay tail of worn playback electronics
 
 ### Signal Specifications
 

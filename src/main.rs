@@ -18,7 +18,7 @@ use rayon::prelude::*;
 
 use crate::constants::SAMPLE_RATE;
 use crate::decoder::Decoder;
-use crate::effects::{GhostConfig, SignalEffects};
+use crate::effects::{GhostConfig, SignalEffects, DEFAULT_HEAD_SWITCH_LINES};
 use crate::encoder::Encoder;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "ts", "mts", "m2ts", "mpg", "mpeg"];
@@ -188,9 +188,81 @@ struct EffectsArgs {
     /// “comet tail”.
     #[arg(long)]
     tape_trail: Option<RangeParam>,
+    /// Head-switching noise strength (0–1).  Tears the bottom lines of
+    /// each field: rightward displacement and a dark, noisy switching line.
+    #[arg(long)]
+    head_switch: Option<RangeParam>,
+    /// Active lines per field torn by head switching (default: 6)
+    #[arg(long)]
+    head_switch_lines: Option<RangeParam>,
+    /// Top-of-frame chroma band strength (0–1).  Faint blue/purple bands
+    /// on the first lines of each field.
+    #[arg(long)]
+    top_band: Option<RangeParam>,
+    /// Closed-caption data strength (0–1) on lines 21/284, visible as
+    /// short light dashes near the top of the frame.
+    #[arg(long)]
+    vbi_data: Option<RangeParam>,
+    /// VHS quality preset.  Fills in every VHS flag that is not given
+    /// explicitly; explicit flags always win.
+    #[arg(long, value_enum)]
+    vhs_preset: Option<VhsPreset>,
+}
+
+/// VHS quality presets for `--vhs-preset`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum VhsPreset {
+    /// Low quality: worn EP-mode tape
+    Lq,
+    /// Medium quality: typical rental tape
+    Mq,
+    /// High quality: clean SP recording
+    Hq,
+}
+
+/// Parse a preset value written in the same syntax as the CLI flags.
+fn rp(s: &str) -> RangeParam {
+    s.parse().expect("valid preset value")
 }
 
 impl EffectsArgs {
+    /// Fill every VHS flag the user did not pass with the preset's value.
+    fn apply_vhs_preset(&mut self) {
+        let Some(preset) = self.vhs_preset else { return };
+        // luma MHz, color-under kHz, ringing, luma noise, dropouts/frame,
+        // head smear, tape trail, head switch, switch lines, top band, VBI.
+        let v: [&str; 11] = match preset {
+            VhsPreset::Lq => [
+                "1.6", "400..450", "0.3..0.4", "0.025..0.035", "1", "0.2..0.3",
+                "0.75..0.9", "0.8..1.0", "7", "0.6..0.8", "0.6..0.8",
+            ],
+            VhsPreset::Mq => [
+                "3", "400..450", "0.25..0.35", "0.02..0.03", "0..1", "0.15..0.2",
+                "0.6..0.75", "0.55..0.7", "6", "0.4..0.55", "0.4..0.55",
+            ],
+            VhsPreset::Hq => [
+                "3", "300..400", "0.2..0.3", "0.015..0.025", "0", "0.1..0.15",
+                "0.5..0.7", "0.35..0.45", "5", "0.2..0.3", "0.25..0.35",
+            ],
+        };
+        let fields: [&mut Option<RangeParam>; 11] = [
+            &mut self.vhs_luma_bw,
+            &mut self.color_under_bw,
+            &mut self.edge_ringing,
+            &mut self.luma_noise,
+            &mut self.tape_dropout_rate,
+            &mut self.head_smear,
+            &mut self.tape_trail,
+            &mut self.head_switch,
+            &mut self.head_switch_lines,
+            &mut self.top_band,
+            &mut self.vbi_data,
+        ];
+        for (field, value) in fields.into_iter().zip(v) {
+            field.get_or_insert_with(|| rp(value));
+        }
+    }
+
     fn to_signal_effects<R: Rng>(&self, rng: &mut R) -> SignalEffects {
         let mut ghosts: Vec<GhostConfig> = Vec::new();
 
@@ -248,6 +320,11 @@ impl EffectsArgs {
             luma_noise: RangeParam::sample_opt(self.luma_noise, rng),
             head_switching_smear: RangeParam::sample_opt(self.head_smear, rng),
             tape_trail_smear: RangeParam::sample_opt(self.tape_trail, rng),
+            head_switch: RangeParam::sample_opt(self.head_switch, rng),
+            head_switch_lines: RangeParam::sample_opt(self.head_switch_lines, rng)
+                .map_or(DEFAULT_HEAD_SWITCH_LINES, |n| n.round().max(0.0) as usize),
+            top_band: RangeParam::sample_opt(self.top_band, rng),
+            vbi_data: RangeParam::sample_opt(self.vbi_data, rng),
         }
     }
 
@@ -269,6 +346,10 @@ impl EffectsArgs {
             || check(self.luma_noise)
             || check(self.head_smear)
             || check(self.tape_trail)
+            || check(self.head_switch)
+            || check(self.head_switch_lines)
+            || check(self.top_band)
+            || check(self.vbi_data)
     }
 
     fn log_sampled(&self, fx: &SignalEffects) {
@@ -316,6 +397,10 @@ impl EffectsArgs {
         check_opt!("luma_noise", self.luma_noise, fx.luma_noise);
         check_opt!("head_smear", self.head_smear, fx.head_switching_smear);
         check_opt!("tape_trail", self.tape_trail, fx.tape_trail_smear);
+        check_opt!("head_switch", self.head_switch, fx.head_switch);
+        check_opt!("head_switch_lines", self.head_switch_lines, Some(fx.head_switch_lines as f32));
+        check_opt!("top_band", self.top_band, fx.top_band);
+        check_opt!("vbi_data", self.vbi_data, fx.vbi_data);
         if !parts.is_empty() {
             eprintln!("  Randomized: {}", parts.join(", "));
         }
@@ -400,7 +485,13 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    match &mut cli.command {
+        Commands::Image { effects, .. }
+        | Commands::Roundtrip { effects, .. }
+        | Commands::Colorbars { effects, .. } => effects.apply_vhs_preset(),
+    }
 
     match cli.command {
         Commands::Image {
@@ -704,20 +795,6 @@ fn cmd_roundtrip(
         .map(|_| vec![0u8; frame_bytes])
         .collect();
 
-    // Clone effects for move into closure
-    let fx_noise = fx.noise;
-    let fx_ghosts = fx.ghosts.clone();
-    let fx_attenuation = fx.attenuation;
-    let fx_jitter = fx.jitter;
-    let fx_vhs_luma_bw = fx.vhs_luma_bw;
-    let fx_color_under_bw = fx.color_under_bw;
-    let fx_tape_dropout_rate = fx.tape_dropout_rate;
-    let fx_tape_dropout_len = fx.tape_dropout_len;
-    let fx_edge_ringing = fx.edge_ringing;
-    let fx_luma_noise = fx.luma_noise;
-    let fx_head_switching_smear = fx.head_switching_smear;
-    let fx_tape_trail_smear = fx.tape_trail_smear;
-
     loop {
         let mut batch_count = 0usize;
         for buf in frame_pool.iter_mut() {
@@ -752,20 +829,6 @@ fn cmd_roundtrip(
                                 let mut sb_ref = sb.borrow_mut();
                                 sb_ref.resize(signal.len(), 0.0);
                                 sb_ref.copy_from_slice(signal);
-                                let fx = SignalEffects {
-                                    noise: fx_noise,
-                                    ghosts: fx_ghosts.clone(),
-                                    attenuation: fx_attenuation,
-                                    jitter: fx_jitter,
-                                    vhs_luma_bw: fx_vhs_luma_bw,
-                                    color_under_bw: fx_color_under_bw,
-                                    tape_dropout_rate: fx_tape_dropout_rate,
-                                    tape_dropout_len: fx_tape_dropout_len,
-                                    edge_ringing: fx_edge_ringing,
-                                    luma_noise: fx_luma_noise,
-                                    head_switching_smear: fx_head_switching_smear,
-                                    tape_trail_smear: fx_tape_trail_smear,
-                                };
                                 let mut rng = rand::rng();
                                 fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);
                                 let mut dec_ref = dec.borrow_mut();
@@ -874,20 +937,6 @@ fn cmd_roundtrip_telecine(
 
     let groups_per_batch = num_cpus.max(1);
 
-    // Clone effects for move into closure
-    let fx_noise = fx.noise;
-    let fx_ghosts = fx.ghosts.clone();
-    let fx_attenuation = fx.attenuation;
-    let fx_jitter = fx.jitter;
-    let fx_vhs_luma_bw = fx.vhs_luma_bw;
-    let fx_color_under_bw = fx.color_under_bw;
-    let fx_tape_dropout_rate = fx.tape_dropout_rate;
-    let fx_tape_dropout_len = fx.tape_dropout_len;
-    let fx_edge_ringing = fx.edge_ringing;
-    let fx_luma_noise = fx.luma_noise;
-    let fx_head_switching_smear = fx.head_switching_smear;
-    let fx_tape_trail_smear = fx.tape_trail_smear;
-
     loop {
         // Read groups_per_batch * 4 film frames
         let mut film_buf: Vec<Vec<u8>> = Vec::with_capacity(groups_per_batch * 4);
@@ -954,20 +1003,6 @@ fn cmd_roundtrip_telecine(
                                 let mut sb_ref = sb.borrow_mut();
                                 sb_ref.resize(signal.len(), 0.0);
                                 sb_ref.copy_from_slice(signal);
-                                let fx = SignalEffects {
-                                    noise: fx_noise,
-                                    ghosts: fx_ghosts.clone(),
-                                    attenuation: fx_attenuation,
-                                    jitter: fx_jitter,
-                                    vhs_luma_bw: fx_vhs_luma_bw,
-                                    color_under_bw: fx_color_under_bw,
-                                    tape_dropout_rate: fx_tape_dropout_rate,
-                                    tape_dropout_len: fx_tape_dropout_len,
-                                    edge_ringing: fx_edge_ringing,
-                                    luma_noise: fx_luma_noise,
-                                    head_switching_smear: fx_head_switching_smear,
-                                    tape_trail_smear: fx_tape_trail_smear,
-                                };
                                 let mut rng = rand::rng();
                                 fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);
                                 let mut dec_ref = dec.borrow_mut();
