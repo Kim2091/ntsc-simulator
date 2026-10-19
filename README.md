@@ -247,6 +247,8 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 | `--chroma-noise` | roundtrip, image, colorbars | Colour-under chroma noise, std dev of I/Q noise (subtle 0.01–0.03, heavy 0.06); horizontal colour blotches |
 | `--chroma-phase-noise` | roundtrip, image, colorbars | Per-line chroma phase (hue) jitter, std dev in degrees (subtle 1–3) |
 | `--chroma-vblur` | roundtrip, image, colorbars | Playback 1H chroma comb (0–1): chroma mixed with the previous line of the field, softening colour vertically |
+| `--chroma-delay` | roundtrip, image, colorbars | Horizontal chroma delay relative to luma in output pixels at 640 wide (typical 1–4, positive = right) |
+| `--chroma-delay-v` | roundtrip, image, colorbars | Vertical chroma delay in field lines (typical 0–1; 1 field line = 2 output rows) |
 | `--vhs-preset` | roundtrip, image, colorbars | `lq`, `mq` or `hq`: fills in all VHS flags not given explicitly |
 
 Run `ntsc-composite-simulator <command> -h` for full details.
@@ -285,7 +287,7 @@ The VHS simulation models both the recording and playback signal paths:
 
 1. **Luma bandwidth** — FIR low-pass limits luma resolution, matching the FM deviation limits of the tape format (SP vs EP/SLP)
 2. **Color-under** — chroma is heterodyned down to 629 kHz, bandwidth-limited, and heterodyned back up, severely restricting color detail
-3. **Playback chroma path** — chroma is demodulated to I/Q per line and rotated into the frame of that line's burst, so lines can be mixed without the line-to-line subcarrier inversion cancelling them. In that frame, colour-under noise (lowpassed at 150 kHz and half-correlated with the previous line of the field, so it forms blotches) is added, each line can get a random hue rotation (phase jitter), and a 1H comb can mix each line's chroma with the previous line of the field (vertical colour blur). Only the change is remodulated, so luma is untouched
+3. **Playback chroma path** — chroma is demodulated to I/Q per line and rotated into the frame of that line's burst, so lines can be mixed without the line-to-line subcarrier inversion cancelling them. In that frame, colour-under noise (lowpassed at 150 kHz and half-correlated with the previous line of the field, so it forms blotches) is added, each line can get a random hue rotation (phase jitter), and a 1H comb can mix each line's chroma with the previous line of the field (vertical colour blur); finally the chroma can be delayed relative to luma, by a fractional number of samples to the right and by whole field lines down. Only the change is remodulated, so luma is untouched
 4. **Edge ringing** — unsharp-mask peaking with intentional Gibbs-phenomenon overshoot simulates the sharpness-enhancement circuit in playback decks
 5. **Luminance-dependent noise** — band-limited noise scaled by signal darkness (darker = noisier), matching real FM tape noise characteristics
 6. **Tape dropouts** — random horizontal streaks from oxide damage; short ones flash white, longer ones trigger the dropout compensator (previous-line hold)

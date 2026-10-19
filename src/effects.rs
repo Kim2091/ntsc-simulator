@@ -133,6 +133,11 @@ pub struct SignalEffects {
     pub chroma_phase_noise: Option<f32>,
     /// Playback 1H chroma comb strength (0–1).  `None` = off.
     pub chroma_vblur: Option<f32>,
+    /// Horizontal chroma delay in output pixels at 640 wide (positive =
+    /// right).  `None` = off.
+    pub chroma_delay: Option<f32>,
+    /// Vertical chroma delay in field lines (rounded).  `None` = off.
+    pub chroma_delay_v: Option<f32>,
 }
 
 /// Default number of active lines per field affected by head switching.
@@ -157,6 +162,8 @@ impl SignalEffects {
             || self.chroma_noise.is_some()
             || self.chroma_phase_noise.is_some()
             || self.chroma_vblur.is_some()
+            || self.chroma_delay.is_some()
+            || self.chroma_delay_v.is_some()
     }
 
     /// Settings for the playback chroma path; zero turns a stage off.
@@ -165,6 +172,9 @@ impl SignalEffects {
             noise: self.chroma_noise.unwrap_or(0.0),
             phase_noise_deg: self.chroma_phase_noise.unwrap_or(0.0),
             vblur: self.chroma_vblur.unwrap_or(0.0),
+            // Pixels at 640 wide to samples.
+            delay_samples: self.chroma_delay.unwrap_or(0.0) * ACTIVE_SAMPLES as f32 / 640.0,
+            delay_lines: self.chroma_delay_v.map_or(0, |v| v.round().max(0.0) as usize),
         }
     }
 
@@ -174,7 +184,7 @@ impl SignalEffects {
     ///   1. VBI closed-caption data — part of the recorded broadcast signal
     ///   2. VHS tape-path (luma BW + color-under) — fundamental recording limits,
     ///      then the playback chroma path (colour-under noise, phase jitter,
-    ///      1H comb)
+    ///      1H comb, chroma delay)
     ///   3. Edge ringing — playback circuit detail enhancement
     ///   4. Head-wear smearing — worn head / degraded oxide blur
     ///   5. Luminance-dependent noise — tape media noise
@@ -1228,11 +1238,20 @@ pub struct ChromaPathConfig {
     /// Playback 1H chroma comb strength (0–1).  At 1 each line's chroma is
     /// the average of itself and the previous line of the field.
     pub vblur: f32,
+    /// Horizontal chroma delay relative to luma, in samples (positive =
+    /// right).
+    pub delay_samples: f32,
+    /// Vertical chroma delay in field lines (positive = down).
+    pub delay_lines: usize,
 }
 
 impl ChromaPathConfig {
     fn is_active(&self) -> bool {
-        self.noise > 0.0 || self.phase_noise_deg > 0.0 || self.vblur > 0.0
+        self.noise > 0.0
+            || self.phase_noise_deg > 0.0
+            || self.vblur > 0.0
+            || self.delay_samples != 0.0
+            || self.delay_lines > 0
     }
 }
 
@@ -1279,6 +1298,11 @@ fn lowpass_zero_phase(buf: &mut [f32], alpha: f32) {
 ///      track.  Each line's chroma becomes `(1−k)·c[n] + k·c[n−1]` with
 ///      `c[n−1]` the previous line of the same field and `k = 0.5` at full
 ///      strength, which halves vertical chroma resolution.
+///   4. **Chroma delay** — the chroma path is slower than the luma path, so
+///      colour lands a little to the right of (and in some decks a line
+///      below) the luma.  The I/Q baseband is shifted by a fractional
+///      number of samples (linear interpolation, edge value held) and by
+///      whole lines within the field (first line held).
 ///
 /// Only the change of the baseband chroma is remodulated and added back,
 /// so luma and the high-frequency part of the comb's chroma output are
@@ -1400,6 +1424,34 @@ fn apply_chroma_path(
                     let (cur, prev) = (line * act + j, (line - 1) * act + j);
                     new_i[cur] = (1.0 - k) * new_i[cur] + k * new_i[prev];
                     new_q[cur] = (1.0 - k) * new_q[cur] + k * new_q[prev];
+                }
+            }
+        }
+
+        // ── 4. Chroma delay ──
+        if cfg.delay_lines > 0 {
+            let v = cfg.delay_lines;
+            for line in (0..n_lines).rev() {
+                let src = line.saturating_sub(v);
+                for j in 0..act {
+                    new_i[line * act + j] = new_i[src * act + j];
+                    new_q[line * act + j] = new_q[src * act + j];
+                }
+            }
+        }
+        if cfg.delay_samples != 0.0 {
+            let d = cfg.delay_samples;
+            let whole = d.floor() as isize;
+            let frac = d - whole as f32;
+            let at = |row: &[f32], i: isize| row[i.clamp(0, act as isize - 1) as usize];
+            for line in 0..n_lines {
+                let r = line * act..(line + 1) * act;
+                tmp_i.copy_from_slice(&new_i[r.clone()]);
+                tmp_q.copy_from_slice(&new_q[r.clone()]);
+                for j in 0..act {
+                    let i = j as isize - whole;
+                    new_i[r.start + j] = (1.0 - frac) * at(&tmp_i, i) + frac * at(&tmp_i, i - 1);
+                    new_q[r.start + j] = (1.0 - frac) * at(&tmp_q, i) + frac * at(&tmp_q, i - 1);
                 }
             }
         }
@@ -1589,6 +1641,57 @@ mod tests {
             .collect();
         assert!(changed.contains(&240) && changed.contains(&241), "{changed:?}");
         assert!(changed.iter().all(|&y| (238..=243).contains(&y)), "{changed:?}");
+    }
+
+    /// Decoded I/Q magnitude along row `y`.
+    fn decoded_chroma_row(sig: &[f32], y: usize) -> Vec<f32> {
+        let mut dec = crate::decoder::Decoder::new();
+        let out = dec.decode_frame(sig, 640, 480, false, false);
+        (0..640)
+            .map(|x| {
+                let i = (y * 640 + x) * 3;
+                chroma_mag([out[i] as f32, out[i + 1] as f32, out[i + 2] as f32])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chroma_delay_moves_colour_right_and_down() {
+        // Grey left half, red right half.
+        let pixels: Vec<u8> = (0..640 * 480)
+            .flat_map(|i| if i % 640 < 320 { [120u8, 120, 120] } else { [200, 40, 40] })
+            .collect();
+        let orig = crate::encoder::Encoder::new().encode_frame(&pixels, 640, 480, 0).to_vec();
+        let mut sig = orig.clone();
+        let mut rng = StdRng::seed_from_u64(9);
+        let cfg = ChromaPathConfig {
+            delay_samples: 4.0 * ACTIVE_SAMPLES as f32 / 640.0,
+            ..Default::default()
+        };
+        apply_chroma_path(&mut sig, &cfg, crate::constants::SAMPLE_RATE, &mut rng);
+        // Where the chroma magnitude crosses half of the red level.
+        let crossing = |row: &[f32]| {
+            let half = 0.5 * row[500];
+            (200..450).find(|&x| row[x] >= half).unwrap() as i32
+        };
+        let shift = crossing(&decoded_chroma_row(&sig, 240)) - crossing(&decoded_chroma_row(&orig, 240));
+        assert!((3..=5).contains(&shift), "shift {shift}");
+
+        // Vertical: top half red, bottom half grey; one field line down
+        // moves the colour edge down by two output rows.
+        let pixels: Vec<u8> = (0..640 * 480)
+            .flat_map(|i| if i / 640 < 240 { [200u8, 40, 40] } else { [120, 120, 120] })
+            .collect();
+        let orig = crate::encoder::Encoder::new().encode_frame(&pixels, 640, 480, 0).to_vec();
+        let mut sig = orig.clone();
+        let cfg = ChromaPathConfig { delay_lines: 1, ..Default::default() };
+        apply_chroma_path(&mut sig, &cfg, crate::constants::SAMPLE_RATE, &mut rng);
+        let red = decoded_chroma_row(&orig, 100)[320];
+        for y in [240, 241] {
+            assert!(decoded_chroma_row(&orig, y)[320] < 0.2 * red);
+            assert!(decoded_chroma_row(&sig, y)[320] > 0.8 * red, "row {y}");
+        }
+        assert!(decoded_chroma_row(&sig, 244)[320] < 0.2 * red);
     }
 
     #[test]

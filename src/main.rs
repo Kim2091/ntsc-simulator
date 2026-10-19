@@ -247,6 +247,13 @@ struct EffectsArgs {
     /// line of the field, halving vertical colour resolution at 1
     #[arg(long)]
     chroma_vblur: Option<RangeParam>,
+    /// Horizontal chroma delay relative to luma, in output pixels at 640
+    /// wide (typical 1–4, positive = right)
+    #[arg(long)]
+    chroma_delay: Option<RangeParam>,
+    /// Vertical chroma delay in field lines (typical 0–1, rounded)
+    #[arg(long)]
+    chroma_delay_v: Option<RangeParam>,
     /// VHS quality preset.  Fills in every VHS flag that is not given
     /// explicitly; explicit flags always win.
     #[arg(long, value_enum)]
@@ -387,6 +394,8 @@ impl EffectsArgs {
             chroma_noise: RangeParam::sample_opt(self.chroma_noise, rng),
             chroma_phase_noise: RangeParam::sample_opt(self.chroma_phase_noise, rng),
             chroma_vblur: RangeParam::sample_opt(self.chroma_vblur, rng),
+            chroma_delay: RangeParam::sample_opt(self.chroma_delay, rng),
+            chroma_delay_v: RangeParam::sample_opt(self.chroma_delay_v, rng),
         }
     }
 
@@ -415,6 +424,8 @@ impl EffectsArgs {
             || check(self.chroma_noise)
             || check(self.chroma_phase_noise)
             || check(self.chroma_vblur)
+            || check(self.chroma_delay)
+            || check(self.chroma_delay_v)
     }
 
     fn log_sampled(&self, fx: &SignalEffects) {
@@ -469,6 +480,8 @@ impl EffectsArgs {
         check_opt!("chroma_noise", self.chroma_noise, fx.chroma_noise);
         check_opt!("chroma_phase_noise", self.chroma_phase_noise, fx.chroma_phase_noise);
         check_opt!("chroma_vblur", self.chroma_vblur, fx.chroma_vblur);
+        check_opt!("chroma_delay", self.chroma_delay, fx.chroma_delay);
+        check_opt!("chroma_delay_v", self.chroma_delay_v, fx.chroma_delay_v);
         if !parts.is_empty() {
             eprintln!("  Randomized: {}", parts.join(", "));
         }
