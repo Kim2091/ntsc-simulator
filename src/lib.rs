@@ -26,3 +26,4 @@ pub mod params;
 pub mod pipeline;
 pub mod presets;
 pub mod profile;
+mod simd;

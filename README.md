@@ -45,6 +45,8 @@ To build only the command-line tool, without the GUI dependencies:
 cargo build --release --no-default-features
 ```
 
+The binaries target baseline x86-64, so a build runs on any x86-64 CPU. The hot loops are compiled twice, for SSE2 and AVX2, and the AVX2 version is picked at run time when the CPU has it; both give bit-identical output (set `NTSC_SIMD=sse2` to force the SSE2 version).
+
 The crate is a library (`src/lib.rs`: encoder, decoder, effects, the shared parameter model in `params.rs`, presets, and the processing pipeline in `pipeline.rs`) with two thin front ends: the CLI in `src/main.rs` and the GUI in `src/bin/ntsc-gui/` (behind the default `gui` feature). Every effect parameter (flag name, label, help text, unit, slider range, default, group) is defined once in `src/params.rs`; the CLI flags and the GUI controls are both generated from that table.
 
 ## GUI
@@ -513,6 +515,7 @@ The VHS simulation models both the recording and playback signal paths:
 
 Newest first.
 
+- **Portable builds**: release builds no longer use `target-cpu=native`, so a binary built on a new CPU runs on older ones (no illegal-instruction crashes); hot loops pick AVX2 or SSE2 at run time. Tape-path, ringing and other FIR filters are vectorised; output is unchanged bit for bit.
 - **GUI copy frame and pan limits**: **Copy frame** / Ctrl+C copies the processed preview to the clipboard; zoomed-out frames stay centred and zoomed-in frames cannot be dragged past their edges.
 
 - **GUI wheel zoom**: scroll over the preview to zoom (0.25× to 16×) about the cursor.

@@ -566,14 +566,7 @@ fn apply_fir_inplace(buf: &mut [f32], kernel: &[f32], scratch: &mut Vec<f32>) {
     scratch[half..half + n].copy_from_slice(buf);
     scratch[half + n..padded].fill(right);
 
-    for i in 0..n {
-        let mut sum = 0.0f32;
-        let s = &scratch[i..i + k];
-        for j in 0..k {
-            sum += s[j] * kernel[j];
-        }
-        buf[i] = sum;
-    }
+    filters::convolve(scratch, kernel, buf);
 }
 
 /// Combined VHS luma bandwidth reduction and color-under chroma processing.

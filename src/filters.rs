@@ -5,6 +5,7 @@ use realfft::{RealFftPlanner, RealToComplex, ComplexToReal};
 use std::sync::Arc;
 
 use crate::constants::{SAMPLE_RATE, NUM_TAPS, LUMA_BW, I_BW, Q_BW};
+use crate::simd::multiversion;
 
 /// Design a FIR lowpass filter using windowed-sinc (Hamming window).
 pub fn design_lowpass(cutoff_hz: f64, num_taps: usize) -> Vec<f32> {
@@ -32,6 +33,43 @@ pub fn design_lowpass(cutoff_hz: f64, num_taps: usize) -> Vec<f32> {
     }
 
     coeffs.iter().map(|&c| c as f32).collect()
+}
+
+/// Output samples computed together by `convolve`.
+const CONVOLVE_LANES: usize = 32;
+
+multiversion! {
+    /// Direct-form FIR: `out[i] = Σ_j src[i + j]·kernel[j]`, summed in order
+    /// of `j` from zero.  `src` must hold `out.len() + kernel.len() − 1`
+    /// samples.
+    ///
+    /// Blocks of output samples are computed side by side so the loop
+    /// vectorises; each output still sees exactly the same sequence of
+    /// multiplies and adds as a plain scalar loop.
+    pub fn convolve(src: &[f32], kernel: &[f32], out: &mut [f32]) {
+        let n = out.len();
+        let k = kernel.len();
+        assert!(k > 0 && src.len() + 1 >= n + k);
+        let mut i = 0;
+        while i + CONVOLVE_LANES <= n {
+            let mut acc = [0.0f32; CONVOLVE_LANES];
+            for (j, &kj) in kernel.iter().enumerate() {
+                let s: &[f32; CONVOLVE_LANES] = src[i + j..i + j + CONVOLVE_LANES].try_into().unwrap();
+                for l in 0..CONVOLVE_LANES {
+                    acc[l] += s[l] * kj;
+                }
+            }
+            out[i..i + CONVOLVE_LANES].copy_from_slice(&acc);
+            i += CONVOLVE_LANES;
+        }
+        for (i, o) in out.iter_mut().enumerate().skip(i) {
+            let mut sum = 0.0f32;
+            for (&s, &kj) in src[i..i + k].iter().zip(kernel) {
+                sum += s * kj;
+            }
+            *o = sum;
+        }
+    }
 }
 
 /// Precomputed filter kernel in frequency domain using real FFT.
