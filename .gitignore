@@ -1,20 +1,10 @@
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
-*.npy
-*.wav
 *.mp4
 *.mkv
 *.png
 *.avi
-.venv/
-venv/
 
 # Rust
-rust/target/
+target/
 
 # Allow example images
 !examples/

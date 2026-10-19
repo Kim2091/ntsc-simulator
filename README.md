@@ -26,12 +26,13 @@ Simulate the NTSC composite video signal encoding and decoding pipeline. Process
 
 Requires Rust 1.70+ and [ffmpeg](https://ffmpeg.org/) on your PATH (for video I/O).
 
+From the repository root:
+
 ```bash
-cd rust
 cargo build --release
 ```
 
-The binary is at `rust/target/release/ntsc-composite-simulator` (`.exe` on Windows).
+The binary is at `target/release/ntsc-composite-simulator` (`.exe` on Windows).
 
 ## Usage
 
