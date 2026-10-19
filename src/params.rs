@@ -406,6 +406,16 @@ pub static SPECS: &[ParamSpec] = &[
         kind: num(0.0, 1.0, 1.0),
     },
     ParamSpec {
+        id: "video-out",
+        label: "Video connection",
+        help: "How the playback device connects to the TV or capture card. composite: one wire, the decoder's \
+               comb filter separates luma and colour (rainbow cross-colour on fine detail, dot crawl on colour \
+               edges). svideo: separate luma and colour wires, no comb filter and no cross-colour.",
+        unit: "",
+        group: Group::Output,
+        kind: Kind::Choice { options: &["composite", "svideo"], default: "composite" },
+    },
+    ParamSpec {
         id: "input-matrix",
         label: "Input colour matrix",
         help: "Colour matrix used to convert source video to RGB. auto: the stream's colour tag if present, \

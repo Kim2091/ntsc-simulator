@@ -22,6 +22,7 @@ use crate::constants::{
     ACTIVE_SAMPLES, ACTIVE_START, BLANKING_V, BURST_SAMPLES, BURST_START, COMPOSITE_SCALE, FSC,
     FRONT_PORCH_SAMPLES, HSYNC_SAMPLES, I_PHASE_RAD, Q_PHASE_RAD, SAMPLES_PER_LINE, TOTAL_LINES,
 };
+use crate::encoder::Wire;
 use crate::filters;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -210,31 +211,67 @@ impl SignalEffects {
     /// `frame` is the frame number within the file; it drives the drifting
     /// tape state when `temporal_coherence` is above zero.
     pub fn apply(&self, signal: &mut [f32], sample_rate: f64, rng: &mut impl Rng, frame: u64) {
+        self.apply_wire(signal, sample_rate, rng, frame, Wire::Composite);
+    }
+
+    /// Apply the effects to one wire of the signal.
+    ///
+    /// For S-Video the Y and C wires are processed separately with clones
+    /// of the same RNG.  Luma-domain effects (luma bandwidth, ringing,
+    /// smear, luma noise, caption data, trail) only change the Y wire and
+    /// chroma-domain effects (colour-under, chroma path, top band) only
+    /// the C wire; effects that draw random numbers still run (on a
+    /// scratch copy) on the other wire, so both wires see the same
+    /// dropouts, jitter, wobble and head switching.  Composite runs
+    /// everything, exactly as `apply`.
+    pub fn apply_wire(&self, signal: &mut [f32], sample_rate: f64, rng: &mut impl Rng, frame: u64, wire: Wire) {
+        let luma_on = wire != Wire::Chroma;
+        let chroma_on = wire != Wire::Luma;
         let clock = TapeClock {
             seed: self.tape_seed,
             frame,
             coherence: self.temporal_coherence.clamp(0.0, 1.0),
         };
         // Closed-caption data is on the tape before any tape-path limits.
+        // On a wire an effect does not belong to, run it on a scratch copy
+        // so the RNG advances identically on both wires.
+        let mut scratch: Vec<f32> = Vec::new();
+        macro_rules! on {
+            ($active:expr, |$s:ident| $body:expr) => {
+                if $active {
+                    let $s: &mut [f32] = signal;
+                    $body;
+                } else {
+                    scratch.clear();
+                    scratch.extend_from_slice(signal);
+                    let $s: &mut [f32] = &mut scratch;
+                    $body;
+                }
+            };
+        }
         if let Some(strength) = self.vbi_data {
-            apply_vbi_data(signal, strength, sample_rate, rng);
+            on!(luma_on, |s| apply_vbi_data(s, strength, sample_rate, rng));
         }
         // VHS tape-path effects
         if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {
-            apply_vhs_tape_path(signal, self.vhs_luma_bw, self.color_under_bw, sample_rate);
+            let luma_bw = if luma_on { self.vhs_luma_bw } else { None };
+            let chroma_bw = if chroma_on { self.color_under_bw } else { None };
+            apply_vhs_tape_path(signal, luma_bw, chroma_bw, sample_rate);
         }
         let chroma_cfg = self.chroma_path_config();
         if chroma_cfg.is_active() {
-            apply_chroma_path(signal, &chroma_cfg, sample_rate, rng);
+            on!(chroma_on, |s| apply_chroma_path(s, &chroma_cfg, sample_rate, rng));
         }
         if let Some(gain) = self.edge_ringing {
-            apply_edge_ringing(signal, gain, sample_rate);
+            if luma_on {
+                apply_edge_ringing(signal, gain, sample_rate);
+            }
         }
         if let Some(strength) = self.head_switching_smear {
-            apply_head_wear_smear(signal, strength, rng, &clock);
+            on!(luma_on, |s| apply_head_wear_smear(s, strength, rng, &clock));
         }
         if let Some(amp) = self.luma_noise {
-            apply_luma_noise(signal, amp, sample_rate, rng);
+            on!(luma_on, |s| apply_luma_noise(s, amp, sample_rate, rng));
         }
         if let Some(rate) = self.tape_dropout_rate {
             apply_tape_dropout(signal, rate, self.tape_dropout_len, sample_rate, rng);
@@ -243,7 +280,7 @@ impl SignalEffects {
             apply_wobble(signal, amp, self.wobble_rate, rng, &clock);
         }
         if let Some(strength) = self.top_band {
-            apply_top_band(signal, strength, rng, &clock);
+            on!(chroma_on, |s| apply_top_band(s, strength, rng, &clock));
         }
         if let Some(strength) = self.head_switch {
             apply_head_switch(signal, strength, self.head_switch_lines, rng, &clock);
@@ -264,7 +301,9 @@ impl SignalEffects {
         // limit smears everything that's on the tape (noise, dropouts,
         // ghosts, etc.) rightward on readout.
         if let Some(strength) = self.tape_trail_smear {
-            apply_tape_trail_smear(signal, strength);
+            if luma_on {
+                apply_tape_trail_smear(signal, strength);
+            }
         }
     }
 }

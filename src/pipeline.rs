@@ -17,7 +17,7 @@ use crate::colorbars;
 use crate::constants::SAMPLE_RATE;
 use crate::decoder::Decoder;
 use crate::effects::SignalEffects;
-use crate::encoder::Encoder;
+use crate::encoder::{Encoder, Wire};
 use crate::params::{frame_rng, ParamValues};
 
 pub const VIDEO_EXTENSIONS: &[&str] =
@@ -135,17 +135,64 @@ pub fn render_frame(
     fx: &SignalEffects,
     frame: u64,
 ) -> Vec<u8> {
-    let legacy = values.flag("legacy-burst-phase");
     let mut encoder = Encoder::new();
-    let signal = encoder.encode_frame(pixels, w, h, frame as u32);
     let mut decoder = Decoder::new();
-    if fx.is_active() {
-        let mut buf = signal.to_vec();
-        let mut rng = frame_rng(values.seed, frame);
-        fx.apply(&mut buf, SAMPLE_RATE, &mut rng, frame);
-        decoder.decode_frame(&buf, out_w, out_h, comb_1h, legacy).to_vec()
+    let mut buf = Vec::new();
+    let mut buf_c = Vec::new();
+    analog_frame(
+        &mut encoder, &mut decoder, &mut buf, &mut buf_c, pixels, None, w, h, out_w, out_h,
+        frame as u32, comb_1h, values, fx, fx.is_active(),
+    )
+}
+
+/// Encode (one or two fields' sources) to the analog signal, apply the
+/// effects for frame `fnum`, and decode, over a composite or S-Video
+/// connection.  `buf`/`buf_c` are reusable scratch buffers.
+#[allow(clippy::too_many_arguments)]
+fn analog_frame(
+    enc: &mut Encoder,
+    dec: &mut Decoder,
+    buf: &mut Vec<f32>,
+    buf_c: &mut Vec<f32>,
+    f1: &[u8],
+    f2: Option<&[u8]>,
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    out_h: usize,
+    fnum: u32,
+    comb_1h: bool,
+    values: &ParamValues,
+    fx: &SignalEffects,
+    effects_active: bool,
+) -> Vec<u8> {
+    let legacy = values.flag("legacy-burst-phase");
+    let encode = |enc: &mut Encoder, wire: Wire, out: &mut Vec<f32>| {
+        enc.wire = wire;
+        let s = match f2 {
+            None => enc.encode_frame(f1, in_w, in_h, fnum),
+            Some(f2) => enc.encode_frame_interlaced(f1, in_w, in_h, f2, fnum),
+        };
+        out.clear();
+        out.extend_from_slice(s);
+        enc.wire = Wire::Composite;
+    };
+    if values.choice("video-out") == "svideo" {
+        encode(enc, Wire::Luma, buf);
+        encode(enc, Wire::Chroma, buf_c);
+        if effects_active {
+            let rng = frame_rng(values.seed, fnum as u64);
+            fx.apply_wire(buf, SAMPLE_RATE, &mut rng.clone(), fnum as u64, Wire::Luma);
+            fx.apply_wire(buf_c, SAMPLE_RATE, &mut rng.clone(), fnum as u64, Wire::Chroma);
+        }
+        dec.decode_svideo(buf, buf_c, out_w, out_h, legacy).to_vec()
     } else {
-        decoder.decode_frame(signal, out_w, out_h, comb_1h, legacy).to_vec()
+        encode(enc, Wire::Composite, buf);
+        if effects_active {
+            let mut rng = frame_rng(values.seed, fnum as u64);
+            fx.apply(buf, SAMPLE_RATE, &mut rng, fnum as u64);
+        }
+        dec.decode_frame(buf, out_w, out_h, comb_1h, legacy).to_vec()
     }
 }
 
@@ -359,6 +406,7 @@ thread_local! {
     static TL_ENCODER: RefCell<Encoder> = RefCell::new(Encoder::new());
     static TL_DECODER: RefCell<Decoder> = RefCell::new(Decoder::new());
     static TL_SIGNAL_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static TL_SIGNAL_BUF_C: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Encode (one or two fields' sources), apply effects, decode — on the
@@ -377,28 +425,16 @@ fn process_frame_tl(
     fx: &SignalEffects,
     effects_active: bool,
 ) -> Vec<u8> {
-    let legacy = values.flag("legacy-burst-phase");
     TL_ENCODER.with(|enc| {
         TL_DECODER.with(|dec| {
-            let mut enc_ref = enc.borrow_mut();
-            let signal = match f2 {
-                None => enc_ref.encode_frame(f1, in_w, in_h, fnum),
-                Some(f2) => enc_ref.encode_frame_interlaced(f1, in_w, in_h, f2, fnum),
-            };
-            if effects_active {
-                TL_SIGNAL_BUF.with(|sb| {
-                    let mut sb_ref = sb.borrow_mut();
-                    sb_ref.resize(signal.len(), 0.0);
-                    sb_ref.copy_from_slice(signal);
-                    let mut rng = frame_rng(values.seed, fnum as u64);
-                    fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng, fnum as u64);
-                    let mut dec_ref = dec.borrow_mut();
-                    dec_ref.decode_frame(&sb_ref, out_w, out_h, comb_1h, legacy).to_vec()
+            TL_SIGNAL_BUF.with(|sb| {
+                TL_SIGNAL_BUF_C.with(|sc| {
+                    analog_frame(
+                        &mut enc.borrow_mut(), &mut dec.borrow_mut(), &mut sb.borrow_mut(), &mut sc.borrow_mut(),
+                        f1, f2, in_w, in_h, out_w, out_h, fnum, comb_1h, values, fx, effects_active,
+                    )
                 })
-            } else {
-                let mut dec_ref = dec.borrow_mut();
-                dec_ref.decode_frame(signal, out_w, out_h, comb_1h, legacy).to_vec()
-            }
+            })
         })
     })
 }
@@ -885,5 +921,63 @@ fn mux_audio(source: &Path, video_path: &Path) {
         _ => {
             let _ = std::fs::remove_file(&tmp);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat(rgb: [u8; 3]) -> Vec<u8> {
+        (0..640 * 480).flat_map(|_| rgb).collect()
+    }
+
+    fn mean(img: &[u8], x0: usize, x1: usize) -> [f32; 3] {
+        let mut m = [0.0f32; 3];
+        let mut n = 0.0;
+        for y in 100..380 {
+            for x in x0..x1 {
+                for c in 0..3 {
+                    m[c] += img[(y * 640 + x) * 3 + c] as f32;
+                }
+                n += 1.0;
+            }
+        }
+        m.map(|v| v / n)
+    }
+
+    #[test]
+    fn svideo_reproduces_flat_colours() {
+        let mut values = ParamValues::default();
+        values.set_from_str("video-out", "svideo").unwrap();
+        let fx = resolve_effects(&values);
+        for rgb in [[200u8, 40, 40], [40, 160, 60], [50, 60, 200], [128, 128, 128]] {
+            let out = render_frame(&flat(rgb), 640, 480, 640, 480, false, &values, &fx, 0);
+            let m = mean(&out, 100, 540);
+            for c in 0..3 {
+                assert!((m[c] - rgb[c] as f32).abs() < 3.0, "{:?} -> {:?}", rgb, m);
+            }
+        }
+    }
+
+    #[test]
+    fn svideo_has_no_cross_colour_on_fine_luma_detail() {
+        // Vertical grey stripes two pixels wide: composite decoding turns
+        // part of this luma detail into false colour, S-Video must not.
+        let src: Vec<u8> = (0..640 * 480).flat_map(|i| if (i % 640) / 2 % 2 == 0 { [60u8; 3] } else { [190u8; 3] }).collect();
+        let sat = |out: &[u8]| -> f32 {
+            let mut s = 0.0;
+            for p in out.chunks(3) {
+                let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+                s += r.max(g).max(b) - r.min(g).min(b);
+            }
+            s / (out.len() / 3) as f32
+        };
+        let mut v = ParamValues::default();
+        let fx = resolve_effects(&v);
+        let composite = sat(&render_frame(&src, 640, 480, 640, 480, false, &v, &fx, 0));
+        v.set_from_str("video-out", "svideo").unwrap();
+        let svideo = sat(&render_frame(&src, 640, 480, 640, 480, false, &v, &fx, 0));
+        assert!(svideo < 0.25 * composite, "svideo {} vs composite {}", svideo, composite);
     }
 }

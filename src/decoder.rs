@@ -86,12 +86,7 @@ impl Decoder {
         let spl = SAMPLES_PER_LINE;
         let ypl = spl + RIGHT_PAD;
 
-        // Ensure output buffer is the right size
-        let out_size = output_width * output_height * 3;
-        if self.cached_out_dims != (output_width, output_height) {
-            self.output.resize(out_size, 0);
-            self.cached_out_dims = (output_width, output_height);
-        }
+        self.prepare_output(output_width, output_height);
 
         // Extract full lines for all visible lines (480 x 910)
         for vis in 0..VISIBLE_LINES {
@@ -133,6 +128,51 @@ impl Decoder {
                 }
             }
         }
+
+        self.finish(output_width, output_height, legacy_burst_phase)
+    }
+
+    fn prepare_output(&mut self, output_width: usize, output_height: usize) {
+        let out_size = output_width * output_height * 3;
+        if self.cached_out_dims != (output_width, output_height) {
+            self.output.resize(out_size, 0);
+            self.cached_out_dims = (output_width, output_height);
+        }
+    }
+
+    /// Decode an S-Video signal pair: luma from the Y wire with no comb
+    /// filter, chroma from the C wire, so there is no cross-colour or
+    /// cross-luma.
+    pub fn decode_svideo(
+        &mut self,
+        y_signal: &[f32],
+        c_signal: &[f32],
+        output_width: usize,
+        output_height: usize,
+        legacy_burst_phase: bool,
+    ) -> &[u8] {
+        let spl = SAMPLES_PER_LINE;
+        let ypl = spl + RIGHT_PAD;
+        self.prepare_output(output_width, output_height);
+        for vis in 0..VISIBLE_LINES {
+            let abs = self.abs_lines[vis];
+            let sig = abs * spl;
+            let base = vis * spl;
+            // full_lines holds the C wire (burst phase is measured on it).
+            self.full_lines[base..base + spl].copy_from_slice(&c_signal[sig..sig + spl]);
+            for n in 0..spl {
+                self.chroma_full[base + n] = c_signal[sig + n] - BLANKING_V;
+            }
+            self.y_full[vis * ypl..vis * ypl + spl].copy_from_slice(&y_signal[sig..sig + spl]);
+        }
+        self.finish(output_width, output_height, legacy_burst_phase)
+    }
+
+    /// Everything after luma/chroma separation: luma lowpass, burst phase,
+    /// product detection, I/Q lowpass, YIQ to RGB.
+    fn finish(&mut self, output_width: usize, output_height: usize, legacy_burst_phase: bool) -> &[u8] {
+        let spl = SAMPLES_PER_LINE;
+        let ypl = spl + RIGHT_PAD;
 
         // Edge-pad luma rows on the right for filter settling
         for vis in 0..VISIBLE_LINES {

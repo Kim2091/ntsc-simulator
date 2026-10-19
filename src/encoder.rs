@@ -6,6 +6,19 @@ use crate::constants::*;
 use crate::filters::{self, FilterKernel, FilterScratch, NtscFilters};
 
 const PAD: usize = NUM_TAPS;
+
+/// Which signal the encoder produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Wire {
+    /// Composite video: luma + chroma + sync + burst on one wire.
+    #[default]
+    Composite,
+    /// S-Video Y wire: luma and sync, no chroma, no burst.
+    Luma,
+    /// S-Video C wire: modulated chroma and burst around the blanking
+    /// level, no luma, no sync.
+    Chroma,
+}
 const PADDED_ACTIVE: usize = ACTIVE_SAMPLES + 2 * PAD;
 
 /// Precomputed data for the encoder (reuse across frames).
@@ -34,6 +47,8 @@ pub struct Encoder {
     ts: Vec<f32>,
     /// Cached source dimensions for interpolation table invalidation
     cached_src_dims: (usize, usize),
+    /// Signal to produce (composite by default).
+    pub wire: Wire,
 }
 
 impl Encoder {
@@ -60,6 +75,7 @@ impl Encoder {
             x1s: vec![0usize; ACTIVE_SAMPLES],
             ts: vec![0.0f32; ACTIVE_SAMPLES],
             cached_src_dims: (0, 0),
+            wire: Wire::Composite,
         }
     }
 
@@ -164,11 +180,26 @@ impl Encoder {
             let q_row = &self.q_all[base..base + ACTIVE_SAMPLES];
             let row = &mut self.active_voltage[base..base + ACTIVE_SAMPLES];
 
-            for n in 0..ACTIVE_SAMPLES {
-                let i_carrier = i_lut[n & 3];
-                let q_carrier = q_lut[n & 3];
-                let chroma = i_row[n] * i_carrier + q_row[n] * q_carrier;
-                row[n] = (y_row[n] + chroma) * COMPOSITE_SCALE + COMPOSITE_OFFSET;
+            match self.wire {
+                Wire::Composite => {
+                    for n in 0..ACTIVE_SAMPLES {
+                        let i_carrier = i_lut[n & 3];
+                        let q_carrier = q_lut[n & 3];
+                        let chroma = i_row[n] * i_carrier + q_row[n] * q_carrier;
+                        row[n] = (y_row[n] + chroma) * COMPOSITE_SCALE + COMPOSITE_OFFSET;
+                    }
+                }
+                Wire::Luma => {
+                    for n in 0..ACTIVE_SAMPLES {
+                        row[n] = y_row[n] * COMPOSITE_SCALE + COMPOSITE_OFFSET;
+                    }
+                }
+                Wire::Chroma => {
+                    for n in 0..ACTIVE_SAMPLES {
+                        let chroma = i_row[n] * i_lut[n & 3] + q_row[n] * q_lut[n & 3];
+                        row[n] = chroma * COMPOSITE_SCALE + BLANKING_V;
+                    }
+                }
             }
         }
 
@@ -180,8 +211,13 @@ impl Encoder {
         // Build the full 525-line signal (reuse pre-allocated buffer)
         self.signal.fill(BLANKING_V);
 
-        write_blanking_structure(&mut self.signal);
-        self.write_burst_visible(frame_phase);
+        // The C wire carries no sync; the Y wire carries no burst.
+        if self.wire != Wire::Chroma {
+            write_blanking_structure(&mut self.signal);
+        }
+        if self.wire != Wire::Luma {
+            self.write_burst_visible(frame_phase);
+        }
 
         for vis_line in 0..VISIBLE_LINES {
             let abs_line = self.abs_lines[vis_line];
@@ -191,7 +227,9 @@ impl Encoder {
                 .copy_from_slice(&self.active_voltage[av_start..av_start + ACTIVE_SAMPLES]);
         }
 
-        self.write_burst_blank_lines(frame_phase);
+        if self.wire != Wire::Luma {
+            self.write_burst_blank_lines(frame_phase);
+        }
 
         &self.signal
     }

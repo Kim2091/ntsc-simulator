@@ -277,6 +277,7 @@ There are two families:
 | `--preset` | roundtrip | x264 encoding preset, e.g. `ultrafast`, `fast`, `slow` (default: fast) |
 | `--input-matrix` | roundtrip, extract-frame | Source colour matrix: `auto` (tag, else BT.709 for HD / BT.601 for SD), `601`, `709` |
 | `--input-range` | roundtrip, extract-frame | Source range: `auto` (tag, else limited), `limited`, `full` |
+| `--video-out` | roundtrip, image, colorbars | Connection to the TV / capture card: `composite` (default; comb filter, cross-colour) or `svideo` (separate Y/C wires, no comb, no cross-colour) |
 | `--threads` | roundtrip | Number of parallel worker threads (default: all logical cores) |
 
 ### Signal degradation (reception)
@@ -411,6 +412,15 @@ The VHS simulation models both the recording and playback signal paths:
 | Frame rate | 29.97 fps |
 | Lines per frame | 525 (480 visible) |
 | Samples per line | 910 |
+
+## Changelog
+
+Newest first.
+
+- **S-Video connection** (`--video-out svideo`): the encoder can produce separate Y and C wires; the decoder takes luma from the Y wire without a comb filter and chroma from the C wire, so there is no cross-colour or dot crawl. Tape effects run per wire (luma effects on Y, colour effects on C, timing effects identically on both).
+- **Lossless, colour-correct video I/O**: lossless RGB output by default (FFV1 `.mkv` / x264 RGB `.mp4`, verified bit-exact), `--lossy` for the old x264 4:2:0 output; input converted with the source's colour matrix and range (`--input-matrix`, `--input-range`); `extract-frame`.
+- **GUI** (`ntsc-gui`) with live preview, presets and batch processing; library + CLI split with one shared parameter model; JSON presets (`--preset-file`); `legacy-*` presets.
+- **VHS effects**: head switching, top chroma bands, caption data line, colour-under chroma noise, chroma phase jitter, 1H chroma comb, chroma delay, time-base wobble, temporal coherence; `--seed`; `--legacy-burst-phase`; decoder burst-phase sign fix.
 
 ## Comb Filter Modes
 
