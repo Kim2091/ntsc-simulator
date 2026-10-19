@@ -1,5 +1,7 @@
 //! Playback-deck stages that need consecutive frames.
 
+use crate::simd::multiversion;
+
 /// Recursive (temporal) noise reduction as in many VCRs and capture
 /// devices: each output frame is blended with the previous output where
 /// the picture is still.
@@ -34,35 +36,65 @@ impl TemporalDnr {
             self.h = h;
             return;
         };
+        let mut out = vec![0.0f32; w * h * 3];
+        blend_still(&cur, prev, w, h, self.k_max, self.threshold, &mut out);
+        round_to_u8(&out, rgb);
+        self.prev = Some(out);
+    }
+}
+
+multiversion! {
+    /// One step of `TemporalDnr`: blend `prev` into `cur` by stillness.
+    /// The 3×3 mean of the luma difference is accumulated a row of
+    /// neighbours at a time across the whole picture row, which adds each
+    /// pixel's terms in the same order (top to bottom, left to right) as a
+    /// per-pixel loop.
+    #[allow(clippy::too_many_arguments)]
+    fn blend_still(cur: &[f32], prev: &[f32], w: usize, h: usize, k_max: f32, threshold: f32, out: &mut [f32]) {
         // Luma difference per pixel.
         let mut d = vec![0.0f32; w * h];
         for i in 0..w * h {
             let l = |p: &[f32]| 0.299 * p[i * 3] + 0.587 * p[i * 3 + 1] + 0.114 * p[i * 3 + 2];
-            d[i] = (l(&cur) - l(prev)).abs();
+            d[i] = (l(cur) - l(prev)).abs();
         }
-        let mut out = vec![0.0f32; w * h * 3];
+        let mut m = vec![0.0f32; w];
+        let mut n = vec![0.0f32; w];
         for y in 0..h {
-            for x in 0..w {
-                let mut m = 0.0;
-                let mut n = 0.0;
-                for yy in y.saturating_sub(1)..(y + 2).min(h) {
-                    for xx in x.saturating_sub(1)..(x + 2).min(w) {
-                        m += d[yy * w + xx];
-                        n += 1.0;
-                    }
+            m.fill(0.0);
+            n.fill(0.0);
+            for yy in y.saturating_sub(1)..(y + 2).min(h) {
+                let row = &d[yy * w..(yy + 1) * w];
+                // Neighbour x − 1, then x, then x + 1.
+                for x in 1..w {
+                    m[x] += row[x - 1];
+                    n[x] += 1.0;
                 }
-                let still = (1.0 - (m / n) / self.threshold).clamp(0.0, 1.0);
-                let k = self.k_max * still;
+                for x in 0..w {
+                    m[x] += row[x];
+                    n[x] += 1.0;
+                }
+                for x in 0..w.saturating_sub(1) {
+                    m[x] += row[x + 1];
+                    n[x] += 1.0;
+                }
+            }
+            for x in 0..w {
+                let still = (1.0 - (m[x] / n[x]) / threshold).clamp(0.0, 1.0);
+                let k = k_max * still;
                 let i = (y * w + x) * 3;
                 for c in 0..3 {
                     out[i + c] = cur[i + c] + k * (prev[i + c] - cur[i + c]);
                 }
             }
         }
-        for (dst, v) in rgb.iter_mut().zip(&out) {
-            *dst = v.round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+multiversion! {
+    fn round_to_u8(src: &[f32], dst: &mut [u8]) {
+        for (d, v) in dst.iter_mut().zip(src) {
+            *d = v.round().clamp(0.0, 255.0) as u8;
         }
-        self.prev = Some(out);
     }
 }
 
