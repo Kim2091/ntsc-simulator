@@ -25,6 +25,7 @@ use crate::constants::{
 use crate::encoder::Wire;
 use crate::filters;
 use crate::profile;
+use crate::simd::multiversion;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Ghost configuration
@@ -1492,6 +1493,42 @@ fn lowpass_zero_phase(buf: &mut [f32], alpha: f32) {
     }
 }
 
+/// Lines of colour-under noise generated and filtered together.
+const NOISE_LANES: usize = 8;
+
+multiversion! {
+    /// `lowpass_zero_phase` on `NOISE_LANES` interleaved signals at once
+    /// (`buf[j * NOISE_LANES + l]` is sample `j` of signal `l`), for both
+    /// `a` and `b`.  Each signal gets exactly the operations of
+    /// `lowpass_zero_phase`.
+    fn lowpass_zero_phase_lanes(a: &mut [f32], b: &mut [f32], alpha: f32) {
+        const L: usize = NOISE_LANES;
+        let len = a.len() / L;
+        if len == 0 {
+            return;
+        }
+        let first = |v: &[f32], j: usize| -> [f32; L] { v[j * L..(j + 1) * L].try_into().unwrap() };
+        let (mut pa, mut pb) = (first(a, 0), first(b, 0));
+        for (sa, sb) in a.chunks_exact_mut(L).zip(b.chunks_exact_mut(L)) {
+            for l in 0..L {
+                pa[l] += alpha * (sa[l] - pa[l]);
+                sa[l] = pa[l];
+                pb[l] += alpha * (sb[l] - pb[l]);
+                sb[l] = pb[l];
+            }
+        }
+        let (mut pa, mut pb) = (first(a, len - 1), first(b, len - 1));
+        for (sa, sb) in a.chunks_exact_mut(L).zip(b.chunks_exact_mut(L)).rev() {
+            for l in 0..L {
+                pa[l] += alpha * (sa[l] - pa[l]);
+                sa[l] = pa[l];
+                pb[l] += alpha * (sb[l] - pb[l]);
+                sb[l] = pb[l];
+            }
+        }
+    }
+}
+
 /// Simulate the VHS playback chroma path in demodulated I/Q baseband.
 ///
 /// For every active line the comb-separated chroma is demodulated with the
@@ -1552,8 +1589,10 @@ fn apply_chroma_path(
     // The noise is generated with a margin on both sides so the filter has
     // settled by the time it reaches the picture.
     let pad = 256;
-    let mut noise_i = vec![0.0f32; act + 2 * pad];
-    let mut noise_q = vec![0.0f32; act + 2 * pad];
+    // Noise for `NOISE_LANES` lines at a time, interleaved by line.
+    let lanes = NOISE_LANES;
+    let mut noise_i = vec![0.0f32; (act + 2 * pad) * lanes];
+    let mut noise_q = vec![0.0f32; (act + 2 * pad) * lanes];
     let mut prev_i = vec![0.0f32; act];
     let mut prev_q = vec![0.0f32; act];
     let mut tmp_i = vec![0.0f32; act];
@@ -1592,23 +1631,29 @@ fn apply_chroma_path(
         // ── 1. Colour-under noise ──
         if cfg.noise > 0.0 {
             let amp = cfg.noise * COMPOSITE_SCALE * noise_gain;
-            for k in 0..n_lines {
-                for j in 0..act + 2 * pad {
-                    noise_i[j] = randn(rng);
-                    noise_q[j] = randn(rng);
-                }
-                lowpass_zero_phase(&mut noise_i, noise_alpha);
-                lowpass_zero_phase(&mut noise_q, noise_alpha);
-                for j in 0..act {
-                    let (mut ni, mut nq) = (noise_i[pad + j], noise_q[pad + j]);
-                    if k > 0 {
-                        ni = line_corr * prev_i[j] + fresh * ni;
-                        nq = line_corr * prev_q[j] + fresh * nq;
+            for k0 in (0..n_lines).step_by(lanes) {
+                let block = lanes.min(n_lines - k0);
+                for l in 0..block {
+                    for j in 0..act + 2 * pad {
+                        noise_i[j * lanes + l] = randn(rng);
+                        noise_q[j * lanes + l] = randn(rng);
                     }
-                    prev_i[j] = ni;
-                    prev_q[j] = nq;
-                    new_i[k * act + j] += amp * ni;
-                    new_q[k * act + j] += amp * nq;
+                }
+                lowpass_zero_phase_lanes(&mut noise_i, &mut noise_q, noise_alpha);
+                for l in 0..block {
+                    let k = k0 + l;
+                    for j in 0..act {
+                        let at = (pad + j) * lanes + l;
+                        let (mut ni, mut nq) = (noise_i[at], noise_q[at]);
+                        if k > 0 {
+                            ni = line_corr * prev_i[j] + fresh * ni;
+                            nq = line_corr * prev_q[j] + fresh * nq;
+                        }
+                        prev_i[j] = ni;
+                        prev_q[j] = nq;
+                        new_i[k * act + j] += amp * ni;
+                        new_q[k * act + j] += amp * nq;
+                    }
                 }
             }
         }
