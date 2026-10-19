@@ -513,6 +513,7 @@ The VHS simulation models both the recording and playback signal paths:
 
 Newest first.
 
+- **AV1 input fallback**: AV1 sources decode with libdav1d when ffmpeg has it, otherwise with hardware decoding, so files that libaom rejects (for example an unknown level index) still load; frame-grab errors now include ffmpeg's own message.
 - **Playback deck and capture stages**: line TBC, frame TBC with a new vertical-bounce effect, recursive deck noise reduction (sequential stage), deck sharpness control, motion-adaptive 3D comb (`--comb 2sample|1h|3d`), deck profiles (`--deck`, and a "Playback deck" dropdown in the GUI).
 - **DVD presets** (`dvd-hq`, `dvd-mq`, `dvd-mq-ee`, `dvd-lq`, `dvd-interlaced`); `--vhs-preset` renamed to `--preset` (old name kept as an alias); roundtrip's x264 `--preset` is now `--x264-preset`.
 - **DVD-Video path** (`--format dvd`): mastering (aspect-correct Lanczos fit, pre-filter, DNR, edge enhancement), field-based 4:2:0, MPEG-2 within the DVD-Video limits via ffmpeg with soft pulldown for film, player chroma upsampling error, digital / S-Video / composite player output, kept MPEG-2 streams and `dvd-check`.

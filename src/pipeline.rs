@@ -1202,6 +1202,58 @@ fn spawn_ffmpeg_reader(input: &Path, values: &ParamValues, progress: &dyn Progre
 
 /// The reader with an extra filter before the RGB conversion (e.g. a
 /// frame-rate conversion).
+/// Decoder options to put before `-i` for this input.
+///
+/// AV1 is the one codec where ffmpeg's default can fail on valid files:
+/// builds without libdav1d fall back to libaom, which rejects streams that
+/// signal a level it does not know.  For AV1 this prefers libdav1d, then
+/// hardware decoding (bit-exact, as AV1 decoding is normative), then libaom.
+pub fn input_decoder_args(path: &Path) -> Vec<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static HAS_DAV1D: OnceLock<bool> = OnceLock::new();
+    static CHOICE: OnceLock<Mutex<HashMap<PathBuf, Vec<String>>>> = OnceLock::new();
+
+    let cache = CHOICE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(args) = cache.lock().unwrap().get(path) {
+        return args.clone();
+    }
+
+    let codec = tool_command("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    let args: Vec<String> = if codec != "av1" {
+        Vec::new()
+    } else if *HAS_DAV1D.get_or_init(|| {
+        tool_command("ffmpeg")
+            .args(["-hide_banner", "-decoders"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("libdav1d"))
+            .unwrap_or(false)
+    }) {
+        vec!["-c:v".into(), "libdav1d".into()]
+    } else {
+        let hw: Vec<String> = vec!["-hwaccel".into(), "auto".into(), "-c:v".into(), "av1".into()];
+        let decodes = tool_command("ffmpeg")
+            .args(["-v", "error"])
+            .args(&hw)
+            .arg("-i")
+            .arg(path)
+            .args(["-frames:v", "1", "-f", "null", "-"])
+            .output()
+            .map(|o| o.status.success() && o.stderr.is_empty())
+            .unwrap_or(false);
+        if decodes { hw } else { Vec::new() }
+    };
+    cache.lock().unwrap().insert(path.to_path_buf(), args.clone());
+    args
+}
+
 fn spawn_ffmpeg_reader_with(
     input: &Path,
     values: &ParamValues,
@@ -1215,6 +1267,7 @@ fn spawn_ffmpeg_reader_with(
         None => colour.filter(),
     };
     tool_command("ffmpeg")
+        .args(input_decoder_args(input))
         .arg("-i")
         .arg(input)
         .args(["-vf", &filter])
@@ -1355,6 +1408,7 @@ pub fn grab_video_frames(
     let start = (time_s - (count as f64 - 1.0) / fps.max(1.0)).max(0.0);
     let colour = input_colour(path, values);
     let output = tool_command("ffmpeg")
+        .args(input_decoder_args(path))
         .args(["-v", "error", "-ss", &format!("{:.3}", start), "-i"])
         .arg(path)
         .args(["-vf", &colour.filter()])
@@ -1364,7 +1418,7 @@ pub fn grab_video_frames(
     let n = w * h * 3;
     let frames: Vec<Vec<u8>> = output.stdout.chunks_exact(n).map(|c| c.to_vec()).collect();
     if frames.is_empty() {
-        bail!("ffmpeg returned no frames at {:.2} s", time_s);
+        bail!("ffmpeg returned no frames at {:.2} s: {}", time_s, ffmpeg_error_text(&output.stderr));
     }
     Ok(frames)
 }
@@ -1375,6 +1429,7 @@ pub fn grab_video_frame(path: &Path, time_s: f64, values: &ParamValues) -> Resul
     let (w, h, ..) = ffprobe_video(path)?;
     let colour = input_colour(path, values);
     let output = tool_command("ffmpeg")
+        .args(input_decoder_args(path))
         .args(["-v", "error", "-ss", &format!("{:.3}", time_s.max(0.0)), "-i"])
         .arg(path)
         .args(["-vf", &colour.filter()])
@@ -1383,9 +1438,19 @@ pub fn grab_video_frame(path: &Path, time_s: f64, values: &ParamValues) -> Resul
         .context("Failed to run ffmpeg. Is ffmpeg installed?")?;
     let need = w * h * 3;
     if output.stdout.len() < need {
-        bail!("ffmpeg returned no frame at {:.2} s", time_s);
+        bail!("ffmpeg returned no frame at {:.2} s: {}", time_s, ffmpeg_error_text(&output.stderr));
     }
     Ok((output.stdout[..need].to_vec(), w, h))
+}
+
+/// The last few lines of ffmpeg's error output, for error messages.
+fn ffmpeg_error_text(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return "no error output (decoded size may not match the probed size)".to_string();
+    }
+    lines[lines.len().saturating_sub(3)..].join(" | ")
 }
 
 fn mux_audio(source: &Path, video_path: &Path) {
