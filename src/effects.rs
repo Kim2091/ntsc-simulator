@@ -240,6 +240,8 @@ impl SignalEffects {
     pub fn apply_wire(&self, signal: &mut [f32], sample_rate: f64, rng: &mut impl Rng, frame: u64, wire: Wire) {
         let luma_on = wire != Wire::Chroma;
         let chroma_on = wire != Wire::Luma;
+        // The S-Video Y wire carries no chroma: luma effects act on all of it.
+        let y_wire = wire == Wire::Luma;
         // A line TBC re-times every line from its sync and burst: it removes
         // most line-to-line timing error but not the noise at the head
         // switch.  A frame TBC holds the picture vertically.
@@ -274,7 +276,7 @@ impl SignalEffects {
         if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {
             let luma_bw = if luma_on { self.vhs_luma_bw } else { None };
             let chroma_bw = if chroma_on { self.color_under_bw } else { None };
-            apply_vhs_tape_path(signal, luma_bw, chroma_bw, sample_rate);
+            apply_vhs_tape_path(signal, luma_bw, chroma_bw, sample_rate, y_wire);
         }
         let chroma_cfg = self.chroma_path_config();
         if chroma_cfg.is_active() {
@@ -282,16 +284,16 @@ impl SignalEffects {
         }
         if let Some(gain) = self.edge_ringing {
             if luma_on {
-                apply_edge_ringing(signal, gain, sample_rate);
+                apply_edge_ringing(signal, gain, sample_rate, y_wire);
             }
         }
         if let Some(s) = self.deck_sharpness {
             if luma_on {
-                apply_deck_sharpness(signal, s);
+                apply_deck_sharpness(signal, s, y_wire);
             }
         }
         if let Some(strength) = self.head_switching_smear {
-            on!(luma_on, |s| apply_head_wear_smear(s, strength, rng, &clock));
+            on!(luma_on, |s| apply_head_wear_smear(s, strength, rng, &clock, y_wire));
         }
         if let Some(amp) = self.luma_noise {
             on!(luma_on, |s| apply_luma_noise(s, amp, sample_rate, rng));
@@ -328,7 +330,7 @@ impl SignalEffects {
         // ghosts, etc.) rightward on readout.
         if let Some(strength) = self.tape_trail_smear {
             if luma_on {
-                apply_tape_trail_smear(signal, strength);
+                apply_tape_trail_smear(signal, strength, y_wire);
             }
         }
     }
@@ -571,6 +573,7 @@ fn apply_vhs_tape_path(
     luma_bw_hz: Option<f32>,
     chroma_bw_hz: Option<f32>,
     _sample_rate: f64,
+    full_luma: bool,
 ) {
     if luma_bw_hz.is_none() && chroma_bw_hz.is_none() {
         return;
@@ -602,16 +605,7 @@ fn apply_vhs_tape_path(
         }
 
         // ── Separate luma and chroma via 2-sample delay ──
-        luma[0] = signal[base];
-        luma[1] = signal[base + 1];
-        chroma[0] = 0.0;
-        chroma[1] = 0.0;
-        for n in 2..spl {
-            let cur = signal[base + n];
-            let delayed = signal[base + n - 2];
-            luma[n] = (cur + delayed) * 0.5;
-            chroma[n] = (cur - delayed) * 0.5;
-        }
+        comb_split(&signal[base..base + spl], &mut luma, &mut chroma, full_luma);
 
         // ── Luma bandwidth reduction ──
         if let Some(ref kernel) = luma_kernel {
@@ -640,6 +634,27 @@ fn apply_vhs_tape_path(
         for n in 0..spl {
             signal[base + n] = luma[n] + chroma[n];
         }
+    }
+}
+
+/// Split one line into luma and chroma with the 2-sample comb.  On an
+/// S-Video Y wire (`full_luma`) there is no chroma, so the whole signal is
+/// luma: luma-domain effects then act on all of it.
+fn comb_split(line: &[f32], luma: &mut [f32], chroma: &mut [f32], full_luma: bool) {
+    if full_luma {
+        luma.copy_from_slice(line);
+        chroma.fill(0.0);
+        return;
+    }
+    luma[0] = line[0];
+    luma[1] = line[1];
+    chroma[0] = 0.0;
+    chroma[1] = 0.0;
+    for n in 2..line.len() {
+        let cur = line[n];
+        let delayed = line[n - 2];
+        luma[n] = (cur + delayed) * 0.5;
+        chroma[n] = (cur - delayed) * 0.5;
     }
 }
 
@@ -715,7 +730,7 @@ fn apply_tape_dropout(
 /// Because the windowed-sinc FIR has Gibbs-phenomenon overshoot, this
 /// naturally creates the bright/dark halos around edges that are
 /// characteristic of VHS sharpness enhancement.
-fn apply_edge_ringing(signal: &mut [f32], strength: f32, _sample_rate: f64) {
+fn apply_edge_ringing(signal: &mut [f32], strength: f32, _sample_rate: f64, full_luma: bool) {
     let spl = SAMPLES_PER_LINE;
     if signal.len() < TOTAL_LINES * spl {
         return;
@@ -739,16 +754,7 @@ fn apply_edge_ringing(signal: &mut [f32], strength: f32, _sample_rate: f64) {
 
         // Separate luma/chroma so peaking does not boost chroma amplitude
         // (which appears as color oversaturation).
-        luma[0] = signal[base];
-        luma[1] = signal[base + 1];
-        chroma[0] = 0.0;
-        chroma[1] = 0.0;
-        for n in 2..spl {
-            let cur = signal[base + n];
-            let delayed = signal[base + n - 2];
-            luma[n] = (cur + delayed) * 0.5;
-            chroma[n] = (cur - delayed) * 0.5;
-        }
+        comb_split(&signal[base..base + spl], &mut luma, &mut chroma, full_luma);
 
         // Apply peaking only on active picture luma.
         luma_active.copy_from_slice(&luma[ACTIVE_START..ACTIVE_START + ACTIVE_SAMPLES]);
@@ -844,6 +850,7 @@ fn apply_head_wear_smear(
     strength: f32,
     rng: &mut impl Rng,
     clock: &TapeClock,
+    full_luma: bool,
 ) {
     let spl = SAMPLES_PER_LINE;
     if signal.len() < TOTAL_LINES * spl {
@@ -894,16 +901,7 @@ fn apply_head_wear_smear(
         }
 
         // ── Separate luma and chroma via 2-sample comb ──
-        luma[0] = signal[base];
-        luma[1] = signal[base + 1];
-        chroma[0] = 0.0;
-        chroma[1] = 0.0;
-        for n in 2..spl {
-            let cur = signal[base + n];
-            let delayed = signal[base + n - 2];
-            luma[n] = (cur + delayed) * 0.5;
-            chroma[n] = (cur - delayed) * 0.5;
-        }
+        comb_split(&signal[base..base + spl], &mut luma, &mut chroma, full_luma);
 
         // ── Box-blur the luma active region only ──
         let act_len = ACTIVE_SAMPLES;
@@ -954,7 +952,7 @@ fn apply_head_wear_smear(
 /// variation (that's what `head_switching_smear` is for).
 ///
 /// `strength` controls how heavy the trailing is (0.3 = subtle, 1.0 = heavy).
-fn apply_tape_trail_smear(signal: &mut [f32], strength: f32) {
+fn apply_tape_trail_smear(signal: &mut [f32], strength: f32, full_luma: bool) {
     let spl = SAMPLES_PER_LINE;
     if signal.len() < TOTAL_LINES * spl {
         return;
@@ -975,16 +973,7 @@ fn apply_tape_trail_smear(signal: &mut [f32], strength: f32) {
         }
 
         // ── Separate luma and chroma via 2-sample comb ──
-        luma[0] = signal[base];
-        luma[1] = signal[base + 1];
-        chroma[0] = 0.0;
-        chroma[1] = 0.0;
-        for n in 2..spl {
-            let cur = signal[base + n];
-            let delayed = signal[base + n - 2];
-            luma[n] = (cur + delayed) * 0.5;
-            chroma[n] = (cur - delayed) * 0.5;
-        }
+        comb_split(&signal[base..base + spl], &mut luma, &mut chroma, full_luma);
 
         // ── Causal IIR on luma only (active region) ──
         let act_start = ACTIVE_START;
@@ -1823,7 +1812,7 @@ fn apply_v_jitter(signal: &mut [f32], amp_rows: f32, rng: &mut impl Rng, clock: 
 /// overshoot); negative values blend towards a 2 MHz lowpass (softer
 /// picture, less visible noise); 0 is the "edit" setting with no
 /// enhancement.
-fn apply_deck_sharpness(signal: &mut [f32], sharpness: f32) {
+fn apply_deck_sharpness(signal: &mut [f32], sharpness: f32, full_luma: bool) {
     let spl = SAMPLES_PER_LINE;
     let s = sharpness.clamp(-1.0, 1.0);
     if s == 0.0 || signal.len() < TOTAL_LINES * spl {
@@ -1836,14 +1825,7 @@ fn apply_deck_sharpness(signal: &mut [f32], sharpness: f32) {
     let mut scratch = Vec::new();
     for line in 0..TOTAL_LINES {
         let base = line * spl;
-        luma[0] = signal[base];
-        luma[1] = signal[base + 1];
-        chroma[0] = 0.0;
-        chroma[1] = 0.0;
-        for n in 2..spl {
-            luma[n] = (signal[base + n] + signal[base + n - 2]) * 0.5;
-            chroma[n] = (signal[base + n] - signal[base + n - 2]) * 0.5;
-        }
+        comb_split(&signal[base..base + spl], &mut luma, &mut chroma, full_luma);
         active.copy_from_slice(&luma[ACTIVE_START..ACTIVE_START + ACTIVE_SAMPLES]);
         apply_fir_inplace(&mut active, &lp, &mut scratch);
         for j in 0..ACTIVE_SAMPLES {
@@ -2167,7 +2149,7 @@ mod tests {
             f(&mut sig, &mut rng, &TapeClock { seed: 5, frame, coherence });
             sig
         };
-        let smear = |s: &mut [f32], r: &mut StdRng, c: &TapeClock| apply_head_wear_smear(s, 0.8, r, c);
+        let smear = |s: &mut [f32], r: &mut StdRng, c: &TapeClock| apply_head_wear_smear(s, 0.8, r, c, false);
         let wobble = |s: &mut [f32], r: &mut StdRng, c: &TapeClock| apply_wobble(s, 3.0, 1.0, r, c);
         for (name, f) in [("smear", &smear as &dyn Fn(&mut [f32], &mut StdRng, &TapeClock)), ("wobble", &wobble)] {
             let jump = mean_abs_diff(&run(10, 0.0, f), &run(11, 0.0, f));

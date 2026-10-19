@@ -142,7 +142,7 @@ pub fn render_frame(
     let mut buf = Vec::new();
     let mut buf_c = Vec::new();
     analog_frame(
-        &mut encoder, &mut decoder, &mut buf, &mut buf_c, pixels, None, Some((pixels, None)), w, h, out_w, out_h,
+        &mut encoder, &mut decoder, &mut buf, &mut buf_c, pixels, None, Some([(pixels, None), (pixels, None)]), w, h, out_w, out_h,
         frame as u32, comb_1h, values, fx, fx.is_active(),
     )
 }
@@ -150,8 +150,9 @@ pub fn render_frame(
 /// Encode (one or two fields' sources) to the analog signal, apply the
 /// effects for frame `fnum`, and decode, over a composite or S-Video
 /// connection.  `buf`/`buf_c` are reusable scratch buffers.
-/// Source of the previous frame, for the 3D comb: (field 1, field 2).
-pub type PrevFrame<'a> = Option<(&'a [u8], Option<&'a [u8]>)>;
+/// Sources (field 1, field 2) of the previous frame and the one before
+/// it, for the 3D comb.
+pub type PrevFrame<'a> = Option<[(&'a [u8], Option<&'a [u8]>); 2]>;
 
 /// Decoder comb filter for a composite connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,16 +218,19 @@ fn analog_frame(
             fx.apply(buf, SAMPLE_RATE, &mut rng, fnum as u64);
         }
         match (comb_mode(values, comb_1h), prev) {
-            (Comb::Frame3d, Some((p1, p2))) => {
-                // The previous frame as received: same encoder, its own
-                // frame number and effects.  `buf_c` holds it.
-                let pnum = if fnum > 0 { fnum - 1 } else { fnum + 1 };
-                encode(enc, Wire::Composite, buf_c, p1, p2, pnum);
+            (Comb::Frame3d, Some([(a1, a2), (b1, b2)])) => {
+                // The two previous frames as received: same encoder, their
+                // own frame numbers and effects.  At the start of a video
+                // the following frame numbers stand in.
+                let (n1, n2) = if fnum >= 2 { (fnum - 1, fnum - 2) } else { (fnum + 1, fnum + 2) };
+                let mut prev2 = Vec::new();
+                encode(enc, Wire::Composite, buf_c, a1, a2, n1);
+                encode(enc, Wire::Composite, &mut prev2, b1, b2, n2);
                 if effects_active {
-                    let mut rng = frame_rng(values.seed, pnum as u64);
-                    fx.apply(buf_c, SAMPLE_RATE, &mut rng, pnum as u64);
+                    fx.apply(buf_c, SAMPLE_RATE, &mut frame_rng(values.seed, n1 as u64), n1 as u64);
+                    fx.apply(&mut prev2, SAMPLE_RATE, &mut frame_rng(values.seed, n2 as u64), n2 as u64);
                 }
-                dec.decode_frame_3d(buf, buf_c, out_w, out_h, legacy).to_vec()
+                dec.decode_frame_3d(buf, buf_c, &prev2, out_w, out_h, legacy).to_vec()
             }
             (Comb::OneLine, _) => dec.decode_frame(buf, out_w, out_h, true, legacy).to_vec(),
             _ => dec.decode_frame(buf, out_w, out_h, false, legacy).to_vec(),
@@ -548,8 +552,8 @@ fn roundtrip(
     progress.start(total_frames, prefix);
 
     let mut frame_pool: Vec<Vec<u8>> = (0..batch_size).map(|_| vec![0u8; frame_bytes]).collect();
-    // Last source frame of the previous batch (previous frame for the 3D comb).
-    let mut last_frame = vec![0u8; frame_bytes];
+    // Last two source frames of the previous batch (for the 3D comb).
+    let mut last_frames = [vec![0u8; frame_bytes], vec![0u8; frame_bytes]];
 
     loop {
         if progress.is_cancelled() {
@@ -577,20 +581,33 @@ fn roundtrip(
             .into_par_iter()
             .map(|i| {
                 let fnum = frame_num + i as u32;
-                let prev: PrevFrame = if i > 0 {
-                    Some((frame_pool[i - 1].as_slice(), None))
-                } else if frame_num > 0 {
-                    Some((last_frame.as_slice(), None))
-                } else {
-                    Some((frame_pool[0].as_slice(), None))
+                // Source frame `k` frames back, from this batch or the last
+                // two frames of the previous one (the first frames of the
+                // video stand in for missing ones).
+                let back = |k: usize| -> &[u8] {
+                    if i >= k {
+                        &frame_pool[i - k]
+                    } else if frame_num as usize >= k - i {
+                        &last_frames[k - i - 1]
+                    } else {
+                        &frame_pool[0]
+                    }
                 };
+                let prev: PrevFrame = Some([(back(1), None), (back(2), None)]);
                 process_frame_tl(
                     &frame_pool[i], None, prev, in_w, in_h, out_w, out_h, fnum,
                     opts.comb_1h, values, &fx, effects_active,
                 )
             })
             .collect();
-        last_frame.copy_from_slice(&frame_pool[batch_count - 1]);
+        // last_frames[0] = most recent, [1] = the one before.
+        if batch_count >= 2 {
+            last_frames[1].copy_from_slice(&frame_pool[batch_count - 2]);
+        } else {
+            let (a, b) = last_frames.split_at_mut(1);
+            b[0].copy_from_slice(&a[0]);
+        }
+        last_frames[0].copy_from_slice(&frame_pool[batch_count - 1]);
 
         let mut results = results;
         if let Some(dnr) = dnr.as_mut() {
@@ -708,9 +725,11 @@ fn roundtrip_telecine(
             .enumerate()
             .map(|(j, &(f1_idx, f2_idx, fnum))| {
                 let f2 = (f1_idx != f2_idx).then(|| film_buf[f2_idx].as_slice());
-                // The previous NTSC frame of this batch (first one: itself).
-                let (p1, p2) = if j > 0 { (jobs[j - 1].0, jobs[j - 1].1) } else { (f1_idx, f2_idx) };
-                let prev: PrevFrame = Some((film_buf[p1].as_slice(), (p1 != p2).then(|| film_buf[p2].as_slice())));
+                // The two previous NTSC frames of this batch (at the start
+                // of a batch the frame itself stands in).
+                let job = |k: usize| if j >= k { (jobs[j - k].0, jobs[j - k].1) } else { (f1_idx, f2_idx) };
+                let src = |(a, b): (usize, usize)| (film_buf[a].as_slice(), (a != b).then(|| film_buf[b].as_slice()));
+                let prev: PrevFrame = Some([src(job(1)), src(job(2))]);
                 process_frame_tl(
                     &film_buf[f1_idx], f2, prev, in_w, in_h, out_w, out_h, fnum,
                     opts.comb_1h, values, &fx, effects_active,
@@ -815,7 +834,7 @@ fn player_output(
                 TL_SIGNAL_BUF_C.with(|sc| {
                     analog_frame(
                         &mut enc.borrow_mut(), &mut dec.borrow_mut(), &mut sb.borrow_mut(), &mut sc.borrow_mut(),
-                        &src, src2.as_deref(), Some((&src, src2.as_deref())), sw, sh, decode_w, 480, fnum, comb_1h, &vals, fx, fx.is_active(),
+                        &src, src2.as_deref(), Some([(&src, src2.as_deref()), (&src, src2.as_deref())]), sw, sh, decode_w, 480, fnum, comb_1h, &vals, fx, fx.is_active(),
                     )
                 })
             })
@@ -878,16 +897,18 @@ pub fn render_preview_sequence(
     let mut dnr = TemporalDnr::new(strength);
     let n = history.len() as u64;
     let mut prev: &[u8] = history[0];
+    let mut prev2: &[u8] = history[0];
     for (k, src) in history.iter().chain(std::iter::once(&pixels)).enumerate() {
         let fnum = (frame + k as u64).saturating_sub(n);
         let mut encoder = Encoder::new();
         let mut decoder = Decoder::new();
         let (mut b1, mut b2) = (Vec::new(), Vec::new());
         let mut rgb = analog_frame(
-            &mut encoder, &mut decoder, &mut b1, &mut b2, src, None, Some((prev, None)), w, h, out_w, out_h,
+            &mut encoder, &mut decoder, &mut b1, &mut b2, src, None, Some([(prev, None), (prev2, None)]), w, h, out_w, out_h,
             fnum as u32, comb_1h, values, &fx, fx.is_active(),
         );
         dnr.process(&mut rgb, out_w, out_h);
+        prev2 = prev;
         prev = src;
         if k as u64 == n {
             return Ok((rgb, out_w, out_h, values.sampled_summary(&fx)));

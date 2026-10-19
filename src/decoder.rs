@@ -143,16 +143,21 @@ impl Decoder {
     /// Decode with a motion-adaptive 3D (frame) comb filter.
     ///
     /// The NTSC subcarrier inverts from one frame to the next, so where the
-    /// picture is still, half the sum of the current and previous frame is
-    /// pure luma and half the difference pure chroma: no cross-colour and
-    /// no dot crawl.  Where the picture moves, the decoder falls back to
-    /// the 2-sample comb.  Motion is detected from the difference of the
-    /// two frames' comb-filtered luma, smoothed over ±4 samples; the blend
-    /// is fully 3D below about 2 IRE of difference and fully 2D above 6.
+    /// picture is still, half the sum of the current and previous frame
+    /// (`prev`) is pure luma and half the difference pure chroma: no
+    /// cross-colour and no dot crawl.  Motion is detected, as in real 3D
+    /// combs, against the frame two back (`prev2`), which has the same
+    /// subcarrier phase: in still areas the two are identical whatever the
+    /// picture contains, while motion, noise and VHS chroma that changes
+    /// from frame to frame all show up.  The difference is smoothed over
+    /// ±4 samples; the blend is fully 3D below about 1 IRE and fully
+    /// 2-sample comb above 3 IRE (conservative, so frame-to-frame chroma
+    /// noise does not leak into luma as dots).
     pub fn decode_frame_3d(
         &mut self,
         signal: &[f32],
         prev: &[f32],
+        prev2: &[f32],
         output_width: usize,
         output_height: usize,
         legacy_burst_phase: bool,
@@ -161,19 +166,19 @@ impl Decoder {
         let ypl = spl + RIGHT_PAD;
         self.prepare_output(output_width, output_height);
         let ire = BLANKING_V / 40.0;
-        let (lo, hi) = (2.0 * ire, 6.0 * ire);
+        let (lo, hi) = (1.0 * ire, 3.0 * ire);
         let mut diff = vec![0.0f32; spl];
         for vis in 0..VISIBLE_LINES {
             let abs = self.abs_lines[vis];
             let s = abs * spl;
             let cur = &signal[s..s + spl];
             let old = &prev[s..s + spl];
+            let old2 = &prev2[s..s + spl];
             let base = vis * spl;
             let ybase = vis * ypl;
             self.full_lines[base..base + spl].copy_from_slice(cur);
             for n in 0..spl {
-                let l2 = |x: &[f32]| if n >= 2 { (x[n] + x[n - 2]) * 0.5 } else { x[n] };
-                diff[n] = (l2(cur) - l2(old)).abs();
+                diff[n] = (cur[n] - old2[n]).abs();
             }
             for n in 0..spl {
                 let a = n.saturating_sub(4);
