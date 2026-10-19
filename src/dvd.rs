@@ -23,6 +23,7 @@ use rand::Rng;
 
 use crate::mpeg2;
 use crate::params::{ParamValues, RangeParam};
+use crate::simd::multiversion;
 
 /// Where the decoded DVD picture goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,12 +194,7 @@ pub fn resize_plane(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> 
     }
     let hw = weights(sw, dw);
     let mut tmp = vec![0.0f32; dw * sh];
-    for y in 0..sh {
-        let row = &src[y * sw..(y + 1) * sw];
-        for (x, (start, w)) in hw.iter().enumerate() {
-            tmp[y * dw + x] = w.iter().enumerate().map(|(k, c)| c * row[start + k]).sum();
-        }
-    }
+    resize_rows(src, sw, &hw, &mut tmp, dw);
     if sh == dh {
         return tmp;
     }
@@ -214,6 +210,41 @@ pub fn resize_plane(src: &[f32], sw: usize, sh: usize, dw: usize, dh: usize) -> 
         }
     }
     out
+}
+
+/// Rows resized together by `resize_rows`.
+const RESIZE_ROWS: usize = 8;
+
+multiversion! {
+    /// Horizontal pass of `resize_plane`: each output sample is the sum, in
+    /// tap order from −0.0 as `Iterator::sum` does, of weight × input.
+    /// `RESIZE_ROWS` rows are computed side by side so the sums of
+    /// different rows overlap instead of waiting on one add chain.
+    fn resize_rows(src: &[f32], sw: usize, hw: &[(usize, Vec<f32>)], tmp: &mut [f32], dw: usize) {
+        let sh = src.len() / sw;
+        let mut y = 0;
+        while y + RESIZE_ROWS <= sh {
+            let rows: [&[f32]; RESIZE_ROWS] = std::array::from_fn(|l| &src[(y + l) * sw..(y + l + 1) * sw]);
+            for (x, (start, w)) in hw.iter().enumerate() {
+                let mut acc = [-0.0f32; RESIZE_ROWS];
+                for (k, &c) in w.iter().enumerate() {
+                    for l in 0..RESIZE_ROWS {
+                        acc[l] += c * rows[l][start + k];
+                    }
+                }
+                for l in 0..RESIZE_ROWS {
+                    tmp[(y + l) * dw + x] = acc[l];
+                }
+            }
+            y += RESIZE_ROWS;
+        }
+        for y in y..sh {
+            let row = &src[y * sw..(y + 1) * sw];
+            for (x, (start, w)) in hw.iter().enumerate() {
+                tmp[y * dw + x] = w.iter().enumerate().map(|(k, c)| c * row[start + k]).sum();
+            }
+        }
+    }
 }
 
 fn lanczos3(x: f32) -> f32 {
@@ -267,20 +298,22 @@ pub struct Planes {
     pub cr: Vec<f32>,
 }
 
-/// RGB24 to BT.601 studio-range Y'CbCr (Y 16–235, Cb/Cr 16–240).
-pub fn rgb_to_planes(rgb: &[u8], w: usize, h: usize) -> Planes {
-    let n = w * h;
-    let (mut y, mut cb, mut cr) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
-    for i in 0..n {
-        let r = rgb[i * 3] as f32 / 255.0;
-        let g = rgb[i * 3 + 1] as f32 / 255.0;
-        let b = rgb[i * 3 + 2] as f32 / 255.0;
-        let yl = 0.299 * r + 0.587 * g + 0.114 * b;
-        y[i] = 16.0 + 219.0 * yl;
-        cb[i] = 128.0 + 224.0 * (b - yl) / 1.772;
-        cr[i] = 128.0 + 224.0 * (r - yl) / 1.402;
+multiversion! {
+    /// RGB24 to BT.601 studio-range Y'CbCr (Y 16–235, Cb/Cr 16–240).
+    pub fn rgb_to_planes(rgb: &[u8], w: usize, h: usize) -> Planes {
+        let n = w * h;
+        let (mut y, mut cb, mut cr) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        for (i, px) in rgb[..n * 3].chunks_exact(3).enumerate() {
+            let r = px[0] as f32 / 255.0;
+            let g = px[1] as f32 / 255.0;
+            let b = px[2] as f32 / 255.0;
+            let yl = 0.299 * r + 0.587 * g + 0.114 * b;
+            y[i] = 16.0 + 219.0 * yl;
+            cb[i] = 128.0 + 224.0 * (b - yl) / 1.772;
+            cr[i] = 128.0 + 224.0 * (r - yl) / 1.402;
+        }
+        Planes { w, h, y, cb, cr }
     }
-    Planes { w, h, y, cb, cr }
 }
 
 fn to_rgb_pixel(y: f32, cb: f32, cr: f32) -> [u8; 3] {
