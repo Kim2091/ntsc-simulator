@@ -4,6 +4,7 @@ use realfft::RealFftPlanner;
 
 use crate::constants::*;
 use crate::filters::{self, FilterKernel, FilterScratch};
+use crate::profile;
 
 const RIGHT_PAD: usize = NUM_TAPS;
 
@@ -83,6 +84,7 @@ impl Decoder {
         comb_1h: bool,
         legacy_burst_phase: bool,
     ) -> &[u8] {
+        let _p = profile::scope("decode comb");
         let spl = SAMPLES_PER_LINE;
         let ypl = spl + RIGHT_PAD;
 
@@ -129,6 +131,7 @@ impl Decoder {
             }
         }
 
+        drop(_p);
         self.finish(output_width, output_height, legacy_burst_phase)
     }
 
@@ -162,6 +165,7 @@ impl Decoder {
         output_height: usize,
         legacy_burst_phase: bool,
     ) -> &[u8] {
+        let p = profile::scope("decode comb");
         let spl = SAMPLES_PER_LINE;
         let ypl = spl + RIGHT_PAD;
         self.prepare_output(output_width, output_height);
@@ -196,6 +200,7 @@ impl Decoder {
                 self.chroma_full[base + n] = c2 + still * (c3 - c2);
             }
         }
+        drop(p);
         self.finish(output_width, output_height, legacy_burst_phase)
     }
 
@@ -210,6 +215,7 @@ impl Decoder {
         output_height: usize,
         legacy_burst_phase: bool,
     ) -> &[u8] {
+        let p = profile::scope("decode comb");
         let spl = SAMPLES_PER_LINE;
         let ypl = spl + RIGHT_PAD;
         self.prepare_output(output_width, output_height);
@@ -224,12 +230,14 @@ impl Decoder {
             }
             self.y_full[vis * ypl..vis * ypl + spl].copy_from_slice(&y_signal[sig..sig + spl]);
         }
+        drop(p);
         self.finish(output_width, output_height, legacy_burst_phase)
     }
 
     /// Everything after luma/chroma separation: luma lowpass, burst phase,
     /// product detection, I/Q lowpass, YIQ to RGB.
     fn finish(&mut self, output_width: usize, output_height: usize, legacy_burst_phase: bool) -> &[u8] {
+        let _p = profile::scope("decode filter/rgb");
         let spl = SAMPLES_PER_LINE;
         let ypl = spl + RIGHT_PAD;
 

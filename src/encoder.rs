@@ -4,6 +4,7 @@ use realfft::RealFftPlanner;
 
 use crate::constants::*;
 use crate::filters::{self, FilterKernel, FilterScratch, NtscFilters};
+use crate::profile;
 
 const PAD: usize = NUM_TAPS;
 
@@ -115,9 +116,12 @@ impl Encoder {
         height: usize,
         frame_number: u32,
     ) -> &[f32] {
-        self.update_interp_tables(width, height);
-        self.resample_yiq_field1(frame_rgb, width);
-        self.resample_yiq_field2(frame_rgb, width);
+        {
+            let _p = profile::scope("encode resample");
+            self.update_interp_tables(width, height);
+            self.resample_yiq_field1(frame_rgb, width);
+            self.resample_yiq_field2(frame_rgb, width);
+        }
         self.encode_signal_from_yiq(frame_number)
     }
 
@@ -131,14 +135,18 @@ impl Encoder {
         f2_rgb: &[u8],
         frame_number: u32,
     ) -> &[f32] {
-        self.update_interp_tables(width, height);
-        self.resample_yiq_field1(f1_rgb, width);
-        self.resample_yiq_field2(f2_rgb, width);
+        {
+            let _p = profile::scope("encode resample");
+            self.update_interp_tables(width, height);
+            self.resample_yiq_field1(f1_rgb, width);
+            self.resample_yiq_field2(f2_rgb, width);
+        }
         self.encode_signal_from_yiq(frame_number)
     }
 
     /// Build composite signal from the already-filled y/i/q planes.
     fn encode_signal_from_yiq(&mut self, frame_number: u32) -> &[f32] {
+        let _p = profile::scope("encode filter/modulate");
         // Bandwidth-limit: pad, filter, unpad for Y, I, Q
         pad_edge_into(&self.y_all, VISIBLE_LINES, ACTIVE_SAMPLES, PAD, &mut self.padded_buf);
         filters::filter_rows_sequential(&self.active_filters.luma, &mut self.padded_buf, PADDED_ACTIVE, &mut self.fft_scratch);

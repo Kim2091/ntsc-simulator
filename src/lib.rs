@@ -25,3 +25,4 @@ pub mod mpeg2;
 pub mod params;
 pub mod pipeline;
 pub mod presets;
+pub mod profile;

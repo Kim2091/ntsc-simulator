@@ -243,6 +243,9 @@ enum Commands {
         /// Enable 3:2 pulldown telecine (24fps film -> 29.97fps interlaced)
         #[arg(long)]
         telecine: bool,
+        /// Print the mean time per frame of each processing stage
+        #[arg(long, hide = true)]
+        profile: bool,
         #[command(flatten)]
         effects: EffectArgs,
     },
@@ -414,9 +417,11 @@ fn main() -> Result<()> {
             pipeline::process_images(&input, &output, width, height, comb_1h, &effects.resolve()?, &progress)
         }
         Commands::Roundtrip {
-            input, output, width, height, comb_1h, lossy, crf, x264_preset, lossless, raw_copy, threads, telecine, effects,
+            input, output, width, height, comb_1h, lossy, crf, x264_preset, lossless, raw_copy, threads, telecine, profile,
+            effects,
         } => {
             let _ = lossless;
+            ntsc_composite_simulator::profile::enable(profile);
             let preset = effects.x264_preset().map(String::from).unwrap_or(x264_preset);
             let opts = VideoOptions { width, height, comb_1h, crf, preset, lossy, raw_copy, threads, telecine };
             pipeline::process_videos(&input, &output, &opts, &effects.resolve()?, &progress)

@@ -21,6 +21,7 @@ use crate::dvd::{self, DvdConfig, DvdOutput};
 use crate::effects::SignalEffects;
 use crate::encoder::{Encoder, Wire};
 use crate::params::{frame_rng, ParamValues};
+use crate::profile;
 
 pub const VIDEO_EXTENSIONS: &[&str] =
     &["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "ts", "mts", "m2ts", "mpg", "mpeg"];
@@ -235,6 +236,14 @@ fn analog_frame(
             (Comb::OneLine, _) => dec.decode_frame(buf, out_w, out_h, true, legacy).to_vec(),
             _ => dec.decode_frame(buf, out_w, out_h, false, legacy).to_vec(),
         }
+    }
+}
+
+/// Log the `--profile` table, if timing is on.
+fn log_profile(frames: u64, progress: &dyn Progress) {
+    if profile::enabled() {
+        progress.log(&format!("Profile (CPU time summed over threads):
+{}", profile::report(frames)));
     }
 }
 
@@ -562,6 +571,7 @@ fn roundtrip(
             progress.finish();
             bail!(CANCELLED);
         }
+        let read_scope = profile::scope("read input (ffmpeg)");
         let mut batch_count = 0usize;
         for buf in frame_pool.iter_mut() {
             match reader_buf.read_exact(buf) {
@@ -573,6 +583,7 @@ fn roundtrip(
                 }
             }
         }
+        drop(read_scope);
         if batch_count == 0 {
             break;
         }
@@ -611,16 +622,19 @@ fn roundtrip(
 
         let mut results = results;
         if let Some(dnr) = dnr.as_mut() {
+            let _p = profile::scope("deck dnr");
             for r in results.iter_mut() {
                 dnr.process(r, out_w, out_h);
             }
         }
+        let write_scope = profile::scope("write output (ffmpeg)");
         for result in &results {
             writer_buf.write_all(result).context("write failed")?;
             if let Some(raw) = raw_copy.as_mut() {
                 raw.write_all(result)?;
             }
         }
+        drop(write_scope);
 
         frame_num += batch_count as u32;
         let elapsed = total_start.elapsed().as_secs_f64();
@@ -637,6 +651,7 @@ fn roundtrip(
         "Done: {} frames in {:.1}s ({:.1} fps)",
         frame_num, total_elapsed, frame_num as f64 / total_elapsed,
     ));
+    log_profile(frame_num as u64, progress);
     mux_audio(input, output);
     Ok(())
 }
@@ -683,6 +698,7 @@ fn roundtrip_telecine(
             bail!(CANCELLED);
         }
         // Read groups_per_batch * 4 film frames
+        let read_scope = profile::scope("read input (ffmpeg)");
         let mut film_buf: Vec<Vec<u8>> = Vec::with_capacity(groups_per_batch * 4);
         for _ in 0..groups_per_batch * 4 {
             let mut buf = vec![0u8; frame_bytes];
@@ -695,6 +711,7 @@ fn roundtrip_telecine(
                 }
             }
         }
+        drop(read_scope);
         if film_buf.is_empty() {
             break;
         }
@@ -739,16 +756,19 @@ fn roundtrip_telecine(
 
         let mut results = results;
         if let Some(dnr) = dnr.as_mut() {
+            let _p = profile::scope("deck dnr");
             for r in results.iter_mut() {
                 dnr.process(r, out_w, out_h);
             }
         }
+        let write_scope = profile::scope("write output (ffmpeg)");
         for result in &results {
             writer_buf.write_all(result).context("write failed")?;
             if let Some(raw) = raw_copy.as_mut() {
                 raw.write_all(result)?;
             }
         }
+        drop(write_scope);
 
         film_idx += film_buf.len() as u32;
         ntsc_num += results.len() as u32;
@@ -766,6 +786,7 @@ fn roundtrip_telecine(
         "Done: {} film frames -> {} NTSC frames in {:.1}s",
         film_idx, ntsc_num, total_elapsed
     ));
+    log_profile(ntsc_num as u64, progress);
     mux_audio(input, output);
     Ok(())
 }
@@ -820,10 +841,13 @@ fn player_output(
     fnum: u32,
 ) -> (Vec<u8>, usize, usize) {
     if cfg.output == DvdOutput::Digital {
+        let _p = profile::scope("dvd digital output");
         return dvd::digital_output(rgb, cfg);
     }
+    let analog_scope = profile::scope("dvd analog source");
     let (src, sw, sh) = dvd::analog_source(rgb, cfg);
     let src2 = f2.map(|f| dvd::analog_source(f, cfg).0);
+    drop(analog_scope);
     let mut vals = values.clone();
     vals.choices.insert("video-out", if cfg.output == DvdOutput::Svideo { "svideo" } else { "composite" });
     let (ow, oh) = cfg.output_size();
@@ -1000,6 +1024,7 @@ fn dvd_roundtrip(
             progress.finish();
             bail!(CANCELLED);
         }
+        let read_scope = profile::scope("read input (ffmpeg)");
         let mut frames = Vec::with_capacity(batch);
         for _ in 0..batch {
             let mut buf = vec![0u8; frame_bytes];
@@ -1008,13 +1033,17 @@ fn dvd_roundtrip(
                 Err(_) => break,
             }
         }
+        drop(read_scope);
         if frames.is_empty() {
             break;
         }
+        let master_scope = profile::scope("dvd master");
         let yuv: Vec<dvd::Yuv420> = frames
             .par_iter()
             .map(|f| dvd::to_420(&dvd::master(f, in_w, in_h, src_dar, &cfg), cfg.interlaced()))
             .collect();
+        drop(master_scope);
+        let _p = profile::scope("dvd mpeg-2 encode (ffmpeg)");
         for y in &yuv {
             enc.push(y)?;
         }
@@ -1023,7 +1052,10 @@ fn dvd_roundtrip(
     }
     let _ = reader.wait();
     progress.finish();
-    let encoded = enc.finish()?;
+    let encoded = {
+        let _p = profile::scope("dvd mpeg-2 encode (ffmpeg)");
+        enc.finish()?
+    };
     let n_pics = encoded.stream.pictures.len();
     progress.log(&format!(
         "  Encoded {} pictures ({}), {:.2} Mbit/s mean",
@@ -1058,11 +1090,19 @@ fn dvd_roundtrip(
             bail!(CANCELLED);
         }
         // Batches are a multiple of 4 pictures so pulldown groups stay whole.
+        let decode_scope = profile::scope("dvd mpeg-2 decode");
         let pics: Vec<dvd::DecodedFrame> = decoder.by_ref().take(batch.max(1) * 4).collect();
+        drop(decode_scope);
         if pics.is_empty() {
             break;
         }
-        let rgbs: Vec<Vec<u8>> = pics.par_iter().map(|p| dvd::yuv420_to_rgb(&p.frame, p.interlaced, cfg.cue)).collect();
+        let rgbs: Vec<Vec<u8>> = pics
+            .par_iter()
+            .map(|p| {
+                let _p = profile::scope("dvd yuv to rgb");
+                dvd::yuv420_to_rgb(&p.frame, p.interlaced, cfg.cue)
+            })
+            .collect();
         // (field 1 picture, field 2 picture) per output frame.
         let mut jobs: Vec<(usize, usize, u32)> = Vec::new();
         if pulldown {
@@ -1094,16 +1134,19 @@ fn dvd_roundtrip(
             .collect();
         let mut results = results;
         if let Some(dnr) = dnr.as_mut() {
+            let _p = profile::scope("deck dnr");
             for r in results.iter_mut() {
                 dnr.process(r, ow, oh);
             }
         }
+        let write_scope = profile::scope("write output (ffmpeg)");
         for r in &results {
             writer_buf.write_all(r).context("write failed")?;
             if let Some(raw) = raw_copy.as_mut() {
                 raw.write_all(r)?;
             }
         }
+        drop(write_scope);
         out_num += results.len() as u32;
         progress.advance(pics.len() as u64, "");
     }
@@ -1111,6 +1154,7 @@ fn dvd_roundtrip(
     drop(writer_buf);
     let _ = writer.wait();
     progress.log(&format!("Done: {} pictures -> {} frames in {:.1}s", n_pics, out_num, t0.elapsed().as_secs_f64()));
+    log_profile(out_num as u64, progress);
     mux_audio(input, output);
     Ok(())
 }

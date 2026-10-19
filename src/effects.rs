@@ -24,6 +24,7 @@ use crate::constants::{
 };
 use crate::encoder::Wire;
 use crate::filters;
+use crate::profile;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Ghost configuration
@@ -270,65 +271,82 @@ impl SignalEffects {
             };
         }
         if let Some(strength) = self.vbi_data {
+            let _p = profile::scope("fx vbi-data");
             on!(luma_on, |s| apply_vbi_data(s, strength, sample_rate, rng));
         }
         // VHS tape-path effects
         if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {
+            let _p = profile::scope("fx tape path (luma/colour-under bw)");
             let luma_bw = if luma_on { self.vhs_luma_bw } else { None };
             let chroma_bw = if chroma_on { self.color_under_bw } else { None };
             apply_vhs_tape_path(signal, luma_bw, chroma_bw, sample_rate, y_wire);
         }
         let chroma_cfg = self.chroma_path_config();
         if chroma_cfg.is_active() {
+            let _p = profile::scope("fx chroma path");
             on!(chroma_on, |s| apply_chroma_path(s, &chroma_cfg, sample_rate, rng));
         }
         if let Some(gain) = self.edge_ringing {
+            let _p = profile::scope("fx edge ringing");
             if luma_on {
                 apply_edge_ringing(signal, gain, sample_rate, y_wire);
             }
         }
         if let Some(s) = self.deck_sharpness {
+            let _p = profile::scope("fx deck sharpness");
             if luma_on {
                 apply_deck_sharpness(signal, s, y_wire);
             }
         }
         if let Some(strength) = self.head_switching_smear {
+            let _p = profile::scope("fx head smear");
             on!(luma_on, |s| apply_head_wear_smear(s, strength, rng, &clock, y_wire));
         }
         if let Some(amp) = self.luma_noise {
+            let _p = profile::scope("fx luma noise");
             on!(luma_on, |s| apply_luma_noise(s, amp, sample_rate, rng));
         }
         if let Some(rate) = self.tape_dropout_rate {
+            let _p = profile::scope("fx dropout");
             apply_tape_dropout(signal, rate, self.tape_dropout_len, sample_rate, rng);
         }
         if let Some(amp) = self.wobble {
+            let _p = profile::scope("fx wobble");
             apply_wobble(signal, amp * (1.0 - 0.95 * tbc), self.wobble_rate, rng, &clock);
         }
         if let Some(amp) = self.v_jitter {
+            let _p = profile::scope("fx v-jitter");
             apply_v_jitter(signal, amp * (1.0 - ftbc), rng, &clock);
         }
         if let Some(strength) = self.top_band {
+            let _p = profile::scope("fx top band");
             on!(chroma_on, |s| apply_top_band(s, strength, rng, &clock));
         }
         if let Some(strength) = self.head_switch {
+            let _p = profile::scope("fx head switch");
             apply_head_switch(signal, strength, self.head_switch_lines, 1.0 - 0.75 * tbc, rng, &clock);
         }
         if let Some(amp) = self.noise {
+            let _p = profile::scope("fx noise");
             apply_noise(signal, amp, rng);
         }
         if !self.ghosts.is_empty() {
+            let _p = profile::scope("fx ghosting");
             apply_ghosting(signal, &self.ghosts, sample_rate, rng);
         }
         if let Some(strength) = self.attenuation {
+            let _p = profile::scope("fx attenuation");
             apply_attenuation(signal, strength);
         }
         if let Some(amp) = self.jitter {
+            let _p = profile::scope("fx jitter");
             apply_jitter(signal, (amp * (1.0 - 0.95 * tbc)).max(1e-6), rng);
         }
         // Tape trail is the very last step — the playback head's bandwidth
         // limit smears everything that's on the tape (noise, dropouts,
         // ghosts, etc.) rightward on readout.
         if let Some(strength) = self.tape_trail_smear {
+            let _p = profile::scope("fx tape trail");
             if luma_on {
                 apply_tape_trail_smear(signal, strength, y_wire);
             }
