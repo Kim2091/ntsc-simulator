@@ -46,6 +46,9 @@ pub struct GuiArgs {
     /// equivalent command line (cli.txt) into this directory
     #[arg(long, hide = true)]
     pub dump: Option<PathBuf>,
+    /// Open a dropdown at start: preset or deck (for screenshots)
+    #[arg(long, hide = true)]
+    pub open_menu: Option<String>,
     /// Save a screenshot of the window to this PNG once the preview has
     /// rendered, then exit
     #[arg(long)]

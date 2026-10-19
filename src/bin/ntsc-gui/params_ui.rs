@@ -183,14 +183,14 @@ fn param_ui(ui: &mut egui::Ui, spec: &ParamSpec, st: &mut ParamState) {
             ui.add_enabled_ui(st.enabled, |ui| {
                 ui.indent(spec.id, |ui| {
                     if st.range {
-                        ui.spacing_mut().slider_width = (ui.available_width() - 110.0).max(60.0);
+                        ui.spacing_mut().slider_width = (ui.available_width() - 175.0).max(60.0);
                         ui.add(slider(&mut st.min, spec, "min")).on_hover_text(&tip);
                         ui.add(slider(&mut st.max, spec, "max")).on_hover_text(&tip);
                         if st.max < st.min {
                             st.max = st.min;
                         }
                     } else {
-                        ui.spacing_mut().slider_width = (ui.available_width() - 110.0).max(60.0);
+                        ui.spacing_mut().slider_width = (ui.available_width() - 175.0).max(60.0);
                         ui.add(slider(&mut st.min, spec, "")).on_hover_text(&tip);
                     }
                 });

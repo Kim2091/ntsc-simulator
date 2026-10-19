@@ -83,6 +83,7 @@ pub struct App {
 
     screenshot: Option<PathBuf>,
     dump: Option<PathBuf>,
+    open_menu: Option<String>,
     screenshot_wait: u32,
     screenshot_done: Arc<AtomicBool>,
     screenshot_sent: bool,
@@ -134,6 +135,7 @@ impl App {
             status: None,
             screenshot: args.screenshot.clone(),
             dump: args.dump.clone(),
+            open_menu: args.open_menu.clone(),
             screenshot_wait: 0,
             screenshot_done: Arc::new(AtomicBool::new(false)),
             screenshot_sent: false,
@@ -386,6 +388,22 @@ impl App {
         }
     }
 
+    /// On-screen size for a processed frame: native DVD frames have
+    /// non-square samples, so they are shown at their display aspect
+    /// (the 704/352-sample active area spans the 4:3 or 16:9 width).
+    fn display_size(&self, w: usize, h: usize) -> Vec2 {
+        let v = self.current_values();
+        let native_dvd = v.choice("format") == "dvd" && v.choice("dvd-output-size") == "native" && v.choice("dvd-output") == "digital";
+        if native_dvd && matches!(w, 720 | 704 | 352) {
+            let active = if w == 720 { 704.0 } else { w as f32 };
+            let dar = if v.choice("dvd-aspect") == "16:9" { 16.0 / 9.0 } else { 4.0 / 3.0 };
+            let lines = if h == 240 { 480.0 } else { h as f32 };
+            Vec2::new(lines * dar * w as f32 / active, lines)
+        } else {
+            Vec2::new(w as f32, h as f32)
+        }
+    }
+
     fn rendering(&self) -> bool {
         self.shown_id + 1 < self.next_id || self.dirty_since.is_some()
     }
@@ -485,9 +503,10 @@ impl App {
                 label.push_str(" (modified)");
             }
             let mut pick: Option<PresetChoice> = None;
-            egui::ComboBox::from_id_salt("preset")
+            let combo = egui::ComboBox::from_id_salt("preset")
                 .selected_text(label)
                 .width(170.0)
+                .height(600.0)
                 .show_ui(ui, |ui| {
                     if ui.selectable_label(self.preset == PresetChoice::None, "None").on_hover_text("All effects off").clicked() {
                         pick = Some(PresetChoice::None);
@@ -514,6 +533,9 @@ impl App {
                         }
                     }
                 });
+            if self.open_menu.as_deref() == Some("preset") {
+                egui::Popup::open_id(ui.ctx(), combo.response.id.with("popup"));
+            }
             if let Some(p) = pick {
                 self.select_preset(p);
             }
@@ -523,7 +545,7 @@ impl App {
                 "Deck / capture profile, combined with the preset above (the deck's values win where both set something).",
             );
             let mut pick: Option<Option<&'static str>> = None;
-            egui::ComboBox::from_id_salt("deck")
+            let combo = egui::ComboBox::from_id_salt("deck")
                 .selected_text(self.deck.unwrap_or("None"))
                 .width(150.0)
                 .show_ui(ui, |ui| {
@@ -536,6 +558,9 @@ impl App {
                         }
                     }
                 });
+            if self.open_menu.as_deref() == Some("deck") {
+                egui::Popup::open_id(ui.ctx(), combo.response.id.with("popup"));
+            }
             if let Some(d) = pick {
                 self.deck = d;
                 let p = self.preset.clone();
@@ -566,11 +591,17 @@ impl App {
     }
 
     fn group_section(&mut self, ui: &mut egui::Ui, group: Group) {
-        let default_open = matches!(group, Group::Tape | Group::Colour | Group::Timing | Group::Output);
+        let dvd = self.current_values().choice("format") == "dvd";
+        // On the DVD path show the DVD group; otherwise the analog ones.
+        let default_open = if dvd {
+            matches!(group, Group::Dvd | Group::Output)
+        } else {
+            matches!(group, Group::Tape | Group::Colour | Group::Timing | Group::Output)
+        };
         let differs = self.editor.group_differs(group, &self.base);
         let title = if differs { format!("{} •", group.label()) } else { group.label().to_string() };
         egui::CollapsingHeader::new(egui::RichText::new(title).strong())
-            .id_salt(group.label())
+            .id_salt((group.label(), dvd))
             .default_open(default_open)
             .show(ui, |ui| {
                 if group == Group::Output {
@@ -644,9 +675,9 @@ impl App {
             } else if self.shown_id > 0 {
                 ui.label(format!("Rendered in {:.0} ms", self.last_ms));
             }
-            let (w, h) = self.out_size();
+            let (w, h) = self.after_rgb.as_ref().map(|(_, w, h)| (*w, *h)).unwrap_or(self.out_size());
             ui.separator();
-            ui.label(format!("Output {}×{}", w, h));
+            ui.label(format!("Output {}×{}", w, h)).on_hover_text("Size of the processed frame (DVD: the stored frame size unless square output is chosen)");
             if !self.sampled.is_empty() {
                 ui.separator();
                 ui.label("Sampled values:").on_hover_text("What the min..max ranges resolved to for this preview (changes with the seed)");
@@ -698,7 +729,7 @@ impl App {
         }
         // Let a few frames settle (fonts, layout) before capturing.
         self.screenshot_wait += 1;
-        if self.screenshot_wait < 10 {
+        if self.screenshot_wait < if self.open_menu.is_some() { 40 } else { 10 } {
             return;
         }
         self.screenshot_sent = true;
@@ -758,7 +789,8 @@ impl eframe::App for App {
         });
         egui::CentralPanel::default().show(ui, |ui| {
             let (w, h) = self.after_rgb.as_ref().map(|(_, w, h)| (*w, *h)).unwrap_or(self.out_size());
-            self.viewer.show(ui, self.before_tex.as_ref(), self.after_tex.as_ref(), Vec2::new(w as f32, h as f32));
+            let size = self.display_size(w, h);
+            self.viewer.show(ui, self.before_tex.as_ref(), self.after_tex.as_ref(), size);
         });
 
         let values = self.current_values();
