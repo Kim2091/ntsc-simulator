@@ -19,7 +19,7 @@ Simulate the NTSC composite video signal encoding and decoding pipeline. Process
 - **Physically-motivated signal degradation**: noise (snow), multipath ghosting, attenuation, horizontal jitter
 - **Realistic multipath ghosting model**: multiple reflections, phase shift (polarity inversion), HF rolloff, sub-sample delay interpolation, dynamic amplitude modulation
 - **VHS tape-path simulation**: luma bandwidth limiting, color-under chroma processing, tape dropouts, edge ringing, luminance-dependent noise, head-wear smearing, causal rightward trailing, head-switching noise, top-of-frame chroma bands, and closed-caption data lines
-- **Presets**: `--vhs-preset lq|mq|hq` sets the full VHS look at once; `legacy-lq|mq|hq` reproduce the original tape-path settings; custom presets load from JSON with `--preset-file`
+- **Presets**: `--preset lq|mq|hq` sets the full VHS look at once; `legacy-lq|mq|hq` reproduce the original tape-path settings; custom presets load from JSON with `--preset-file`
 - **Range parameters**: all numeric effect arguments accept `min..max` ranges — a random value is sampled per file in batch mode for natural variation
 - **Two comb filter modes**: horizontal 2-sample delay (default) and 1H line-delay
 - Parallel frame processing via rayon
@@ -197,17 +197,17 @@ ntsc-composite-simulator image photo.png -o vhs.png \
 
 #### Presets
 
-`--vhs-preset` fills in every flag you did not pass. Flags you pass explicitly always win, so a preset is a starting point:
+`--preset` (also accepted as `--vhs-preset`) fills in every flag you did not pass. Flags you pass explicitly always win, so a preset is a starting point:
 
 ```bash
 # Worn EP-mode tape
-ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --vhs-preset lq
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --preset lq
 
 # Typical tape, but without the closed-caption dashes
-ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --vhs-preset mq --vbi-data 0
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --preset mq --vbi-data 0
 
 # The original tape-path-only look
-ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --vhs-preset legacy-mq
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --preset legacy-mq
 ```
 
 There are two families:
@@ -236,9 +236,19 @@ There are two families:
 | `--wobble` | 1..1.5 | 0.5..1 | 0.3..0.6 | no |
 | `--temporal-coherence` | 1 | 1 | 1 | no |
 
+DVD presets select the DVD path (`--format dvd`); see [DVD-Video path](#dvd-video-path):
+
+| Preset | Frames | Size | Avg / peak Mbit/s | Other |
+|---|---|---|---|---|
+| `dvd-hq` | 23.976p, soft pulldown | 720×480 | 7–8 / 9.5 | two-pass |
+| `dvd-mq` | 23.976p, soft pulldown | 720×480 | 5–6 / 8–9 | |
+| `dvd-mq-ee` | 23.976p, soft pulldown | 720×480 | 5–6 / 8–9 | edge enhancement 0.5–0.7, DNR 0.3–0.5 |
+| `dvd-lq` | 23.976p, soft pulldown | 352×480 | 3–4 / 6–7 | low-rate matrices, pre-filter 0.3–0.5 |
+| `dvd-interlaced` | 29.97i TFF | 720×480 | 5–6 / 8–9 | video-sourced |
+
 #### Preset files
 
-`--preset-file <path>` reads a JSON preset (the GUI saves the same format). Its values fill in flags not given explicitly, before `--vhs-preset`. Values are written as on the command line: a number, a `"min..max"` string, `true`/`false` for switches, or text; `seed` is optional.
+`--preset-file <path>` reads a JSON preset (the GUI saves the same format). Its values fill in flags not given explicitly, before `--preset`. Values are written as on the command line: a number, a `"min..max"` string, `true`/`false` for switches, or text; `seed` is optional.
 
 ```json
 {
@@ -305,7 +315,7 @@ Still images are encoded as a short sequence (one GOP plus a few pictures) so th
 | `--telecine` | roundtrip | Enable 3:2 pulldown telecine |
 | `--lossy` | roundtrip | Lossy x264 4:2:0 output at `--crf` instead of the lossless default |
 | `--crf` | roundtrip | x264 CRF quality with `--lossy`, 0=lossless, 51=worst (default: 17) |
-| `--preset` | roundtrip | x264 encoding preset, e.g. `ultrafast`, `fast`, `slow` (default: fast) |
+| `--x264-preset` | roundtrip | x264 encoding preset for `--lossy` and lossless `.mp4`, e.g. `ultrafast`, `fast`, `slow` (default: fast); an x264 preset name given to `--preset` still works |
 | `--input-matrix` | roundtrip, extract-frame | Source colour matrix: `auto` (tag, else BT.709 for HD / BT.601 for SD), `601`, `709` |
 | `--input-range` | roundtrip, extract-frame | Source range: `auto` (tag, else limited), `limited`, `full` |
 | `--video-out` | roundtrip, image, colorbars | Connection to the TV / capture card: `composite` (default; comb filter, cross-colour) or `svideo` (separate Y/C wires, no comb, no cross-colour) |
@@ -357,8 +367,8 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 | `--wobble` | roundtrip, image, colorbars | Correlated time-base wobble: peak horizontal displacement in output pixels (typical 0.5–3); smooth across lines, burst moves with the line so hue is kept |
 | `--wobble-rate` | roundtrip, image, colorbars | Wobble frequency scale (default 1.0 = periods of ~20–300 lines) |
 | `--temporal-coherence` | roundtrip | Tape-state coherence over time (0–1). 0 (default) re-rolls head-smear bands, wobble, head-switch shape and top-band tint every frame; 1 makes them drift slowly from frame to frame like a real tape. Chroma noise stays random |
-| `--vhs-preset` | roundtrip, image, colorbars | `lq`, `mq`, `hq`, `legacy-lq`, `legacy-mq` or `legacy-hq`: fills in all flags not given explicitly |
-| `--preset-file` | roundtrip, image, colorbars | JSON preset file; fills in flags not given explicitly, before `--vhs-preset` |
+| `--preset` | roundtrip, image, colorbars | `lq`, `mq`, `hq`, `legacy-lq`, `legacy-mq`, `legacy-hq`, `dvd-hq`, `dvd-mq`, `dvd-mq-ee`, `dvd-lq`, `dvd-interlaced`: fills in all flags not given explicitly (alias `--vhs-preset`) |
+| `--preset-file` | roundtrip, image, colorbars | JSON preset file; fills in flags not given explicitly, before `--preset` |
 
 ### DVD path
 
@@ -470,6 +480,7 @@ The VHS simulation models both the recording and playback signal paths:
 
 Newest first.
 
+- **DVD presets** (`dvd-hq`, `dvd-mq`, `dvd-mq-ee`, `dvd-lq`, `dvd-interlaced`); `--vhs-preset` renamed to `--preset` (old name kept as an alias); roundtrip's x264 `--preset` is now `--x264-preset`.
 - **DVD-Video path** (`--format dvd`): mastering (aspect-correct Lanczos fit, pre-filter, DNR, edge enhancement), field-based 4:2:0, MPEG-2 within the DVD-Video limits via ffmpeg with soft pulldown for film, player chroma upsampling error, digital / S-Video / composite player output, kept MPEG-2 streams and `dvd-check`.
 - **S-Video connection** (`--video-out svideo`): the encoder can produce separate Y and C wires; the decoder takes luma from the Y wire without a comb filter and chroma from the C wire, so there is no cross-colour or dot crawl. Tape effects run per wire (luma effects on Y, colour effects on C, timing effects identically on both).
 - **Lossless, colour-correct video I/O**: lossless RGB output by default (FFV1 `.mkv` / x264 RGB `.mp4`, verified bit-exact), `--lossy` for the old x264 4:2:0 output; input converted with the source's colour matrix and range (`--input-matrix`, `--input-range`); `extract-frame`.

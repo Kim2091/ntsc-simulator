@@ -126,6 +126,67 @@ pub static BUILTIN: &[BuiltinPreset] = &[
         ]),
     },
     BuiltinPreset {
+        name: "dvd-hq",
+        group: "DVD",
+        description: "Well-made film title: 23.976p soft pulldown, 7-8 Mbit/s, two-pass",
+        values: &[
+            ("format", "dvd"),
+            ("dvd-rate", "film"),
+            ("dvd-bitrate", "7..8"),
+            ("dvd-maxrate", "9.5"),
+            ("dvd-2pass", "true"),
+        ],
+    },
+    BuiltinPreset {
+        name: "dvd-mq",
+        group: "DVD",
+        description: "Average film title: 23.976p soft pulldown, 5-6 Mbit/s",
+        values: &[
+            ("format", "dvd"),
+            ("dvd-rate", "film"),
+            ("dvd-bitrate", "5..6"),
+            ("dvd-maxrate", "8..9"),
+        ],
+    },
+    BuiltinPreset {
+        name: "dvd-mq-ee",
+        group: "DVD",
+        description: "Average film title from a processed master: edge-enhancement halos and noise reduction",
+        values: &[
+            ("format", "dvd"),
+            ("dvd-rate", "film"),
+            ("dvd-bitrate", "5..6"),
+            ("dvd-maxrate", "8..9"),
+            ("dvd-ee", "0.5..0.7"),
+            ("dvd-dnr", "0.3..0.5"),
+        ],
+    },
+    BuiltinPreset {
+        name: "dvd-lq",
+        group: "DVD",
+        description: "Budget / long-play disc: half-D1 352x480, 3-4 Mbit/s, low-rate matrices, pre-filtered",
+        values: &[
+            ("format", "dvd"),
+            ("dvd-rate", "film"),
+            ("dvd-size", "352x480"),
+            ("dvd-bitrate", "3..4"),
+            ("dvd-maxrate", "6..7"),
+            ("dvd-matrix", "lowrate"),
+            ("dvd-prefilter", "0.3..0.5"),
+        ],
+    },
+    BuiltinPreset {
+        name: "dvd-interlaced",
+        group: "DVD",
+        description: "Video-sourced title: 480i top field first, 5-6 Mbit/s",
+        values: &[
+            ("format", "dvd"),
+            ("dvd-rate", "interlaced"),
+            ("dvd-bitrate", "5..6"),
+            ("dvd-maxrate", "8..9"),
+        ],
+    },
+    BuiltinPreset {
         name: "legacy-lq",
         group: "VHS legacy",
         description: "Original LQ settings (tape path only)",
@@ -252,7 +313,8 @@ mod tests {
     fn builtin_presets_parse() {
         for p in BUILTIN {
             let v = p.to_values();
-            assert_eq!(v.numbers.len(), p.values.len(), "{}", p.name);
+            let set = v.numbers.len() + v.flags.len() + v.texts.len() + v.choices.len();
+            assert_eq!(set, p.values.len(), "{}", p.name);
         }
         // Legacy presets hold the original seven values and nothing else.
         for name in ["legacy-lq", "legacy-mq", "legacy-hq"] {

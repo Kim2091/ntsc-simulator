@@ -28,7 +28,7 @@ struct Cli {
 #[derive(Clone, Debug)]
 struct EffectArgs {
     values: ParamValues,
-    vhs_preset: Option<String>,
+    preset: Option<String>,
     preset_file: Option<PathBuf>,
 }
 
@@ -65,13 +65,18 @@ impl Args for EffectArgs {
                 ),
         )
         .arg(
-            Arg::new("vhs-preset")
-                .long("vhs-preset")
-                .value_parser(PossibleValuesParser::new(names))
+            Arg::new("preset")
+                .long("preset")
+                .visible_alias("vhs-preset")
+                .value_name("NAME")
+                .value_parser(PossibleValuesParser::new(names.into_iter().chain(X264_PRESETS.iter().copied())))
+                .hide_possible_values(true)
                 .help_heading("Presets and seed")
                 .help(
-                    "Built-in preset: lq, mq, hq (full VHS look) or legacy-lq, legacy-mq, legacy-hq (the original \
-                     tape-path settings only). Fills in every flag that is not given explicitly; explicit flags always win.",
+                    "Built-in preset: lq, mq, hq (full VHS look), legacy-lq, legacy-mq, legacy-hq (the original \
+                     tape-path settings only), dvd-hq, dvd-mq, dvd-mq-ee, dvd-lq, dvd-interlaced (DVD path). Fills in \
+                     every flag that is not given explicitly; explicit flags always win. (For compatibility, an x264 \
+                     preset name here sets --x264-preset.)",
                 ),
         )
         .arg(
@@ -122,7 +127,7 @@ impl FromArgMatches for EffectArgs {
         values.seed = m.get_one::<u64>("seed").copied();
         Ok(Self {
             values,
-            vhs_preset: m.get_one::<String>("vhs-preset").cloned(),
+            preset: m.get_one::<String>("preset").cloned(),
             preset_file: m.get_one::<PathBuf>("preset-file").cloned(),
         })
     }
@@ -134,6 +139,11 @@ impl FromArgMatches for EffectArgs {
 }
 
 impl EffectArgs {
+    /// x264 preset given through `--preset` (old command lines).
+    fn x264_preset(&self) -> Option<&str> {
+        self.preset.as_deref().filter(|p| X264_PRESETS.contains(p))
+    }
+
     /// The final values: explicit flags first, then the preset file, then
     /// the built-in preset for whatever is still unset.
     fn resolve(&self) -> Result<ParamValues> {
@@ -141,13 +151,20 @@ impl EffectArgs {
         if let Some(path) = &self.preset_file {
             values.fill_from(&load_preset(path)?.values);
         }
-        if let Some(name) = &self.vhs_preset {
-            let preset = presets::builtin(name).expect("validated by clap");
-            values.fill_from(&preset.to_values());
+        if let Some(name) = &self.preset {
+            if let Some(preset) = presets::builtin(name) {
+                values.fill_from(&preset.to_values());
+            } else if !X264_PRESETS.contains(&name.as_str()) {
+                anyhow::bail!("unknown preset '{}'", name);
+            }
         }
         Ok(values)
     }
 }
+
+/// x264 speed presets, accepted by `--preset` for compatibility.
+const X264_PRESETS: &[&str] =
+    &["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"];
 
 #[derive(Subcommand)]
 enum Commands {
@@ -194,8 +211,8 @@ enum Commands {
         #[arg(long, default_value = "17")]
         crf: u32,
         /// x264 preset (speed) for --lossy and lossless .mp4
-        #[arg(long, default_value = "fast")]
-        preset: String,
+        #[arg(long = "x264-preset", default_value = "fast")]
+        x264_preset: String,
         /// Lossless output (the default now; kept for compatibility)
         #[arg(long, hide = true)]
         lossless: bool,
@@ -379,9 +396,10 @@ fn main() -> Result<()> {
             pipeline::process_images(&input, &output, width, height, comb_1h, &effects.resolve()?, &progress)
         }
         Commands::Roundtrip {
-            input, output, width, height, comb_1h, lossy, crf, preset, lossless, raw_copy, threads, telecine, effects,
+            input, output, width, height, comb_1h, lossy, crf, x264_preset, lossless, raw_copy, threads, telecine, effects,
         } => {
             let _ = lossless;
+            let preset = effects.x264_preset().map(String::from).unwrap_or(x264_preset);
             let opts = VideoOptions { width, height, comb_1h, crf, preset, lossy, raw_copy, threads, telecine };
             pipeline::process_videos(&input, &output, &opts, &effects.resolve()?, &progress)
         }
