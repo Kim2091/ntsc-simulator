@@ -143,6 +143,11 @@ pub struct SignalEffects {
     pub wobble: Option<f32>,
     /// Frequency scale of the wobble components (1.0 = default periods).
     pub wobble_rate: f32,
+    /// How slowly the per-frame random state drifts (0 = re-rolled every
+    /// frame, 1 = fully coherent tape state).  See `TapeClock`.
+    pub temporal_coherence: f32,
+    /// Seed of the drifting tape state for this file.
+    pub tape_seed: u64,
 }
 
 /// Default number of active lines per field affected by head switching.
@@ -201,7 +206,15 @@ impl SignalEffects {
     ///  10. Tape trailing — **last**: causal rightward luma smudge from
     ///      playback electronics.  Everything on the tape (noise, dropouts,
     ///      ghosts) passes through this bottleneck on readout.
-    pub fn apply(&self, signal: &mut [f32], sample_rate: f64, rng: &mut impl Rng) {
+    ///
+    /// `frame` is the frame number within the file; it drives the drifting
+    /// tape state when `temporal_coherence` is above zero.
+    pub fn apply(&self, signal: &mut [f32], sample_rate: f64, rng: &mut impl Rng, frame: u64) {
+        let clock = TapeClock {
+            seed: self.tape_seed,
+            frame,
+            coherence: self.temporal_coherence.clamp(0.0, 1.0),
+        };
         // Closed-caption data is on the tape before any tape-path limits.
         if let Some(strength) = self.vbi_data {
             apply_vbi_data(signal, strength, sample_rate, rng);
@@ -218,7 +231,7 @@ impl SignalEffects {
             apply_edge_ringing(signal, gain, sample_rate);
         }
         if let Some(strength) = self.head_switching_smear {
-            apply_head_wear_smear(signal, strength, rng);
+            apply_head_wear_smear(signal, strength, rng, &clock);
         }
         if let Some(amp) = self.luma_noise {
             apply_luma_noise(signal, amp, sample_rate, rng);
@@ -227,13 +240,13 @@ impl SignalEffects {
             apply_tape_dropout(signal, rate, self.tape_dropout_len, sample_rate, rng);
         }
         if let Some(amp) = self.wobble {
-            apply_wobble(signal, amp, self.wobble_rate, rng);
+            apply_wobble(signal, amp, self.wobble_rate, rng, &clock);
         }
         if let Some(strength) = self.top_band {
-            apply_top_band(signal, strength, rng);
+            apply_top_band(signal, strength, rng, &clock);
         }
         if let Some(strength) = self.head_switch {
-            apply_head_switch(signal, strength, self.head_switch_lines, rng);
+            apply_head_switch(signal, strength, self.head_switch_lines, rng, &clock);
         }
         if let Some(amp) = self.noise {
             apply_noise(signal, amp, rng);
@@ -752,7 +765,8 @@ fn apply_luma_noise(
 ///     head sweeps across the tape.
 ///   - Some regions of the frame are clear while others are heavily smeared,
 ///     producing "patches" or "bands" of blur.
-///   - The smeared regions shift slightly from frame to frame (random seed).
+///   - The smeared regions shift from frame to frame: re-rolled each frame,
+///     or drifting slowly with `--temporal-coherence` (see `TapeClock`).
 ///
 /// The box blur is applied only to the **luma** component (separated via
 /// the 2-sample comb) so the color subcarrier is preserved.
@@ -760,7 +774,12 @@ fn apply_luma_noise(
 /// Implementation: a per-line running-average (box filter) whose kernel
 /// width is modulated by a sum of low-frequency sinusoids across line
 /// number, creating smooth bands of varying smear intensity.
-fn apply_head_wear_smear(signal: &mut [f32], strength: f32, rng: &mut impl Rng) {
+fn apply_head_wear_smear(
+    signal: &mut [f32],
+    strength: f32,
+    rng: &mut impl Rng,
+    clock: &TapeClock,
+) {
     let spl = SAMPLES_PER_LINE;
     if signal.len() < TOTAL_LINES * spl {
         return;
@@ -773,9 +792,13 @@ fn apply_head_wear_smear(signal: &mut [f32], strength: f32, rng: &mut impl Rng) 
     // Build a per-line smear-width map using 3 incommensurate sinusoids
     // so the blur amount drifts smoothly with interesting, non-repeating
     // variation across the frame.
-    let phase1: f32 = rng.random::<f32>() * std::f32::consts::TAU;
-    let phase2: f32 = rng.random::<f32>() * std::f32::consts::TAU;
-    let phase3: f32 = rng.random::<f32>() * std::f32::consts::TAU;
+    let mut band_phase = |k: u64| {
+        let r: f32 = rng.random::<f32>() * std::f32::consts::TAU;
+        clock.blend(r, || clock.phase(KEY_SMEAR + k))
+    };
+    let phase1 = band_phase(0);
+    let phase2 = band_phase(1);
+    let phase3 = band_phase(2);
 
     // Frequencies chosen so the "beats" span 40–120 lines
     let freq1 = std::f32::consts::TAU / 73.0;
@@ -915,6 +938,105 @@ fn apply_tape_trail_smear(signal: &mut [f32], strength: f32) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Tape state: slowly drifting per-file randomness
+// ────────────────────────────────────────────────────────────────────────────
+
+/// SplitMix64 finaliser: spreads the bits of `x` over the whole word.
+pub fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Hash of (seed, key, knot) mapped to [−1, 1].
+fn hash_signed(seed: u64, key: u64, knot: i64) -> f32 {
+    let h = splitmix64(seed ^ splitmix64(key ^ splitmix64(knot as u64)));
+    (h >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+}
+
+/// Smooth 1-D value noise in [−1, 1]: random values at integer `t`,
+/// joined with a smoothstep.  The same arguments always give the same
+/// value, so any frame can be computed on its own.
+fn drift(seed: u64, key: u64, t: f64) -> f32 {
+    let k0 = t.floor();
+    let f = (t - k0) as f32;
+    let w = f * f * (3.0 - 2.0 * f);
+    let a = hash_signed(seed, key, k0 as i64);
+    let b = hash_signed(seed, key, k0 as i64 + 1);
+    a + (b - a) * w
+}
+
+/// Frames per value-noise knot for slowly drifting tape state (~1.3 s).
+const DRIFT_FRAMES: f64 = 40.0;
+
+/// Keys that separate the drifting values of different effect parameters.
+const KEY_SMEAR: u64 = 0x100;
+const KEY_WOBBLE: u64 = 0x200;
+const KEY_TOP_BAND: u64 = 0x300;
+const KEY_HEAD_SWITCH: u64 = 0x400;
+
+/// Per-frame view of the drifting "tape state".
+///
+/// Effects that keep a frame-wide random state (band phases, tear shape,
+/// tint angle) draw it from the frame's RNG as before, then blend it toward
+/// a smooth function of (tape seed, key, frame number) by `coherence`:
+/// 0 keeps the old per-frame re-roll exactly, 1 makes the state drift
+/// slowly from frame to frame like a real tape.  Because the smooth value
+/// depends only on the frame number, frames can still be processed in
+/// parallel without shared mutable state.
+#[derive(Clone, Copy, Debug)]
+pub struct TapeClock {
+    pub seed: u64,
+    pub frame: u64,
+    pub coherence: f32,
+}
+
+impl TapeClock {
+    /// A clock that leaves every per-frame draw unchanged.
+    #[cfg(test)]
+    pub fn off() -> Self {
+        Self { seed: 0, frame: 0, coherence: 0.0 }
+    }
+
+    fn t(&self, scale: f64) -> f64 {
+        self.frame as f64 / (DRIFT_FRAMES * scale)
+    }
+
+    /// Blend a per-frame draw `r` toward the drifting value `s`.  With zero
+    /// coherence `r` is returned unchanged.
+    fn blend(&self, r: f32, s: impl FnOnce() -> f32) -> f32 {
+        if self.coherence <= 0.0 {
+            r
+        } else {
+            r + self.coherence * (s() - r)
+        }
+    }
+
+    /// Drifting value in [0, 1].
+    fn unit(&self, key: u64) -> f32 {
+        0.5 + 0.5 * drift(self.seed, key, self.t(1.0))
+    }
+
+    /// Drifting value with roughly unit standard deviation.
+    fn normal(&self, key: u64) -> f32 {
+        1.7 * drift(self.seed, key, self.t(1.0))
+    }
+
+    /// Drifting phase in radians: a fixed random start, a slow steady
+    /// advance and a smooth wander.
+    fn phase(&self, key: u64) -> f32 {
+        let start = (hash_signed(self.seed, key, -1) + 1.0) * std::f32::consts::PI;
+        start + 0.03 * self.frame as f32 + 2.0 * drift(self.seed, key ^ 0xF00D, self.t(1.5))
+    }
+
+    /// Drifting value in [−1, 1] along a free coordinate.
+    fn along(&self, key: u64, x: f64) -> f32 {
+        drift(self.seed, key, x)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Shared helpers for the field-timing effects
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -1044,7 +1166,7 @@ fn apply_vbi_data(signal: &mut [f32], strength: f32, sample_rate: f64, rng: &mut
 ///
 /// All of it decays with the line index.  Angles, bias and decay are random
 /// for every frame and field.
-fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng) {
+fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng, clock: &TapeClock) {
     let spl = SAMPLES_PER_LINE;
     let strength = strength.clamp(0.0, 1.0);
     if strength <= 0.0 || signal.len() < TOTAL_LINES * spl {
@@ -1066,12 +1188,25 @@ fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng) {
     let mut streak = vec![0.0f32; ACTIVE_SAMPLES];
     let mut scratch = Vec::new();
 
-    for &(first, _) in &FIELD_ACTIVE_LINES {
-        // Per-field random state.
-        let rot0 = randn(rng) * 0.35 * strength + 0.25 * strength;
-        let hue = (105.0f32 + 12.0 * randn(rng)).to_radians();
-        let bias = strength * 0.05 * (0.7 + 0.6 * rng.random::<f32>());
-        let lift = strength * 0.02 * (0.5 + rng.random::<f32>());
+    for (field, &(first, _)) in FIELD_ACTIVE_LINES.iter().enumerate() {
+        // Per-field random state (drifts with the tape clock).
+        let key = KEY_TOP_BAND + 8 * field as u64;
+        let r = randn(rng);
+        let rot0 = clock.blend(r * 0.35 * strength + 0.25 * strength, || {
+            clock.normal(key) * 0.35 * strength + 0.25 * strength
+        });
+        let r = randn(rng);
+        let hue = clock
+            .blend(105.0f32 + 12.0 * r, || 105.0 + 12.0 * clock.normal(key + 1))
+            .to_radians();
+        let r = rng.random::<f32>();
+        let bias = clock.blend(strength * 0.05 * (0.7 + 0.6 * r), || {
+            strength * 0.05 * (0.7 + 0.6 * clock.unit(key + 2))
+        });
+        let r = rng.random::<f32>();
+        let lift = clock.blend(strength * 0.02 * (0.5 + r), || {
+            strength * 0.02 * (0.5 + clock.unit(key + 3))
+        });
 
         for k in 0..band_lines {
             let line = first + k;
@@ -1150,7 +1285,13 @@ fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng) {
 ///
 /// `max_shift` is about 28 samples (≈ 2 µs) at strength 1 and varies
 /// randomly for every frame and field.
-fn apply_head_switch(signal: &mut [f32], strength: f32, lines: usize, rng: &mut impl Rng) {
+fn apply_head_switch(
+    signal: &mut [f32],
+    strength: f32,
+    lines: usize,
+    rng: &mut impl Rng,
+    clock: &TapeClock,
+) {
     let spl = SAMPLES_PER_LINE;
     let strength = strength.clamp(0.0, 1.0);
     if strength <= 0.0 || lines == 0 || signal.len() < TOTAL_LINES * spl {
@@ -1161,14 +1302,21 @@ fn apply_head_switch(signal: &mut [f32], strength: f32, lines: usize, rng: &mut 
     let mut noise = vec![0.0f32; ACTIVE_SAMPLES];
     let mut scratch = Vec::new();
 
-    for &(first, end) in &FIELD_ACTIVE_LINES {
+    for (field, &(first, end)) in FIELD_ACTIVE_LINES.iter().enumerate() {
+        let key = KEY_HEAD_SWITCH + 8 * field as u64;
         let n_lines = lines.min(end - first);
         let switch_line = end - n_lines;
-        let max_shift = strength * 28.0 * (0.75 + 0.5 * rng.random::<f32>());
+        let r = rng.random::<f32>();
+        let max_shift = clock.blend(strength * 28.0 * (0.75 + 0.5 * r), || {
+            strength * 28.0 * (0.75 + 0.5 * clock.unit(key))
+        });
         // Residual burst timing error at the bottom line, in samples
         // (one sample = 90° of subcarrier phase).
         let sign = if rng.random::<bool>() { 1.0 } else { -1.0 };
-        let burst_error = sign * strength * (0.4 + 0.5 * rng.random::<f32>());
+        let r = rng.random::<f32>();
+        let burst_error = clock.blend(sign * strength * (0.4 + 0.5 * r), || {
+            strength * 0.9 * clock.along(key + 1, clock.t(1.0))
+        });
 
         for k in 0..n_lines {
             let line_base = (switch_line + k) * spl;
@@ -1187,10 +1335,14 @@ fn apply_head_switch(signal: &mut [f32], strength: f32, lines: usize, rng: &mut 
 
             // ── Switching line: dark, noisy burst over part of the line ──
             if k == 0 {
-                let len = ((0.3 + 0.4 * rng.random::<f32>()) * (0.5 + 0.5 * strength)
-                    * ACTIVE_SAMPLES as f32) as usize;
-                let start = (rng.random::<f32>() * (ACTIVE_SAMPLES - len) as f32) as usize;
-                let depth = 0.6 + 0.3 * rng.random::<f32>();
+                let r = rng.random::<f32>();
+                let len_frac = clock.blend(0.3 + 0.4 * r, || 0.3 + 0.4 * clock.unit(key + 2));
+                let len = (len_frac * (0.5 + 0.5 * strength) * ACTIVE_SAMPLES as f32) as usize;
+                let r = rng.random::<f32>();
+                let start_frac = clock.blend(r, || clock.unit(key + 3));
+                let start = (start_frac * (ACTIVE_SAMPLES - len) as f32) as usize;
+                let r = rng.random::<f32>();
+                let depth = clock.blend(0.6 + 0.3 * r, || 0.6 + 0.3 * clock.unit(key + 4));
                 let ramp_len = 12.0f32;
 
                 for s in noise.iter_mut() {
@@ -1497,8 +1649,16 @@ const WOBBLE_WALK_CORR: f32 = 0.97;
 /// stays locked to the chroma and hue is preserved, as on a real TV that
 /// follows the time-base error of each line.
 ///
-/// `amp_px` is the peak displacement in output pixels at 640 wide.
-fn apply_wobble(signal: &mut [f32], amp_px: f32, rate: f32, rng: &mut impl Rng) {
+/// `amp_px` is the peak displacement in output pixels at 640 wide.  With
+/// `--temporal-coherence` the periods, phases and walk drift slowly from
+/// frame to frame instead of being re-rolled.
+fn apply_wobble(
+    signal: &mut [f32],
+    amp_px: f32,
+    rate: f32,
+    rng: &mut impl Rng,
+    clock: &TapeClock,
+) {
     let spl = SAMPLES_PER_LINE;
     if amp_px == 0.0 || signal.len() < TOTAL_LINES * spl {
         return;
@@ -1506,9 +1666,12 @@ fn apply_wobble(signal: &mut [f32], amp_px: f32, rate: f32, rng: &mut impl Rng) 
     let amp = amp_px * ACTIVE_SAMPLES as f32 / 640.0;
 
     let mut comps = [(0.0f32, 0.0f32, 0.0f32); 3];
-    for (c, &((lo, hi), weight)) in comps.iter_mut().zip(&WOBBLE_COMPONENTS) {
-        let period = lo + (hi - lo) * rng.random::<f32>();
-        let phase = rng.random::<f32>() * std::f32::consts::TAU;
+    for (k, (c, &((lo, hi), weight))) in comps.iter_mut().zip(&WOBBLE_COMPONENTS).enumerate() {
+        let key = KEY_WOBBLE + 4 * k as u64;
+        let r = rng.random::<f32>();
+        let period = clock.blend(lo + (hi - lo) * r, || lo + (hi - lo) * clock.unit(key));
+        let r = rng.random::<f32>() * std::f32::consts::TAU;
+        let phase = clock.blend(r, || clock.phase(key + 1));
         *c = (std::f32::consts::TAU * rate / period, phase, weight);
     }
 
@@ -1524,7 +1687,12 @@ fn apply_wobble(signal: &mut [f32], amp_px: f32, rate: f32, rng: &mut impl Rng) 
             continue;
         }
         let t = line as f32;
-        let mut d = WOBBLE_WALK_WEIGHT * walk;
+        // With coherence the walk becomes smooth noise along the lines
+        // that scrolls slowly from frame to frame.
+        let w = clock.blend(walk, || {
+            1.7 * clock.along(KEY_WOBBLE + 16, line as f64 / 30.0 + 0.02 * clock.frame as f64)
+        });
+        let mut d = WOBBLE_WALK_WEIGHT * w;
         for &(w, phase, weight) in &comps {
             d += weight * (w * t + phase).sin();
         }
@@ -1789,7 +1957,7 @@ mod tests {
         let orig = crate::encoder::Encoder::new().encode_frame(&pixels, 640, 480, 0).to_vec();
         let mut sig = orig.clone();
         let mut rng = StdRng::seed_from_u64(10);
-        apply_wobble(&mut sig, 6.0, 1.0, &mut rng);
+        apply_wobble(&mut sig, 6.0, 1.0, &mut rng, &TapeClock::off());
 
         let mut dec = crate::decoder::Decoder::new();
         let out = dec.decode_frame(&sig, 640, 480, false, false).to_vec();
@@ -1815,17 +1983,57 @@ mod tests {
         assert!((a - b).abs() < 3.0, "hue {a} vs {b}");
     }
 
+    /// Mean absolute difference between two signals.
+    fn mean_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32
+    }
+
+    #[test]
+    fn zero_coherence_keeps_per_frame_draws() {
+        let clock = TapeClock { seed: 99, frame: 17, coherence: 0.0 };
+        for r in [0.0f32, 0.3, 5.9] {
+            assert_eq!(clock.blend(r, || 123.0), r);
+        }
+    }
+
+    #[test]
+    fn coherent_state_drifts_between_frames() {
+        // Consecutive frames, each with its own RNG as in the video path.
+        // A smooth picture, so the difference tracks displacement rather
+        // than the decorrelation of sample-level noise.
+        let mut orig = test_signal();
+        for line in 0..TOTAL_LINES {
+            for n in ACTIVE_START..SAMPLES_PER_LINE {
+                let x = (n + 3 * line) as f32;
+                orig[line * SAMPLES_PER_LINE + n] = 0.6 + 0.2 * (x / 25.0).sin();
+            }
+        }
+        let run = |frame: u64, coherence: f32, f: &dyn Fn(&mut [f32], &mut StdRng, &TapeClock)| {
+            let mut sig = orig.clone();
+            let mut rng = StdRng::seed_from_u64(1000 + frame);
+            f(&mut sig, &mut rng, &TapeClock { seed: 5, frame, coherence });
+            sig
+        };
+        let smear = |s: &mut [f32], r: &mut StdRng, c: &TapeClock| apply_head_wear_smear(s, 0.8, r, c);
+        let wobble = |s: &mut [f32], r: &mut StdRng, c: &TapeClock| apply_wobble(s, 3.0, 1.0, r, c);
+        for (name, f) in [("smear", &smear as &dyn Fn(&mut [f32], &mut StdRng, &TapeClock)), ("wobble", &wobble)] {
+            let jump = mean_abs_diff(&run(10, 0.0, f), &run(11, 0.0, f));
+            let drift = mean_abs_diff(&run(10, 1.0, f), &run(11, 1.0, f));
+            assert!(drift < 0.3 * jump, "{name}: drift {drift} vs jump {jump}");
+        }
+    }
+
     #[test]
     fn zero_strength_is_noop() {
         let orig = test_signal();
         let mut rng = StdRng::seed_from_u64(1);
         let mut sig = orig.clone();
-        apply_head_switch(&mut sig, 0.0, DEFAULT_HEAD_SWITCH_LINES, &mut rng);
-        apply_top_band(&mut sig, 0.0, &mut rng);
+        apply_head_switch(&mut sig, 0.0, DEFAULT_HEAD_SWITCH_LINES, &mut rng, &TapeClock::off());
+        apply_top_band(&mut sig, 0.0, &mut rng, &TapeClock::off());
         apply_vbi_data(&mut sig, 0.0, crate::constants::SAMPLE_RATE, &mut rng);
         let off = ChromaPathConfig::default();
         apply_chroma_path(&mut sig, &off, crate::constants::SAMPLE_RATE, &mut rng);
-        apply_wobble(&mut sig, 0.0, 1.0, &mut rng);
+        apply_wobble(&mut sig, 0.0, 1.0, &mut rng, &TapeClock::off());
         assert_eq!(sig, orig);
     }
 
@@ -1835,7 +2043,7 @@ mod tests {
         let n = 6;
         let mut rng = StdRng::seed_from_u64(2);
         let mut sig = orig.clone();
-        apply_head_switch(&mut sig, 1.0, n, &mut rng);
+        apply_head_switch(&mut sig, 1.0, n, &mut rng, &TapeClock::off());
         let expected: Vec<usize> = (260 - n..260).chain(523 - n..523).collect();
         assert_eq!(changed_lines(&orig, &sig), expected);
         // Front porch and sync stay untouched on the affected lines.
@@ -1860,7 +2068,7 @@ mod tests {
         let orig = test_signal();
         let mut rng = StdRng::seed_from_u64(4);
         let mut sig = orig.clone();
-        apply_top_band(&mut sig, 1.0, &mut rng);
+        apply_top_band(&mut sig, 1.0, &mut rng, &TapeClock::off());
         let expected: Vec<usize> = (20..26).chain(283..289).collect();
         assert_eq!(changed_lines(&orig, &sig), expected);
     }

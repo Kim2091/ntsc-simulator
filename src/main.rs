@@ -19,7 +19,7 @@ use rayon::prelude::*;
 
 use crate::constants::SAMPLE_RATE;
 use crate::decoder::Decoder;
-use crate::effects::{GhostConfig, SignalEffects, DEFAULT_HEAD_SWITCH_LINES};
+use crate::effects::{splitmix64, GhostConfig, SignalEffects, DEFAULT_HEAD_SWITCH_LINES};
 use crate::encoder::Encoder;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "mov", "avi", "wmv", "flv", "webm", "m4v", "ts", "mts", "m2ts", "mpg", "mpeg"];
@@ -85,14 +85,6 @@ impl std::fmt::Display for RangeParam {
             write!(f, "{}", self.min)
         }
     }
-}
-
-/// SplitMix64 finaliser: spreads the bits of `x` over the whole word.
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
 }
 
 /// Combine a seed with an index into a new, well-mixed seed.
@@ -262,6 +254,11 @@ struct EffectsArgs {
     /// faster wobble)
     #[arg(long, default_value = "1.0")]
     wobble_rate: RangeParam,
+    /// Temporal coherence of the tape state (0–1).  0 = head-smear bands,
+    /// wobble, head-switch shape and top-band tint re-rolled every frame;
+    /// 1 = they drift slowly from frame to frame like a real tape
+    #[arg(long)]
+    temporal_coherence: Option<RangeParam>,
     /// VHS quality preset.  Fills in every VHS flag that is not given
     /// explicitly; explicit flags always win.
     #[arg(long, value_enum)]
@@ -381,7 +378,7 @@ impl EffectsArgs {
             }
         }
 
-        SignalEffects {
+        let mut fx = SignalEffects {
             noise: RangeParam::sample_opt(self.noise, rng),
             ghosts,
             attenuation: RangeParam::sample_opt(self.attenuation, rng),
@@ -406,7 +403,18 @@ impl EffectsArgs {
             chroma_delay_v: RangeParam::sample_opt(self.chroma_delay_v, rng),
             wobble: RangeParam::sample_opt(self.wobble, rng),
             wobble_rate: self.wobble.map_or(1.0, |_| self.wobble_rate.sample(rng)),
+            temporal_coherence: 0.0,
+            tape_seed: 0,
+        };
+        // Drawn last so the values above match runs without coherence.
+        fx.temporal_coherence = RangeParam::sample_opt(self.temporal_coherence, rng).unwrap_or(0.0);
+        if fx.temporal_coherence > 0.0 {
+            fx.tape_seed = match self.seed {
+                Some(seed) => mix_seed(seed, 0x7A9E),
+                None => rng.random(),
+            };
         }
+        fx
     }
 
     fn has_any_range(&self) -> bool {
@@ -438,6 +446,7 @@ impl EffectsArgs {
             || check(self.chroma_delay_v)
             || check(self.wobble)
             || (self.wobble.is_some() && self.wobble_rate.is_range())
+            || check(self.temporal_coherence)
     }
 
     fn log_sampled(&self, fx: &SignalEffects) {
@@ -498,6 +507,7 @@ impl EffectsArgs {
         if self.wobble.is_some() {
             check_req!("wobble_rate", self.wobble_rate, fx.wobble_rate);
         }
+        check_opt!("temporal_coherence", self.temporal_coherence, Some(fx.temporal_coherence));
         if !parts.is_empty() {
             eprintln!("  Randomized: {}", parts.join(", "));
         }
@@ -718,7 +728,7 @@ fn cmd_image(
     let signal_ref: &[f32] = if fx.is_active() {
         let mut buf = signal.to_vec();
         let mut rng = frame_rng(effects_args.seed, 0);
-        fx.apply(&mut buf, SAMPLE_RATE, &mut rng);
+        fx.apply(&mut buf, SAMPLE_RATE, &mut rng, 0);
         // Leak into a temporary that lives long enough — use a boxed slice
         // We need owned data for decode; just decode from the vec.
         let encode_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -808,7 +818,7 @@ fn cmd_colorbars(
     let decoded = if fx.is_active() {
         let mut buf = signal.to_vec();
         let mut rng = frame_rng(effects_args.seed, 0);
-        fx.apply(&mut buf, SAMPLE_RATE, &mut rng);
+        fx.apply(&mut buf, SAMPLE_RATE, &mut rng, 0);
         let mut decoder = Decoder::new();
         decoder.decode_frame(&buf, w, h, comb_1h, effects_args.legacy_burst_phase).to_vec()
     } else {
@@ -927,7 +937,7 @@ fn cmd_roundtrip(
                                 sb_ref.resize(signal.len(), 0.0);
                                 sb_ref.copy_from_slice(signal);
                                 let mut rng = frame_rng(effects_args.seed, *fnum as u64);
-                                fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);
+                                fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng, *fnum as u64);
                                 let mut dec_ref = dec.borrow_mut();
                                 dec_ref.decode_frame(&sb_ref, out_w, out_h, comb_1h, effects_args.legacy_burst_phase).to_vec()
                             })
@@ -1101,7 +1111,7 @@ fn cmd_roundtrip_telecine(
                                 sb_ref.resize(signal.len(), 0.0);
                                 sb_ref.copy_from_slice(signal);
                                 let mut rng = frame_rng(effects_args.seed, *fnum as u64);
-                                fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);
+                                fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng, *fnum as u64);
                                 let mut dec_ref = dec.borrow_mut();
                                 dec_ref.decode_frame(&sb_ref, out_w, out_h, comb_1h, effects_args.legacy_burst_phase).to_vec()
                             })

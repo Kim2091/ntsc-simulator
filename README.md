@@ -251,6 +251,7 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 | `--chroma-delay-v` | roundtrip, image, colorbars | Vertical chroma delay in field lines (typical 0–1; 1 field line = 2 output rows) |
 | `--wobble` | roundtrip, image, colorbars | Correlated time-base wobble: peak horizontal displacement in output pixels (typical 0.5–3); smooth across lines, burst moves with the line so hue is kept |
 | `--wobble-rate` | roundtrip, image, colorbars | Wobble frequency scale (default 1.0 = periods of ~20–300 lines) |
+| `--temporal-coherence` | roundtrip | Tape-state coherence over time (0–1). 0 (default) re-rolls head-smear bands, wobble, head-switch shape and top-band tint every frame; 1 makes them drift slowly from frame to frame like a real tape. Chroma noise stays random |
 | `--vhs-preset` | roundtrip, image, colorbars | `lq`, `mq` or `hq`: fills in all VHS flags not given explicitly |
 
 Run `ntsc-composite-simulator <command> -h` for full details.
