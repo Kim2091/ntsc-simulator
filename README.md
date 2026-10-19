@@ -194,6 +194,7 @@ ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --vhs-preset mq --vbi
 | `--comb-1h` | roundtrip, image, colorbars | Use 1H line-delay comb filter instead of 2-sample delay |
 | `--save-source` | colorbars | Save the source SMPTE pattern as PNG |
 | `--seed` | roundtrip, image, colorbars | Seed for all random choices (sampled ranges and per-frame effects), for exactly reproducible output; in batch mode each file gets its own seed derived from it |
+| `--legacy-burst-phase` | roundtrip, image, colorbars | Decode with the inverted burst phase estimate of older builds, which doubles burst phase errors (e.g. from `--luma-noise`) into per-line hue noise. Together with `--seed`, reproduces output from builds before fb47e5c exactly |
 
 ### Video encoding
 

@@ -216,6 +216,11 @@ struct EffectsArgs {
     /// its own seed derived from this one.
     #[arg(long)]
     seed: Option<u64>,
+    /// Decode with the burst phase sign used before the decoder fix, which
+    /// doubles any burst phase error instead of cancelling it.  Reproduces
+    /// output from builds before fb47e5c exactly.
+    #[arg(long)]
+    legacy_burst_phase: bool,
     /// Head-switching noise strength (0–1).  Tears the bottom lines of
     /// each field: rightward displacement and a dark, noisy switching line.
     #[arg(long)]
@@ -673,7 +678,7 @@ fn cmd_image(
         eprintln!("Decoding from composite signal...");
         let mut decoder = Decoder::new();
         let t1 = Instant::now();
-        let result_rgb = decoder.decode_frame(&buf, out_w, out_h, comb_1h);
+        let result_rgb = decoder.decode_frame(&buf, out_w, out_h, comb_1h, effects_args.legacy_burst_phase);
         let decode_ms = t1.elapsed().as_secs_f64() * 1000.0;
         eprintln!("  Decode: {:.1} ms", decode_ms);
         eprintln!(
@@ -701,7 +706,7 @@ fn cmd_image(
     eprintln!("Decoding from composite signal...");
     let mut decoder = Decoder::new();
     let t0 = Instant::now();
-    let result_rgb = decoder.decode_frame(signal_ref, out_w, out_h, comb_1h);
+    let result_rgb = decoder.decode_frame(signal_ref, out_w, out_h, comb_1h, effects_args.legacy_burst_phase);
     let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
     eprintln!("  Decode: {:.1} ms", decode_ms);
     eprintln!(
@@ -756,10 +761,10 @@ fn cmd_colorbars(
         let mut rng = frame_rng(effects_args.seed, 0);
         fx.apply(&mut buf, SAMPLE_RATE, &mut rng);
         let mut decoder = Decoder::new();
-        decoder.decode_frame(&buf, w, h, comb_1h).to_vec()
+        decoder.decode_frame(&buf, w, h, comb_1h, effects_args.legacy_burst_phase).to_vec()
     } else {
         let mut decoder = Decoder::new();
-        decoder.decode_frame(signal, w, h, comb_1h).to_vec()
+        decoder.decode_frame(signal, w, h, comb_1h, effects_args.legacy_burst_phase).to_vec()
     };
 
     let out_img = image::RgbImage::from_raw(width, height, decoded)
@@ -875,11 +880,11 @@ fn cmd_roundtrip(
                                 let mut rng = frame_rng(effects_args.seed, *fnum as u64);
                                 fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);
                                 let mut dec_ref = dec.borrow_mut();
-                                dec_ref.decode_frame(&sb_ref, out_w, out_h, comb_1h).to_vec()
+                                dec_ref.decode_frame(&sb_ref, out_w, out_h, comb_1h, effects_args.legacy_burst_phase).to_vec()
                             })
                         } else {
                             let mut dec_ref = dec.borrow_mut();
-                            dec_ref.decode_frame(signal, out_w, out_h, comb_1h).to_vec()
+                            dec_ref.decode_frame(signal, out_w, out_h, comb_1h, effects_args.legacy_burst_phase).to_vec()
                         }
                     })
                 })
@@ -1049,11 +1054,11 @@ fn cmd_roundtrip_telecine(
                                 let mut rng = frame_rng(effects_args.seed, *fnum as u64);
                                 fx.apply(&mut sb_ref, SAMPLE_RATE, &mut rng);
                                 let mut dec_ref = dec.borrow_mut();
-                                dec_ref.decode_frame(&sb_ref, out_w, out_h, comb_1h).to_vec()
+                                dec_ref.decode_frame(&sb_ref, out_w, out_h, comb_1h, effects_args.legacy_burst_phase).to_vec()
                             })
                         } else {
                             let mut dec_ref = dec.borrow_mut();
-                            dec_ref.decode_frame(signal, out_w, out_h, comb_1h).to_vec()
+                            dec_ref.decode_frame(signal, out_w, out_h, comb_1h, effects_args.legacy_burst_phase).to_vec()
                         }
                     })
                 })

@@ -72,12 +72,16 @@ impl Decoder {
 
     /// Decode a composite NTSC signal back to an RGB frame.
     /// Returns a reference to the internal output buffer (valid until the next call).
+    ///
+    /// `legacy_burst_phase` uses the inverted burst phase estimate of older
+    /// builds, which doubles any burst phase error instead of cancelling it.
     pub fn decode_frame(
         &mut self,
         signal: &[f32],
         output_width: usize,
         output_height: usize,
         comb_1h: bool,
+        legacy_burst_phase: bool,
     ) -> &[u8] {
         let spl = SAMPLES_PER_LINE;
         let ypl = spl + RIGHT_PAD;
@@ -172,7 +176,13 @@ impl Decoder {
                 sin_corr += burst_val * sin_lut[n & 3];
             }
 
-            self.burst_phases[vis] = std::f32::consts::PI - sin_corr.atan2(cos_corr);
+            // atan2 gives π − δ for a burst that leads by δ.
+            let measured = sin_corr.atan2(cos_corr);
+            self.burst_phases[vis] = if legacy_burst_phase {
+                measured - std::f32::consts::PI
+            } else {
+                std::f32::consts::PI - measured
+            };
         }
 
         // Zero out chroma in blanking region
