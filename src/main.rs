@@ -243,6 +243,10 @@ struct EffectsArgs {
     /// Per-line chroma phase (hue) jitter, std dev in degrees (e.g. 2–8)
     #[arg(long)]
     chroma_phase_noise: Option<RangeParam>,
+    /// Playback 1H chroma comb (0–1): chroma averaged with the previous
+    /// line of the field, halving vertical colour resolution at 1
+    #[arg(long)]
+    chroma_vblur: Option<RangeParam>,
     /// VHS quality preset.  Fills in every VHS flag that is not given
     /// explicitly; explicit flags always win.
     #[arg(long, value_enum)]
@@ -382,6 +386,7 @@ impl EffectsArgs {
             vbi_data: RangeParam::sample_opt(self.vbi_data, rng),
             chroma_noise: RangeParam::sample_opt(self.chroma_noise, rng),
             chroma_phase_noise: RangeParam::sample_opt(self.chroma_phase_noise, rng),
+            chroma_vblur: RangeParam::sample_opt(self.chroma_vblur, rng),
         }
     }
 
@@ -409,6 +414,7 @@ impl EffectsArgs {
             || check(self.vbi_data)
             || check(self.chroma_noise)
             || check(self.chroma_phase_noise)
+            || check(self.chroma_vblur)
     }
 
     fn log_sampled(&self, fx: &SignalEffects) {
@@ -462,6 +468,7 @@ impl EffectsArgs {
         check_opt!("vbi_data", self.vbi_data, fx.vbi_data);
         check_opt!("chroma_noise", self.chroma_noise, fx.chroma_noise);
         check_opt!("chroma_phase_noise", self.chroma_phase_noise, fx.chroma_phase_noise);
+        check_opt!("chroma_vblur", self.chroma_vblur, fx.chroma_vblur);
         if !parts.is_empty() {
             eprintln!("  Randomized: {}", parts.join(", "));
         }

@@ -131,6 +131,8 @@ pub struct SignalEffects {
     pub chroma_noise: Option<f32>,
     /// Per-line chroma phase jitter: std dev in degrees.  `None` = off.
     pub chroma_phase_noise: Option<f32>,
+    /// Playback 1H chroma comb strength (0–1).  `None` = off.
+    pub chroma_vblur: Option<f32>,
 }
 
 /// Default number of active lines per field affected by head switching.
@@ -154,6 +156,7 @@ impl SignalEffects {
             || self.vbi_data.is_some()
             || self.chroma_noise.is_some()
             || self.chroma_phase_noise.is_some()
+            || self.chroma_vblur.is_some()
     }
 
     /// Settings for the playback chroma path; zero turns a stage off.
@@ -161,6 +164,7 @@ impl SignalEffects {
         ChromaPathConfig {
             noise: self.chroma_noise.unwrap_or(0.0),
             phase_noise_deg: self.chroma_phase_noise.unwrap_or(0.0),
+            vblur: self.chroma_vblur.unwrap_or(0.0),
         }
     }
 
@@ -169,7 +173,8 @@ impl SignalEffects {
     /// Processing order:
     ///   1. VBI closed-caption data — part of the recorded broadcast signal
     ///   2. VHS tape-path (luma BW + color-under) — fundamental recording limits,
-    ///      then the playback chroma path (colour-under noise, phase jitter)
+    ///      then the playback chroma path (colour-under noise, phase jitter,
+    ///      1H comb)
     ///   3. Edge ringing — playback circuit detail enhancement
     ///   4. Head-wear smearing — worn head / degraded oxide blur
     ///   5. Luminance-dependent noise — tape media noise
@@ -1220,11 +1225,14 @@ pub struct ChromaPathConfig {
     pub noise: f32,
     /// Per-line chroma phase jitter: std dev in degrees.
     pub phase_noise_deg: f32,
+    /// Playback 1H chroma comb strength (0–1).  At 1 each line's chroma is
+    /// the average of itself and the previous line of the field.
+    pub vblur: f32,
 }
 
 impl ChromaPathConfig {
     fn is_active(&self) -> bool {
-        self.noise > 0.0 || self.phase_noise_deg > 0.0
+        self.noise > 0.0 || self.phase_noise_deg > 0.0 || self.vblur > 0.0
     }
 }
 
@@ -1266,6 +1274,11 @@ fn lowpass_zero_phase(buf: &mut [f32], alpha: f32) {
 ///   2. **Phase jitter** — each line's I/Q vector is rotated by a random
 ///      angle, the hue flicker caused by time-base errors in the
 ///      colour-under heterodyne.
+///   3. **1H comb** — many decks pass the playback chroma through a
+///      one-line delay comb to cancel crosstalk from the neighbouring
+///      track.  Each line's chroma becomes `(1−k)·c[n] + k·c[n−1]` with
+///      `c[n−1]` the previous line of the same field and `k = 0.5` at full
+///      strength, which halves vertical chroma resolution.
 ///
 /// Only the change of the baseband chroma is remodulated and added back,
 /// so luma and the high-frequency part of the comb's chroma output are
@@ -1373,6 +1386,20 @@ fn apply_chroma_path(
                     let (i, q) = (new_i[j], new_q[j]);
                     new_i[j] = c * i - s * q;
                     new_q[j] = s * i + c * q;
+                }
+            }
+        }
+
+        // ── 3. Playback 1H comb ──
+        // Lines are mixed bottom-up so each line reads its predecessor
+        // before that line is itself mixed.
+        if cfg.vblur > 0.0 {
+            let k = 0.5 * cfg.vblur.min(1.0);
+            for line in (1..n_lines).rev() {
+                for j in 0..act {
+                    let (cur, prev) = (line * act + j, (line - 1) * act + j);
+                    new_i[cur] = (1.0 - k) * new_i[cur] + k * new_i[prev];
+                    new_q[cur] = (1.0 - k) * new_q[cur] + k * new_q[prev];
                 }
             }
         }
@@ -1525,6 +1552,43 @@ mod tests {
         let b = chroma_mag(decode_mean(&sig, 320, 240, 8));
         // Averaging rotated vectors shortens them by about cos(σ); allow 15 %.
         assert!((a - b).abs() < 0.15 * a, "{a} vs {b}");
+    }
+
+    #[test]
+    fn chroma_vblur_keeps_flat_colour_and_mixes_edges() {
+        // Top half red, bottom half blue.
+        let pixels: Vec<u8> = (0..640 * 480)
+            .flat_map(|i| if i / 640 < 240 { [200u8, 40, 40] } else { [40, 60, 200] })
+            .collect();
+        let orig = crate::encoder::Encoder::new().encode_frame(&pixels, 640, 480, 0).to_vec();
+        let mut sig = orig.clone();
+        let mut rng = StdRng::seed_from_u64(8);
+        let cfg = ChromaPathConfig { vblur: 1.0, ..Default::default() };
+        apply_chroma_path(&mut sig, &cfg, crate::constants::SAMPLE_RATE, &mut rng);
+
+        // Flat areas keep their saturation: the subcarrier inversion
+        // between adjacent lines must not cancel the chroma.
+        for y in [100, 380] {
+            let a = chroma_mag(decode_mean(&orig, 320, y, 8));
+            let b = chroma_mag(decode_mean(&sig, 320, y, 8));
+            assert!((a - b).abs() < 0.03 * a, "row {y}: {a} vs {b}");
+        }
+        // Only the rows at the colour edge change visibly: visible rows 240
+        // and 241 are the first blue lines of the two fields and take half
+        // their chroma from the red line above.
+        let mut dec = crate::decoder::Decoder::new();
+        let a = dec.decode_frame(&orig, 640, 480, false, false).to_vec();
+        let b = dec.decode_frame(&sig, 640, 480, false, false).to_vec();
+        let changed: Vec<usize> = (0..480)
+            .filter(|&y| {
+                (40..600).any(|x| {
+                    let i = (y * 640 + x) * 3;
+                    (0..3).any(|c| (a[i + c] as i32 - b[i + c] as i32).abs() > 3)
+                })
+            })
+            .collect();
+        assert!(changed.contains(&240) && changed.contains(&241), "{changed:?}");
+        assert!(changed.iter().all(|&y| (238..=243).contains(&y)), "{changed:?}");
     }
 
     #[test]
