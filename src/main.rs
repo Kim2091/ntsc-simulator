@@ -236,6 +236,13 @@ struct EffectsArgs {
     /// short light dashes near the top of the frame.
     #[arg(long)]
     vbi_data: Option<RangeParam>,
+    /// Colour-under chroma noise: std dev of I/Q noise (e.g. 0.02–0.08).
+    /// Shows as horizontal colour blotches.
+    #[arg(long)]
+    chroma_noise: Option<RangeParam>,
+    /// Per-line chroma phase (hue) jitter, std dev in degrees (e.g. 2–8)
+    #[arg(long)]
+    chroma_phase_noise: Option<RangeParam>,
     /// VHS quality preset.  Fills in every VHS flag that is not given
     /// explicitly; explicit flags always win.
     #[arg(long, value_enum)]
@@ -373,6 +380,8 @@ impl EffectsArgs {
                 .map_or(DEFAULT_HEAD_SWITCH_LINES, |n| n.round().max(0.0) as usize),
             top_band: RangeParam::sample_opt(self.top_band, rng),
             vbi_data: RangeParam::sample_opt(self.vbi_data, rng),
+            chroma_noise: RangeParam::sample_opt(self.chroma_noise, rng),
+            chroma_phase_noise: RangeParam::sample_opt(self.chroma_phase_noise, rng),
         }
     }
 
@@ -398,6 +407,8 @@ impl EffectsArgs {
             || check(self.head_switch_lines)
             || check(self.top_band)
             || check(self.vbi_data)
+            || check(self.chroma_noise)
+            || check(self.chroma_phase_noise)
     }
 
     fn log_sampled(&self, fx: &SignalEffects) {
@@ -449,6 +460,8 @@ impl EffectsArgs {
         check_opt!("head_switch_lines", self.head_switch_lines, Some(fx.head_switch_lines as f32));
         check_opt!("top_band", self.top_band, fx.top_band);
         check_opt!("vbi_data", self.vbi_data, fx.vbi_data);
+        check_opt!("chroma_noise", self.chroma_noise, fx.chroma_noise);
+        check_opt!("chroma_phase_noise", self.chroma_phase_noise, fx.chroma_phase_noise);
         if !parts.is_empty() {
             eprintln!("  Randomized: {}", parts.join(", "));
         }

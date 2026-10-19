@@ -126,6 +126,11 @@ pub struct SignalEffects {
     /// waveform is blended over the picture on those lines, so it shows
     /// as short light dashes near the top of the frame.  `None` = off.
     pub vbi_data: Option<f32>,
+    /// Colour-under chroma noise: std dev of the I/Q noise in YIQ units
+    /// (e.g. 0.02–0.08).  `None` = off.
+    pub chroma_noise: Option<f32>,
+    /// Per-line chroma phase jitter: std dev in degrees.  `None` = off.
+    pub chroma_phase_noise: Option<f32>,
 }
 
 /// Default number of active lines per field affected by head switching.
@@ -147,13 +152,24 @@ impl SignalEffects {
             || self.head_switch.is_some()
             || self.top_band.is_some()
             || self.vbi_data.is_some()
+            || self.chroma_noise.is_some()
+            || self.chroma_phase_noise.is_some()
+    }
+
+    /// Settings for the playback chroma path; zero turns a stage off.
+    fn chroma_path_config(&self) -> ChromaPathConfig {
+        ChromaPathConfig {
+            noise: self.chroma_noise.unwrap_or(0.0),
+            phase_noise_deg: self.chroma_phase_noise.unwrap_or(0.0),
+        }
     }
 
     /// Apply all active effects to the signal in-place.
     ///
     /// Processing order:
     ///   1. VBI closed-caption data — part of the recorded broadcast signal
-    ///   2. VHS tape-path (luma BW + color-under) — fundamental recording limits
+    ///   2. VHS tape-path (luma BW + color-under) — fundamental recording limits,
+    ///      then the playback chroma path (colour-under noise, phase jitter)
     ///   3. Edge ringing — playback circuit detail enhancement
     ///   4. Head-wear smearing — worn head / degraded oxide blur
     ///   5. Luminance-dependent noise — tape media noise
@@ -172,6 +188,10 @@ impl SignalEffects {
         // VHS tape-path effects
         if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {
             apply_vhs_tape_path(signal, self.vhs_luma_bw, self.color_under_bw, sample_rate);
+        }
+        let chroma_cfg = self.chroma_path_config();
+        if chroma_cfg.is_active() {
+            apply_chroma_path(signal, &chroma_cfg, sample_rate, rng);
         }
         if let Some(gain) = self.edge_ringing {
             apply_edge_ringing(signal, gain, sample_rate);
@@ -1189,6 +1209,192 @@ fn apply_head_switch(signal: &mut [f32], strength: f32, lines: usize, rng: &mut 
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Playback chroma path (colour-under noise, phase jitter)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Settings for `apply_chroma_path`.  A zero value turns a stage off.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChromaPathConfig {
+    /// Colour-under noise: std dev of the I/Q noise in YIQ units.
+    pub noise: f32,
+    /// Per-line chroma phase jitter: std dev in degrees.
+    pub phase_noise_deg: f32,
+}
+
+impl ChromaPathConfig {
+    fn is_active(&self) -> bool {
+        self.noise > 0.0 || self.phase_noise_deg > 0.0
+    }
+}
+
+/// −3 dB cutoff of the colour-under noise.  Well under the colour-under
+/// bandwidth, so the noise forms blotches a few to tens of pixels long.
+const CHROMA_NOISE_CUTOFF_HZ: f64 = 150e3;
+
+/// Correlation of the chroma noise with the previous line of the field.
+const CHROMA_NOISE_LINE_CORR: f32 = 0.5;
+
+/// Zero-phase lowpass: a one-pole IIR run forward, then backward.
+fn lowpass_zero_phase(buf: &mut [f32], alpha: f32) {
+    if buf.is_empty() {
+        return;
+    }
+    let mut prev = buf[0];
+    for s in buf.iter_mut() {
+        prev += alpha * (*s - prev);
+        *s = prev;
+    }
+    let mut prev = buf[buf.len() - 1];
+    for s in buf.iter_mut().rev() {
+        prev += alpha * (*s - prev);
+        *s = prev;
+    }
+}
+
+/// Simulate the VHS playback chroma path in demodulated I/Q baseband.
+///
+/// For every active line the comb-separated chroma is demodulated with the
+/// 4×fsc LUTs, lowpassed, and rotated into the frame of the line's own
+/// colorburst.  In that frame a given colour has the same I/Q vector on
+/// every line, even though the subcarrier inverts from one line to the
+/// next, so lines can be compared and mixed directly.  The stages are:
+///   1. **Colour-under noise** — low-frequency noise added to I and Q.  It
+///      is lowpassed far below the colour-under bandwidth and partly
+///      correlated with the previous line of the field, so it shows as
+///      horizontal colour blotches rather than single-line stripes.
+///   2. **Phase jitter** — each line's I/Q vector is rotated by a random
+///      angle, the hue flicker caused by time-base errors in the
+///      colour-under heterodyne.
+///
+/// Only the change of the baseband chroma is remodulated and added back,
+/// so luma and the high-frequency part of the comb's chroma output are
+/// preserved exactly.
+fn apply_chroma_path(
+    signal: &mut [f32],
+    cfg: &ChromaPathConfig,
+    sample_rate: f64,
+    rng: &mut impl Rng,
+) {
+    let spl = SAMPLES_PER_LINE;
+    if !cfg.is_active() || signal.len() < TOTAL_LINES * spl {
+        return;
+    }
+
+    let cos_lut: [f32; 4] = [1.0, 0.0, -1.0, 0.0];
+    let nsin_lut: [f32; 4] = [0.0, -1.0, 0.0, 1.0];
+    let bb_lp = filters::design_lowpass(1.3e6, 31);
+    let mut scratch = Vec::new();
+
+    // Noise filter and the gain that restores unit variance after it.
+    let noise_alpha =
+        1.0 - (-2.0 * std::f64::consts::PI * CHROMA_NOISE_CUTOFF_HZ / sample_rate).exp() as f32;
+    let noise_gain = {
+        let mut h = vec![0.0f32; 4096];
+        h[2048] = 1.0;
+        lowpass_zero_phase(&mut h, noise_alpha);
+        1.0 / h.iter().map(|v| v * v).sum::<f32>().sqrt()
+    };
+    let line_corr = CHROMA_NOISE_LINE_CORR;
+    let fresh = (1.0 - line_corr * line_corr).sqrt();
+
+    let act = ACTIVE_SAMPLES;
+    // The noise is generated with a margin on both sides so the filter has
+    // settled by the time it reaches the picture.
+    let pad = 256;
+    let mut noise_i = vec![0.0f32; act + 2 * pad];
+    let mut noise_q = vec![0.0f32; act + 2 * pad];
+    let mut prev_i = vec![0.0f32; act];
+    let mut prev_q = vec![0.0f32; act];
+    let mut tmp_i = vec![0.0f32; act];
+    let mut tmp_q = vec![0.0f32; act];
+
+    for &(first, end) in &FIELD_ACTIVE_LINES {
+        let n_lines = end - first;
+
+        // ── Demodulate every line of the field into its burst frame ──
+        let mut orig_i = vec![0.0f32; n_lines * act];
+        let mut orig_q = vec![0.0f32; n_lines * act];
+        let mut burst = vec![(1.0f32, 0.0f32); n_lines];
+        for k in 0..n_lines {
+            let base = (first + k) * spl;
+            for j in 0..act {
+                let n = ACTIVE_START + j;
+                let chroma = (signal[base + n] - signal[base + n - 2]) * 0.5;
+                tmp_i[j] = 2.0 * chroma * cos_lut[n & 3];
+                tmp_q[j] = 2.0 * chroma * nsin_lut[n & 3];
+            }
+            apply_fir_inplace(&mut tmp_i, &bb_lp, &mut scratch);
+            apply_fir_inplace(&mut tmp_q, &bb_lp, &mut scratch);
+            let phi = measure_burst_phase(&signal[base..base + spl]);
+            let (c, s) = (phi.cos(), phi.sin());
+            burst[k] = (c, s);
+            // Rotate by −φ into the burst frame.
+            let row = k * act;
+            for j in 0..act {
+                orig_i[row + j] = c * tmp_i[j] + s * tmp_q[j];
+                orig_q[row + j] = -s * tmp_i[j] + c * tmp_q[j];
+            }
+        }
+        let mut new_i = orig_i.clone();
+        let mut new_q = orig_q.clone();
+
+        // ── 1. Colour-under noise ──
+        if cfg.noise > 0.0 {
+            let amp = cfg.noise * COMPOSITE_SCALE * noise_gain;
+            for k in 0..n_lines {
+                for j in 0..act + 2 * pad {
+                    noise_i[j] = randn(rng);
+                    noise_q[j] = randn(rng);
+                }
+                lowpass_zero_phase(&mut noise_i, noise_alpha);
+                lowpass_zero_phase(&mut noise_q, noise_alpha);
+                for j in 0..act {
+                    let (mut ni, mut nq) = (noise_i[pad + j], noise_q[pad + j]);
+                    if k > 0 {
+                        ni = line_corr * prev_i[j] + fresh * ni;
+                        nq = line_corr * prev_q[j] + fresh * nq;
+                    }
+                    prev_i[j] = ni;
+                    prev_q[j] = nq;
+                    new_i[k * act + j] += amp * ni;
+                    new_q[k * act + j] += amp * nq;
+                }
+            }
+        }
+
+        // ── 2. Phase jitter ──
+        if cfg.phase_noise_deg > 0.0 {
+            let sigma = cfg.phase_noise_deg.to_radians();
+            for k in 0..n_lines {
+                let theta = sigma * randn(rng);
+                let (c, s) = (theta.cos(), theta.sin());
+                for j in k * act..(k + 1) * act {
+                    let (i, q) = (new_i[j], new_q[j]);
+                    new_i[j] = c * i - s * q;
+                    new_q[j] = s * i + c * q;
+                }
+            }
+        }
+
+        // ── Remodulate the change and add it back ──
+        for k in 0..n_lines {
+            let base = (first + k) * spl;
+            let (c, s) = burst[k];
+            for j in 0..act {
+                let idx = k * act + j;
+                let di_b = new_i[idx] - orig_i[idx];
+                let dq_b = new_q[idx] - orig_q[idx];
+                // Rotate by +φ back into the LUT frame.
+                let di = c * di_b - s * dq_b;
+                let dq = s * di_b + c * dq_b;
+                let n = ACTIVE_START + j;
+                signal[base + n] += di * cos_lut[n & 3] + dq * nsin_lut[n & 3];
+            }
+        }
+    }
+}
+
 /// Shift `line[lo..hi]` right by `shift` samples with linear interpolation.
 /// Samples that would come from before `lo` read as blanking.
 fn shift_segment(line: &mut [f32], lo: usize, hi: usize, shift: f32) {
@@ -1248,6 +1454,79 @@ mod tests {
             .collect()
     }
 
+    /// Encode a flat 640×480 colour through the real encoder.
+    fn encode_flat(rgb: [u8; 3]) -> Vec<f32> {
+        let pixels: Vec<u8> = (0..640 * 480).flat_map(|_| rgb).collect();
+        crate::encoder::Encoder::new().encode_frame(&pixels, 640, 480, 0).to_vec()
+    }
+
+    /// Decode and return the mean RGB of a block around (x, y).
+    fn decode_mean(sig: &[f32], x: usize, y: usize, r: usize) -> [f32; 3] {
+        let mut dec = crate::decoder::Decoder::new();
+        let out = dec.decode_frame(sig, 640, 480, false, false);
+        let mut m = [0.0f32; 3];
+        let mut n = 0.0;
+        for yy in y - r..=y + r {
+            for xx in x - r..=x + r {
+                for c in 0..3 {
+                    m[c] += out[(yy * 640 + xx) * 3 + c] as f32;
+                }
+                n += 1.0;
+            }
+        }
+        m.map(|v| v / n)
+    }
+
+    /// I/Q magnitude of an RGB colour (0–255 scale).
+    fn chroma_mag(rgb: [f32; 3]) -> f32 {
+        let i: f32 = (0..3).map(|c| crate::constants::RGB_TO_YIQ[1][c] * rgb[c]).sum();
+        let q: f32 = (0..3).map(|c| crate::constants::RGB_TO_YIQ[2][c] * rgb[c]).sum();
+        (i * i + q * q).sqrt()
+    }
+
+    #[test]
+    fn chroma_noise_leaves_luma_and_blanking_alone() {
+        let orig = encode_flat([180, 60, 50]);
+        let mut sig = orig.clone();
+        let mut rng = StdRng::seed_from_u64(5);
+        let cfg = ChromaPathConfig { noise: 0.08, ..Default::default() };
+        apply_chroma_path(&mut sig, &cfg, crate::constants::SAMPLE_RATE, &mut rng);
+        let mut max_chroma = 0.0f32;
+        let mut max_luma = 0.0f32;
+        for line in 0..TOTAL_LINES {
+            let base = line * SAMPLES_PER_LINE;
+            assert_eq!(sig[base..base + ACTIVE_START], orig[base..base + ACTIVE_START]);
+            let d = |k: usize| sig[k] - orig[k];
+            for n in base + ACTIVE_START..base + SAMPLES_PER_LINE {
+                max_chroma = max_chroma.max(d(n).abs());
+            }
+            // A mean over four subcarrier cycles cancels the carrier and
+            // leaves the low-frequency (luma) part of the change.
+            for n in base + ACTIVE_START..base + SAMPLES_PER_LINE - 16 {
+                let mean: f32 = (n..n + 16).map(d).sum::<f32>() / 16.0;
+                max_luma = max_luma.max(mean.abs());
+            }
+        }
+        assert!(max_chroma > 0.01, "noise too weak: {max_chroma}");
+        // The window does not fully cancel a carrier whose amplitude varies,
+        // so a few percent remain (about 1 IRE here).
+        assert!(max_luma < 0.05 * max_chroma, "luma changed: {max_luma} vs {max_chroma}");
+    }
+
+    #[test]
+    fn chroma_phase_noise_keeps_saturation() {
+        let orig = encode_flat([180, 60, 50]);
+        let mut sig = orig.clone();
+        let mut rng = StdRng::seed_from_u64(6);
+        let cfg = ChromaPathConfig { phase_noise_deg: 20.0, ..Default::default() };
+        apply_chroma_path(&mut sig, &cfg, crate::constants::SAMPLE_RATE, &mut rng);
+        assert_ne!(sig, orig);
+        let a = chroma_mag(decode_mean(&orig, 320, 240, 8));
+        let b = chroma_mag(decode_mean(&sig, 320, 240, 8));
+        // Averaging rotated vectors shortens them by about cos(σ); allow 15 %.
+        assert!((a - b).abs() < 0.15 * a, "{a} vs {b}");
+    }
+
     #[test]
     fn zero_strength_is_noop() {
         let orig = test_signal();
@@ -1256,6 +1535,8 @@ mod tests {
         apply_head_switch(&mut sig, 0.0, DEFAULT_HEAD_SWITCH_LINES, &mut rng);
         apply_top_band(&mut sig, 0.0, &mut rng);
         apply_vbi_data(&mut sig, 0.0, crate::constants::SAMPLE_RATE, &mut rng);
+        let off = ChromaPathConfig::default();
+        apply_chroma_path(&mut sig, &off, crate::constants::SAMPLE_RATE, &mut rng);
         assert_eq!(sig, orig);
     }
 
