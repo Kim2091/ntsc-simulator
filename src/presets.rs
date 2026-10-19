@@ -206,6 +206,41 @@ pub static BUILTIN: &[BuiltinPreset] = &[
     },
 ];
 
+/// Playback-deck profiles.  They combine with the tape / DVD presets: a
+/// deck's values win over the tape preset's (`--deck` is applied before
+/// `--preset`).
+pub static DECKS: &[BuiltinPreset] = &[
+    BuiltinPreset {
+        name: "deck-basic",
+        group: "Deck",
+        description: "Ordinary VCR: composite output, no TBC or noise reduction (the behaviour without a deck profile)",
+        values: &[],
+    },
+    BuiltinPreset {
+        name: "deck-svhs-tbc",
+        group: "Deck",
+        description: "High-end S-VHS deck: line TBC, frame TBC, recursive noise reduction, S-Video out (3D comb for composite captures)",
+        values: &[
+            ("line-tbc", "0.9"),
+            ("frame-tbc", "1"),
+            ("deck-dnr", "0.5"),
+            ("comb", "3d"),
+            ("video-out", "svideo"),
+        ],
+    },
+    BuiltinPreset {
+        name: "deck-edit",
+        group: "Deck",
+        description: "Deck in edit mode: no sharpening or peaking",
+        values: &[("deck-sharpness", "0"), ("edge-ringing", "0")],
+    },
+];
+
+/// Look up a deck profile by name.
+pub fn deck(name: &str) -> Option<&'static BuiltinPreset> {
+    DECKS.iter().find(|p| p.name == name)
+}
+
 /// Look up a built-in preset by name.
 pub fn builtin(name: &str) -> Option<&'static BuiltinPreset> {
     BUILTIN.iter().find(|p| p.name == name)
@@ -319,6 +354,15 @@ mod tests {
         // Legacy presets hold the original seven values and nothing else.
         for name in ["legacy-lq", "legacy-mq", "legacy-hq"] {
             assert_eq!(builtin(name).unwrap().values.len(), 7);
+        }
+    }
+
+    #[test]
+    fn deck_profiles_parse() {
+        for d in DECKS {
+            let v = d.to_values();
+            let set = v.numbers.len() + v.flags.len() + v.texts.len() + v.choices.len();
+            assert_eq!(set, d.values.len(), "{}", d.name);
         }
     }
 

@@ -15,6 +15,7 @@
 
 pub mod colorbars;
 pub mod constants;
+pub mod deck;
 pub mod decoder;
 pub mod dvd;
 pub mod effects;

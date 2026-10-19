@@ -17,6 +17,9 @@ pub struct SourceImage {
     pub rgb: Vec<u8>,
     pub w: usize,
     pub h: usize,
+    /// Earlier frames of a video (oldest first) for stages that need
+    /// consecutive frames, such as the deck noise reduction.
+    pub history: Vec<Vec<u8>>,
 }
 
 pub struct RenderRequest {
@@ -60,8 +63,9 @@ impl Renderer {
                     }
                     let t0 = Instant::now();
                     let dar = req.src.w as f64 / req.src.h as f64;
-                    let result = match pipeline::render_preview(
-                        &req.src.rgb, req.src.w, req.src.h, dar, req.out_w, req.out_h,
+                    let history: Vec<&[u8]> = req.src.history.iter().map(|f| f.as_slice()).collect();
+                    let result = match pipeline::render_preview_sequence(
+                        &history, &req.src.rgb, req.src.w, req.src.h, dar, req.out_w, req.out_h,
                         req.comb_1h, &req.values, req.frame,
                     ) {
                         Ok((rgb, w, h, sampled)) => RenderResult {
@@ -116,8 +120,13 @@ pub fn grab_frame_async(
 ) -> Receiver<Result<SourceImage, String>> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
-        let r = pipeline::grab_video_frame(&path, time_s, &values)
-            .map(|(rgb, w, h)| SourceImage { rgb, w, h })
+        // The frame plus the 8 before it (for the deck noise reduction).
+        let r = pipeline::ffprobe_video(&path)
+            .and_then(|(w, h, ..)| {
+                let mut frames = pipeline::grab_video_frames(&path, time_s, 9, &values)?;
+                let rgb = frames.pop().unwrap();
+                Ok(SourceImage { rgb, w, h, history: frames })
+            })
             .map_err(|e| format!("{:#}", e));
         let _ = tx.send(r);
         ctx.request_repaint();

@@ -24,6 +24,12 @@ pub struct GuiArgs {
     /// Built-in preset to start with (default: mq; "none" for no effects)
     #[arg(long)]
     pub preset: Option<String>,
+    /// Playback-deck profile to start with (deck-basic, deck-svhs-tbc, deck-edit)
+    #[arg(long)]
+    pub deck: Option<String>,
+    /// Start a video at this time (seconds)
+    #[arg(long)]
+    pub time: Option<f64>,
     /// Starting zoom: fit, 1, 2 or 4
     #[arg(long)]
     pub zoom: Option<String>,

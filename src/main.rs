@@ -29,6 +29,7 @@ struct Cli {
 struct EffectArgs {
     values: ParamValues,
     preset: Option<String>,
+    deck: Option<String>,
     preset_file: Option<PathBuf>,
 }
 
@@ -80,6 +81,18 @@ impl Args for EffectArgs {
                 ),
         )
         .arg(
+            Arg::new("deck")
+                .long("deck")
+                .value_name("NAME")
+                .value_parser(PossibleValuesParser::new(presets::DECKS.iter().map(|d| d.name)))
+                .help_heading("Presets and seed")
+                .help(
+                    "Playback-deck profile: deck-basic, deck-svhs-tbc (line + frame TBC, recursive noise \
+                     reduction, S-Video, 3D comb), deck-edit (no sharpening). Combines with --preset; the deck's \
+                     values win where both set the same flag.",
+                ),
+        )
+        .arg(
             Arg::new("preset-file")
                 .long("preset-file")
                 .value_name("PATH")
@@ -128,6 +141,7 @@ impl FromArgMatches for EffectArgs {
         Ok(Self {
             values,
             preset: m.get_one::<String>("preset").cloned(),
+            deck: m.get_one::<String>("deck").cloned(),
             preset_file: m.get_one::<PathBuf>("preset-file").cloned(),
         })
     }
@@ -145,11 +159,15 @@ impl EffectArgs {
     }
 
     /// The final values: explicit flags first, then the preset file, then
-    /// the built-in preset for whatever is still unset.
+    /// the deck profile, then the built-in preset for whatever is still
+    /// unset.
     fn resolve(&self) -> Result<ParamValues> {
         let mut values = self.values.clone();
         if let Some(path) = &self.preset_file {
             values.fill_from(&load_preset(path)?.values);
+        }
+        if let Some(name) = &self.deck {
+            values.fill_from(&presets::deck(name).expect("validated by clap").to_values());
         }
         if let Some(name) = &self.preset {
             if let Some(preset) = presets::builtin(name) {

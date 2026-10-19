@@ -93,17 +93,19 @@ pub enum Group {
     NoiseDropouts,
     Timing,
     Reception,
+    Deck,
     Output,
 }
 
 impl Group {
-    pub const ALL: [Group; 7] = [
+    pub const ALL: [Group; 8] = [
         Group::Dvd,
         Group::Tape,
         Group::Colour,
         Group::NoiseDropouts,
         Group::Timing,
         Group::Reception,
+        Group::Deck,
         Group::Output,
     ];
 
@@ -115,6 +117,7 @@ impl Group {
             Group::NoiseDropouts => "Noise & dropouts",
             Group::Timing => "Timing",
             Group::Reception => "Reception",
+            Group::Deck => "Playback deck / capture",
             Group::Output => "Input / decoder / output",
         }
     }
@@ -450,6 +453,15 @@ pub static SPECS: &[ParamSpec] = &[
         kind: num_def(0.1, 4.0, 1.0),
     },
     ParamSpec {
+        id: "v-jitter",
+        label: "Vertical bounce",
+        help: "Vertical bounce: the picture jumps up and down by whole lines from frame to frame (std dev in output \
+               rows), from tape tension and servo errors. A frame TBC removes it.",
+        unit: "rows",
+        group: Group::Timing,
+        kind: num(0.0, 4.0, 1.0),
+    },
+    ParamSpec {
         id: "head-switch",
         label: "Head switching",
         help: "Head-switching noise (0–1). The bottom lines tear to the right with a dark, speckled switching line.",
@@ -553,6 +565,55 @@ pub static SPECS: &[ParamSpec] = &[
         unit: "",
         group: Group::Reception,
         kind: num(0.0, 1.0, 0.1),
+    },
+    // ── Playback deck / capture ──
+    ParamSpec {
+        id: "line-tbc",
+        label: "Line TBC",
+        help: "Line time-base corrector (0–1): re-times every line from its sync and burst, removing most jitter and \
+               wobble and much of the head-switching displacement (the switching noise line stays). Like high-end \
+               S-VHS decks with a built-in TBC.",
+        unit: "",
+        group: Group::Deck,
+        kind: num(0.0, 1.0, 1.0),
+    },
+    ParamSpec {
+        id: "frame-tbc",
+        label: "Frame TBC",
+        help: "Frame TBC / frame synchroniser (0–1): holds the picture vertically steady, removing vertical bounce.",
+        unit: "",
+        group: Group::Deck,
+        kind: num(0.0, 1.0, 1.0),
+    },
+    ParamSpec {
+        id: "deck-dnr",
+        label: "Deck noise reduction",
+        help: "Deck recursive noise reduction (0–1): averages each frame with the previous output where the picture \
+               is still, which cleans noise but leaves smeared ghost trails behind moving objects. Needs \
+               consecutive frames: no effect on single images; the GUI's video preview renders the previous 8 \
+               frames so it shows.",
+        unit: "",
+        group: Group::Deck,
+        kind: num(0.0, 1.0, 0.5),
+    },
+    ParamSpec {
+        id: "deck-sharpness",
+        label: "Deck sharpness",
+        help: "Deck picture / sharpness control (−1 to 1): negative softens, 0 is the edit setting (no enhancement), \
+               positive sharpens with peaking. Complements Edge ringing.",
+        unit: "",
+        group: Group::Deck,
+        kind: num(-1.0, 1.0, 0.0),
+    },
+    ParamSpec {
+        id: "comb",
+        label: "Decoder comb filter",
+        help: "Luma/chroma separation in the TV or capture card (composite only). 2sample: simple, rainbow on fine \
+               detail. 1h: line comb, less rainbow but hanging dots on colour edges. 3d: frame comb using the \
+               previous frame where the picture is still (motion-adaptive), the cleanest on static areas.",
+        unit: "",
+        group: Group::Deck,
+        kind: Kind::Choice { options: &["2sample", "1h", "3d"], default: "2sample" },
     },
     // ── Decoder / output ──
     ParamSpec {
@@ -821,6 +882,11 @@ impl ParamValues {
             wobble_rate: 1.0,
             temporal_coherence: 0.0,
             tape_seed: 0,
+            line_tbc: None,
+            frame_tbc: None,
+            v_jitter: None,
+            deck_sharpness: None,
+            deck_dnr: None,
         };
         if fx.wobble.is_some() {
             fx.wobble_rate = req("wobble-rate").sample(rng);
@@ -833,6 +899,12 @@ impl ParamValues {
                 None => rng.random(),
             };
         }
+        // Deck stages (newer; drawn after everything above).
+        fx.line_tbc = s("line-tbc", rng);
+        fx.frame_tbc = s("frame-tbc", rng);
+        fx.v_jitter = s("v-jitter", rng);
+        fx.deck_sharpness = s("deck-sharpness", rng);
+        fx.deck_dnr = s("deck-dnr", rng);
         fx
     }
 
@@ -903,6 +975,11 @@ impl ParamValues {
             opt("wobble_rate", "wobble-rate", Some(fx.wobble_rate));
         }
         opt("temporal_coherence", "temporal-coherence", Some(fx.temporal_coherence));
+        opt("line_tbc", "line-tbc", fx.line_tbc);
+        opt("frame_tbc", "frame-tbc", fx.frame_tbc);
+        opt("v_jitter", "v-jitter", fx.v_jitter);
+        opt("deck_sharpness", "deck-sharpness", fx.deck_sharpness);
+        opt("deck_dnr", "deck-dnr", fx.deck_dnr);
         parts
     }
 

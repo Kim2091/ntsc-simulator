@@ -15,6 +15,7 @@ use rayon::prelude::*;
 
 use crate::colorbars;
 use crate::constants::SAMPLE_RATE;
+use crate::deck::TemporalDnr;
 use crate::decoder::Decoder;
 use crate::dvd::{self, DvdConfig, DvdOutput};
 use crate::effects::SignalEffects;
@@ -141,7 +142,7 @@ pub fn render_frame(
     let mut buf = Vec::new();
     let mut buf_c = Vec::new();
     analog_frame(
-        &mut encoder, &mut decoder, &mut buf, &mut buf_c, pixels, None, w, h, out_w, out_h,
+        &mut encoder, &mut decoder, &mut buf, &mut buf_c, pixels, None, Some((pixels, None)), w, h, out_w, out_h,
         frame as u32, comb_1h, values, fx, fx.is_active(),
     )
 }
@@ -149,6 +150,27 @@ pub fn render_frame(
 /// Encode (one or two fields' sources) to the analog signal, apply the
 /// effects for frame `fnum`, and decode, over a composite or S-Video
 /// connection.  `buf`/`buf_c` are reusable scratch buffers.
+/// Source of the previous frame, for the 3D comb: (field 1, field 2).
+pub type PrevFrame<'a> = Option<(&'a [u8], Option<&'a [u8]>)>;
+
+/// Decoder comb filter for a composite connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Comb {
+    TwoSample,
+    OneLine,
+    Frame3d,
+}
+
+/// The comb in use: `--comb`, or `--comb-1h` for compatibility.
+pub fn comb_mode(values: &ParamValues, comb_1h: bool) -> Comb {
+    match values.choice("comb") {
+        _ if comb_1h => Comb::OneLine,
+        "1h" => Comb::OneLine,
+        "3d" => Comb::Frame3d,
+        _ => Comb::TwoSample,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn analog_frame(
     enc: &mut Encoder,
@@ -157,6 +179,7 @@ fn analog_frame(
     buf_c: &mut Vec<f32>,
     f1: &[u8],
     f2: Option<&[u8]>,
+    prev: PrevFrame,
     in_w: usize,
     in_h: usize,
     out_w: usize,
@@ -168,7 +191,7 @@ fn analog_frame(
     effects_active: bool,
 ) -> Vec<u8> {
     let legacy = values.flag("legacy-burst-phase");
-    let encode = |enc: &mut Encoder, wire: Wire, out: &mut Vec<f32>| {
+    let encode = |enc: &mut Encoder, wire: Wire, out: &mut Vec<f32>, f1: &[u8], f2: Option<&[u8]>, fnum: u32| {
         enc.wire = wire;
         let s = match f2 {
             None => enc.encode_frame(f1, in_w, in_h, fnum),
@@ -179,8 +202,8 @@ fn analog_frame(
         enc.wire = Wire::Composite;
     };
     if values.choice("video-out") == "svideo" {
-        encode(enc, Wire::Luma, buf);
-        encode(enc, Wire::Chroma, buf_c);
+        encode(enc, Wire::Luma, buf, f1, f2, fnum);
+        encode(enc, Wire::Chroma, buf_c, f1, f2, fnum);
         if effects_active {
             let rng = frame_rng(values.seed, fnum as u64);
             fx.apply_wire(buf, SAMPLE_RATE, &mut rng.clone(), fnum as u64, Wire::Luma);
@@ -188,12 +211,26 @@ fn analog_frame(
         }
         dec.decode_svideo(buf, buf_c, out_w, out_h, legacy).to_vec()
     } else {
-        encode(enc, Wire::Composite, buf);
+        encode(enc, Wire::Composite, buf, f1, f2, fnum);
         if effects_active {
             let mut rng = frame_rng(values.seed, fnum as u64);
             fx.apply(buf, SAMPLE_RATE, &mut rng, fnum as u64);
         }
-        dec.decode_frame(buf, out_w, out_h, comb_1h, legacy).to_vec()
+        match (comb_mode(values, comb_1h), prev) {
+            (Comb::Frame3d, Some((p1, p2))) => {
+                // The previous frame as received: same encoder, its own
+                // frame number and effects.  `buf_c` holds it.
+                let pnum = if fnum > 0 { fnum - 1 } else { fnum + 1 };
+                encode(enc, Wire::Composite, buf_c, p1, p2, pnum);
+                if effects_active {
+                    let mut rng = frame_rng(values.seed, pnum as u64);
+                    fx.apply(buf_c, SAMPLE_RATE, &mut rng, pnum as u64);
+                }
+                dec.decode_frame_3d(buf, buf_c, out_w, out_h, legacy).to_vec()
+            }
+            (Comb::OneLine, _) => dec.decode_frame(buf, out_w, out_h, true, legacy).to_vec(),
+            _ => dec.decode_frame(buf, out_w, out_h, false, legacy).to_vec(),
+        }
     }
 }
 
@@ -408,6 +445,17 @@ pub fn process_video_file(
     progress: &dyn Progress,
     prefix: &str,
 ) -> Result<()> {
+    // Give unseeded runs a random seed, so per-frame effects can be
+    // re-created exactly (the 3D comb re-encodes the previous frame).
+    let seeded;
+    let values = if values.seed.is_none() {
+        let mut v = values.clone();
+        v.seed = Some(rand::random());
+        seeded = v;
+        &seeded
+    } else {
+        values
+    };
     if values.choice("format") == "dvd" {
         dvd_roundtrip(input, output, opts, values, progress, prefix)
     } else if opts.telecine {
@@ -430,6 +478,7 @@ thread_local! {
 fn process_frame_tl(
     f1: &[u8],
     f2: Option<&[u8]>,
+    prev: PrevFrame,
     in_w: usize,
     in_h: usize,
     out_w: usize,
@@ -446,7 +495,7 @@ fn process_frame_tl(
                 TL_SIGNAL_BUF_C.with(|sc| {
                     analog_frame(
                         &mut enc.borrow_mut(), &mut dec.borrow_mut(), &mut sb.borrow_mut(), &mut sc.borrow_mut(),
-                        f1, f2, in_w, in_h, out_w, out_h, fnum, comb_1h, values, fx, effects_active,
+                        f1, f2, prev, in_w, in_h, out_w, out_h, fnum, comb_1h, values, fx, effects_active,
                     )
                 })
             })
@@ -488,6 +537,8 @@ fn roundtrip(
     let mut raw_copy = open_raw_copy(opts)?;
     let mut reader_buf = std::io::BufReader::new(reader.stdout.take().unwrap());
     let mut writer_buf = std::io::BufWriter::new(writer.stdin.take().unwrap());
+    // Sequential stage: runs on the decoded frames in order.
+    let mut dnr = fx.deck_dnr.filter(|s| *s > 0.0).map(TemporalDnr::new);
 
     let batch_size = init_thread_pool(opts.threads);
     progress.log(&format!("  Batch size: {} (parallel frames)", batch_size));
@@ -497,6 +548,8 @@ fn roundtrip(
     progress.start(total_frames, prefix);
 
     let mut frame_pool: Vec<Vec<u8>> = (0..batch_size).map(|_| vec![0u8; frame_bytes]).collect();
+    // Last source frame of the previous batch (previous frame for the 3D comb).
+    let mut last_frame = vec![0u8; frame_bytes];
 
     loop {
         if progress.is_cancelled() {
@@ -524,13 +577,27 @@ fn roundtrip(
             .into_par_iter()
             .map(|i| {
                 let fnum = frame_num + i as u32;
+                let prev: PrevFrame = if i > 0 {
+                    Some((frame_pool[i - 1].as_slice(), None))
+                } else if frame_num > 0 {
+                    Some((last_frame.as_slice(), None))
+                } else {
+                    Some((frame_pool[0].as_slice(), None))
+                };
                 process_frame_tl(
-                    &frame_pool[i], None, in_w, in_h, out_w, out_h, fnum,
+                    &frame_pool[i], None, prev, in_w, in_h, out_w, out_h, fnum,
                     opts.comb_1h, values, &fx, effects_active,
                 )
             })
             .collect();
+        last_frame.copy_from_slice(&frame_pool[batch_count - 1]);
 
+        let mut results = results;
+        if let Some(dnr) = dnr.as_mut() {
+            for r in results.iter_mut() {
+                dnr.process(r, out_w, out_h);
+            }
+        }
         for result in &results {
             writer_buf.write_all(result).context("write failed")?;
             if let Some(raw) = raw_copy.as_mut() {
@@ -580,6 +647,7 @@ fn roundtrip_telecine(
     let mut raw_copy = open_raw_copy(opts)?;
     let mut reader_buf = std::io::BufReader::new(reader.stdout.take().unwrap());
     let mut writer_buf = std::io::BufWriter::new(writer.stdin.take().unwrap());
+    let mut dnr = fx.deck_dnr.filter(|s| *s > 0.0).map(TemporalDnr::new);
 
     let num_cpus = init_thread_pool(opts.threads);
     progress.log(&format!("  Workers: {}", num_cpus));
@@ -637,15 +705,25 @@ fn roundtrip_telecine(
 
         let results: Vec<Vec<u8>> = jobs
             .par_iter()
-            .map(|&(f1_idx, f2_idx, fnum)| {
+            .enumerate()
+            .map(|(j, &(f1_idx, f2_idx, fnum))| {
                 let f2 = (f1_idx != f2_idx).then(|| film_buf[f2_idx].as_slice());
+                // The previous NTSC frame of this batch (first one: itself).
+                let (p1, p2) = if j > 0 { (jobs[j - 1].0, jobs[j - 1].1) } else { (f1_idx, f2_idx) };
+                let prev: PrevFrame = Some((film_buf[p1].as_slice(), (p1 != p2).then(|| film_buf[p2].as_slice())));
                 process_frame_tl(
-                    &film_buf[f1_idx], f2, in_w, in_h, out_w, out_h, fnum,
+                    &film_buf[f1_idx], f2, prev, in_w, in_h, out_w, out_h, fnum,
                     opts.comb_1h, values, &fx, effects_active,
                 )
             })
             .collect();
 
+        let mut results = results;
+        if let Some(dnr) = dnr.as_mut() {
+            for r in results.iter_mut() {
+                dnr.process(r, out_w, out_h);
+            }
+        }
         for result in &results {
             writer_buf.write_all(result).context("write failed")?;
             if let Some(raw) = raw_copy.as_mut() {
@@ -737,7 +815,7 @@ fn player_output(
                 TL_SIGNAL_BUF_C.with(|sc| {
                     analog_frame(
                         &mut enc.borrow_mut(), &mut dec.borrow_mut(), &mut sb.borrow_mut(), &mut sc.borrow_mut(),
-                        &src, src2.as_deref(), sw, sh, decode_w, 480, fnum, comb_1h, &vals, fx, fx.is_active(),
+                        &src, src2.as_deref(), Some((&src, src2.as_deref())), sw, sh, decode_w, 480, fnum, comb_1h, &vals, fx, fx.is_active(),
                     )
                 })
             })
@@ -775,6 +853,47 @@ pub fn dvd_still(
     let pic = encoded.decoder()?.nth(idx).context("the MPEG-2 decoder returned too few frames")?;
     let rgb = dvd::yuv420_to_rgb(&pic.frame, pic.interlaced, cfg.cue);
     Ok(player_output(&rgb, None, cfg, values, fx, comb_1h, frame as u32))
+}
+
+/// Like `render_preview`, but for a video frame with the frames before it
+/// (`history`, oldest first): when the deck noise reduction is on, the
+/// earlier frames are rendered first so its recursive state builds up.
+#[allow(clippy::too_many_arguments)]
+pub fn render_preview_sequence(
+    history: &[&[u8]],
+    pixels: &[u8],
+    w: usize,
+    h: usize,
+    src_dar: f64,
+    out_w: usize,
+    out_h: usize,
+    comb_1h: bool,
+    values: &ParamValues,
+    frame: u64,
+) -> Result<(Vec<u8>, usize, usize, Vec<String>)> {
+    let (fx, dvd) = resolve_all(values);
+    let Some(strength) = fx.deck_dnr.filter(|s| *s > 0.0 && dvd.is_none() && !history.is_empty()) else {
+        return render_preview(pixels, w, h, src_dar, out_w, out_h, comb_1h, values, frame);
+    };
+    let mut dnr = TemporalDnr::new(strength);
+    let n = history.len() as u64;
+    let mut prev: &[u8] = history[0];
+    for (k, src) in history.iter().chain(std::iter::once(&pixels)).enumerate() {
+        let fnum = (frame + k as u64).saturating_sub(n);
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new();
+        let (mut b1, mut b2) = (Vec::new(), Vec::new());
+        let mut rgb = analog_frame(
+            &mut encoder, &mut decoder, &mut b1, &mut b2, src, None, Some((prev, None)), w, h, out_w, out_h,
+            fnum as u32, comb_1h, values, &fx, fx.is_active(),
+        );
+        dnr.process(&mut rgb, out_w, out_h);
+        prev = src;
+        if k as u64 == n {
+            return Ok((rgb, out_w, out_h, values.sampled_summary(&fx)));
+        }
+    }
+    unreachable!()
 }
 
 /// Render a preview or still: the analog path at `out_w`×`out_h`, or the
@@ -907,6 +1026,7 @@ fn dvd_roundtrip(
     let mut writer_buf = std::io::BufWriter::new(writer.stdin.take().unwrap());
     let mut raw_copy = open_raw_copy(opts)?;
     let mut decoder = encoded.decoder()?;
+    let mut dnr = if analog { fx.deck_dnr.filter(|s| *s > 0.0).map(TemporalDnr::new) } else { None };
     progress.start(n_pics, "Player output");
     let mut out_num = 0u32;
     loop {
@@ -951,6 +1071,12 @@ fn dvd_roundtrip(
                 player_output(&rgbs[a], f2, &cfg, values, &fx, opts.comb_1h, fnum).0
             })
             .collect();
+        let mut results = results;
+        if let Some(dnr) = dnr.as_mut() {
+            for r in results.iter_mut() {
+                dnr.process(r, ow, oh);
+            }
+        }
         for r in &results {
             writer_buf.write_all(r).context("write failed")?;
             if let Some(raw) = raw_copy.as_mut() {
@@ -1195,6 +1321,33 @@ pub fn video_duration(path: &Path) -> Option<f64> {
     String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
+/// Grab `count` consecutive RGB frames ending at `time_s` (oldest first),
+/// with the same colour conversion as the reader.  Fewer frames come back
+/// near the start of the video.
+pub fn grab_video_frames(
+    path: &Path,
+    time_s: f64,
+    count: usize,
+    values: &ParamValues,
+) -> Result<Vec<Vec<u8>>> {
+    let (w, h, fps, ..) = ffprobe_video(path)?;
+    let start = (time_s - (count as f64 - 1.0) / fps.max(1.0)).max(0.0);
+    let colour = input_colour(path, values);
+    let output = tool_command("ffmpeg")
+        .args(["-v", "error", "-ss", &format!("{:.3}", start), "-i"])
+        .arg(path)
+        .args(["-vf", &colour.filter()])
+        .args(["-frames:v", &count.to_string(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+        .output()
+        .context("Failed to run ffmpeg. Is ffmpeg installed?")?;
+    let n = w * h * 3;
+    let frames: Vec<Vec<u8>> = output.stdout.chunks_exact(n).map(|c| c.to_vec()).collect();
+    if frames.is_empty() {
+        bail!("ffmpeg returned no frames at {:.2} s", time_s);
+    }
+    Ok(frames)
+}
+
 /// Grab one RGB frame at `time_s` seconds, converted with the same colour
 /// handling as the video reader: (pixels, width, height).
 pub fn grab_video_frame(path: &Path, time_s: f64, values: &ParamValues) -> Result<(Vec<u8>, usize, usize)> {
@@ -1304,5 +1457,11 @@ mod tests {
         v.set_from_str("video-out", "svideo").unwrap();
         let svideo = sat(&render_frame(&src, 640, 480, 640, 480, false, &v, &fx, 0));
         assert!(svideo < 0.25 * composite, "svideo {} vs composite {}", svideo, composite);
+
+        // The 3D comb separates a still picture cleanly too.
+        let mut v = ParamValues::default();
+        v.set_from_str("comb", "3d").unwrap();
+        let comb3d = sat(&render_frame(&src, 640, 480, 640, 480, false, &v, &fx, 5));
+        assert!(comb3d < 0.25 * composite, "3d comb {} vs 2-sample {}", comb3d, composite);
     }
 }

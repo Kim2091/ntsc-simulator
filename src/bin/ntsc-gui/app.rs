@@ -49,6 +49,8 @@ pub struct App {
     /// Editor state of the selected preset, to show "modified" and reset.
     base: ParamEditor,
     preset: PresetChoice,
+    /// Playback-deck profile combined with the preset.
+    deck: Option<&'static str>,
     custom_presets: Vec<Preset>,
 
     seed: u64,
@@ -87,7 +89,7 @@ pub struct App {
 }
 
 fn bars_source() -> SourceImage {
-    SourceImage { rgb: colorbars::generate_colorbars(640, 480), w: 640, h: 480 }
+    SourceImage { rgb: colorbars::generate_colorbars(640, 480), w: 640, h: 480, history: Vec::new() }
 }
 
 fn quote(arg: &str) -> String {
@@ -105,6 +107,7 @@ impl App {
             editor: ParamEditor::from_values(&ParamValues::default()),
             base: ParamEditor::from_values(&ParamValues::default()),
             preset: PresetChoice::None,
+            deck: None,
             custom_presets: Vec::new(),
             seed: 1,
             frame: 0,
@@ -135,6 +138,7 @@ impl App {
             screenshot_done: Arc::new(AtomicBool::new(false)),
             screenshot_sent: false,
         };
+        app.deck = args.deck.as_deref().and_then(presets::deck).map(|d| d.name);
         let preset = args.preset.as_deref().unwrap_or("mq");
         match presets::builtin(preset) {
             Some(p) => app.select_preset(PresetChoice::Builtin(p.name)),
@@ -154,6 +158,13 @@ impl App {
         app.set_before_texture(&cc.egui_ctx);
         if let Some(path) = &args.open {
             app.open_path(&cc.egui_ctx, path);
+        }
+        if let Some(t) = args.time {
+            if let Source::Video { path, fps, time, .. } = &mut app.source {
+                *time = t;
+                app.frame = (t * *fps).round() as u64;
+                app.grab = Some(grab_frame_async(cc.egui_ctx.clone(), path.clone(), t, ParamValues::default()));
+            }
         }
         if args.process {
             app.process.open = true;
@@ -184,7 +195,9 @@ impl App {
     }
 
     fn select_preset(&mut self, choice: PresetChoice) {
-        let values = self.preset_values(&choice);
+        // The deck profile's values win over the preset's.
+        let mut values = self.deck.and_then(presets::deck).map(|d| d.to_values()).unwrap_or_default();
+        values.fill_from(&self.preset_values(&choice));
         if let Some(seed) = values.seed {
             self.seed = seed;
         }
@@ -205,8 +218,9 @@ impl App {
 
     fn settings_label(&self) -> String {
         format!(
-            "preset {}{}, seed {}",
+            "preset {}{}{}, seed {}",
             self.preset_label(&self.preset),
+            self.deck.map(|d| format!(" + {}", d)).unwrap_or_default(),
             if self.is_modified() { " (modified)" } else { "" },
             self.seed
         )
@@ -301,7 +315,7 @@ impl App {
                     let rgb = img.to_rgb8();
                     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
                     self.source = Source::Image(path.to_path_buf());
-                    self.set_source_image(ctx, SourceImage { rgb: rgb.into_raw(), w, h });
+                    self.set_source_image(ctx, SourceImage { rgb: rgb.into_raw(), w, h, history: Vec::new() });
                     self.status = Some((true, format!("Opened {} ({}×{})", path.display(), w, h)));
                 }
                 Err(e) => self.status = Some((false, format!("Cannot open {}: {}", path.display(), e))),
@@ -505,6 +519,30 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Playback deck").strong()).on_hover_text(
+                "Deck / capture profile, combined with the preset above (the deck's values win where both set something).",
+            );
+            let mut pick: Option<Option<&'static str>> = None;
+            egui::ComboBox::from_id_salt("deck")
+                .selected_text(self.deck.unwrap_or("None"))
+                .width(150.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(self.deck.is_none(), "None").clicked() {
+                        pick = Some(None);
+                    }
+                    for d in presets::DECKS {
+                        if ui.selectable_label(self.deck == Some(d.name), d.name).on_hover_text(d.description).clicked() {
+                            pick = Some(Some(d.name));
+                        }
+                    }
+                });
+            if let Some(d) = pick {
+                self.deck = d;
+                let p = self.preset.clone();
+                self.select_preset(p);
+            }
+        });
+        ui.horizontal(|ui| {
             if ui.add_enabled(self.is_modified(), egui::Button::new("Reset all"))
                 .on_hover_text("Back to the selected preset's values")
                 .clicked()
@@ -551,8 +589,6 @@ impl App {
     }
 
     fn output_controls(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.comb_1h, "1H comb filter (decoder)")
-            .on_hover_text("Line-delay comb instead of the 2-sample comb: less rainbow, but hanging dots on colour edges. CLI: --comb-1h");
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.auto_size, "Auto size").on_hover_text(
                 "Images keep their own size; video and colour bars are 640×480. Untick to set --width/--height.",

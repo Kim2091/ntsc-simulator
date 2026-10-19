@@ -70,7 +70,7 @@ impl Default for GhostConfig {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Configurable signal degradation effects.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct SignalEffects {
     /// Gaussian noise amplitude (e.g. 0.05 = subtle, 0.2 = heavy snow)
     pub noise: Option<f32>,
@@ -149,6 +149,17 @@ pub struct SignalEffects {
     pub temporal_coherence: f32,
     /// Seed of the drifting tape state for this file.
     pub tape_seed: u64,
+    /// Line time-base corrector strength (0–1).  `None` = off.
+    pub line_tbc: Option<f32>,
+    /// Frame TBC / frame synchroniser strength (0–1).  `None` = off.
+    pub frame_tbc: Option<f32>,
+    /// Vertical bounce, std dev in output rows.  `None` = off.
+    pub v_jitter: Option<f32>,
+    /// Deck sharpness control (−1 soft … 0 edit … 1 sharp).  `None` = off.
+    pub deck_sharpness: Option<f32>,
+    /// Deck recursive (temporal) noise reduction, applied to decoded frames
+    /// in frame order by the pipeline.  `None` = off.
+    pub deck_dnr: Option<f32>,
 }
 
 /// Default number of active lines per field affected by head switching.
@@ -176,6 +187,8 @@ impl SignalEffects {
             || self.chroma_delay.is_some()
             || self.chroma_delay_v.is_some()
             || self.wobble.is_some()
+            || self.v_jitter.is_some()
+            || self.deck_sharpness.is_some()
     }
 
     /// Settings for the playback chroma path; zero turns a stage off.
@@ -227,6 +240,11 @@ impl SignalEffects {
     pub fn apply_wire(&self, signal: &mut [f32], sample_rate: f64, rng: &mut impl Rng, frame: u64, wire: Wire) {
         let luma_on = wire != Wire::Chroma;
         let chroma_on = wire != Wire::Luma;
+        // A line TBC re-times every line from its sync and burst: it removes
+        // most line-to-line timing error but not the noise at the head
+        // switch.  A frame TBC holds the picture vertically.
+        let tbc = self.line_tbc.unwrap_or(0.0).clamp(0.0, 1.0);
+        let ftbc = self.frame_tbc.unwrap_or(0.0).clamp(0.0, 1.0);
         let clock = TapeClock {
             seed: self.tape_seed,
             frame,
@@ -267,6 +285,11 @@ impl SignalEffects {
                 apply_edge_ringing(signal, gain, sample_rate);
             }
         }
+        if let Some(s) = self.deck_sharpness {
+            if luma_on {
+                apply_deck_sharpness(signal, s);
+            }
+        }
         if let Some(strength) = self.head_switching_smear {
             on!(luma_on, |s| apply_head_wear_smear(s, strength, rng, &clock));
         }
@@ -277,13 +300,16 @@ impl SignalEffects {
             apply_tape_dropout(signal, rate, self.tape_dropout_len, sample_rate, rng);
         }
         if let Some(amp) = self.wobble {
-            apply_wobble(signal, amp, self.wobble_rate, rng, &clock);
+            apply_wobble(signal, amp * (1.0 - 0.95 * tbc), self.wobble_rate, rng, &clock);
+        }
+        if let Some(amp) = self.v_jitter {
+            apply_v_jitter(signal, amp * (1.0 - ftbc), rng, &clock);
         }
         if let Some(strength) = self.top_band {
             on!(chroma_on, |s| apply_top_band(s, strength, rng, &clock));
         }
         if let Some(strength) = self.head_switch {
-            apply_head_switch(signal, strength, self.head_switch_lines, rng, &clock);
+            apply_head_switch(signal, strength, self.head_switch_lines, 1.0 - 0.75 * tbc, rng, &clock);
         }
         if let Some(amp) = self.noise {
             apply_noise(signal, amp, rng);
@@ -295,7 +321,7 @@ impl SignalEffects {
             apply_attenuation(signal, strength);
         }
         if let Some(amp) = self.jitter {
-            apply_jitter(signal, amp, rng);
+            apply_jitter(signal, (amp * (1.0 - 0.95 * tbc)).max(1e-6), rng);
         }
         // Tape trail is the very last step — the playback head's bandwidth
         // limit smears everything that's on the tape (noise, dropouts,
@@ -1323,11 +1349,13 @@ fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng, clock: 
 ///     with coloured speckles.
 ///
 /// `max_shift` is about 28 samples (≈ 2 µs) at strength 1 and varies
-/// randomly for every frame and field.
+/// randomly for every frame and field.  `timing_scale` (< 1 with a line
+/// TBC) scales the displacement and burst error, not the noise.
 fn apply_head_switch(
     signal: &mut [f32],
     strength: f32,
     lines: usize,
+    timing_scale: f32,
     rng: &mut impl Rng,
     clock: &TapeClock,
 ) {
@@ -1363,11 +1391,11 @@ fn apply_head_switch(
 
             // ── Time-base jump: fractional rightward shift ──
             let ramp = ((k + 1) as f32 / n_lines as f32).powf(1.5);
-            let shift = (max_shift * ramp + 0.6 * strength * randn(rng)).max(0.0);
+            let shift = ((max_shift * ramp + 0.6 * strength * randn(rng)) * timing_scale).max(0.0);
             shift_segment(&mut signal[line_base..line_base + spl], ACTIVE_START, spl, shift);
 
             // ── Burst moves with the line, minus a residual timing error ──
-            let residual = burst_error * ramp + 0.1 * strength * randn(rng);
+            let residual = (burst_error * ramp + 0.1 * strength * randn(rng)) * timing_scale;
             let burst_lo = FRONT_PORCH_SAMPLES + HSYNC_SAMPLES;
             shift_segment(&mut signal[line_base..line_base + spl], burst_lo, ACTIVE_START, shift - residual);
             let row = &mut signal[base..base + ACTIVE_SAMPLES];
@@ -1743,6 +1771,92 @@ fn apply_wobble(
 /// Half-width of the fractional-delay kernel used by `shift_segment`.
 const SHIFT_HALF_TAPS: isize = 8;
 
+// ────────────────────────────────────────────────────────────────────────────
+// Vertical bounce
+// ────────────────────────────────────────────────────────────────────────────
+
+const KEY_V_JITTER: u64 = 0x500;
+
+/// Simulate vertical bounce: the whole picture jumps up or down from frame
+/// to frame (tape tension and servo errors), with a little extra
+/// difference between the two fields.
+///
+/// Lines are moved by whole field lines, burst included, because blending
+/// neighbouring composite lines would cancel their (inverted) chroma.
+/// Lines moved in from outside the picture are blank (black).
+/// `amp_rows` is the standard deviation in output rows.
+fn apply_v_jitter(signal: &mut [f32], amp_rows: f32, rng: &mut impl Rng, clock: &TapeClock) {
+    let spl = SAMPLES_PER_LINE;
+    if amp_rows <= 0.0 || signal.len() < TOTAL_LINES * spl {
+        return;
+    }
+    let r = randn(rng);
+    let frame_bounce = clock.blend(r, || clock.normal(KEY_V_JITTER));
+    for (field, &(first, end)) in FIELD_ACTIVE_LINES.iter().enumerate() {
+        let r = randn(rng);
+        let field_delta = clock.blend(r, || clock.normal(KEY_V_JITTER + 1 + field as u64));
+        // One field line is two output rows.
+        let shift = ((frame_bounce + 0.2 * field_delta) * amp_rows / 2.0).round() as isize;
+        if shift == 0 {
+            continue;
+        }
+        let src: Vec<f32> = signal[first * spl..end * spl].to_vec();
+        let n = (end - first) as isize;
+        for k in 0..n {
+            let from = k - shift;
+            let dst = &mut signal[(first + k as usize) * spl..(first + k as usize + 1) * spl];
+            if (0..n).contains(&from) {
+                dst.copy_from_slice(&src[from as usize * spl..(from as usize + 1) * spl]);
+            } else {
+                dst.fill(BLANKING_V);
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Deck sharpness control
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The playback deck's picture / sharpness control, on luma only.
+/// Positive values add peaking around 2 MHz (crisper edges with some
+/// overshoot); negative values blend towards a 2 MHz lowpass (softer
+/// picture, less visible noise); 0 is the "edit" setting with no
+/// enhancement.
+fn apply_deck_sharpness(signal: &mut [f32], sharpness: f32) {
+    let spl = SAMPLES_PER_LINE;
+    let s = sharpness.clamp(-1.0, 1.0);
+    if s == 0.0 || signal.len() < TOTAL_LINES * spl {
+        return;
+    }
+    let lp = filters::design_lowpass(2.0e6, 41);
+    let mut luma = vec![0.0f32; spl];
+    let mut chroma = vec![0.0f32; spl];
+    let mut active = vec![0.0f32; ACTIVE_SAMPLES];
+    let mut scratch = Vec::new();
+    for line in 0..TOTAL_LINES {
+        let base = line * spl;
+        luma[0] = signal[base];
+        luma[1] = signal[base + 1];
+        chroma[0] = 0.0;
+        chroma[1] = 0.0;
+        for n in 2..spl {
+            luma[n] = (signal[base + n] + signal[base + n - 2]) * 0.5;
+            chroma[n] = (signal[base + n] - signal[base + n - 2]) * 0.5;
+        }
+        active.copy_from_slice(&luma[ACTIVE_START..ACTIVE_START + ACTIVE_SAMPLES]);
+        apply_fir_inplace(&mut active, &lp, &mut scratch);
+        for j in 0..ACTIVE_SAMPLES {
+            let y = luma[ACTIVE_START + j];
+            let detail = y - active[j];
+            luma[ACTIVE_START + j] = if s > 0.0 { y + 1.5 * s * detail } else { y - (-s) * detail };
+        }
+        for n in 0..spl {
+            signal[base + n] = luma[n] + chroma[n];
+        }
+    }
+}
+
 /// Shift `line[lo..hi]` right by `shift` samples (negative = left).
 /// Samples that would come from outside the segment read as blanking.
 ///
@@ -2063,11 +2177,53 @@ mod tests {
     }
 
     #[test]
+    fn v_jitter_moves_whole_lines_and_frame_tbc_stops_it() {
+        let orig = test_signal();
+        let clock = TapeClock { seed: 3, frame: 0, coherence: 1.0 };
+        let mut moved = orig.clone();
+        apply_v_jitter(&mut moved, 4.0, &mut StdRng::seed_from_u64(1), &clock);
+        assert_ne!(moved, orig);
+        // Every changed line is a copy of another line of the same field, or blank.
+        for (first, end) in FIELD_ACTIVE_LINES {
+            for l in first..end {
+                let r = l * SAMPLES_PER_LINE..(l + 1) * SAMPLES_PER_LINE;
+                let line = &moved[r.clone()];
+                let blank = line.iter().all(|&v| v == BLANKING_V);
+                let copy = (first..end).any(|m| &orig[m * SAMPLES_PER_LINE..(m + 1) * SAMPLES_PER_LINE] == line);
+                assert!(blank || copy, "line {l}");
+            }
+        }
+        let mut fx = SignalEffects {
+            v_jitter: Some(4.0),
+            frame_tbc: Some(1.0),
+            ..SignalEffects::default()
+        };
+        let mut sig = orig.clone();
+        fx.apply(&mut sig, crate::constants::SAMPLE_RATE, &mut StdRng::seed_from_u64(1), 0);
+        assert_eq!(sig, orig);
+        fx.frame_tbc = None;
+        fx.apply(&mut sig, crate::constants::SAMPLE_RATE, &mut StdRng::seed_from_u64(1), 0);
+        assert_ne!(sig, orig);
+    }
+
+    #[test]
+    fn line_tbc_reduces_wobble() {
+        let orig = test_signal();
+        let run = |tbc: Option<f32>| {
+            let fx = SignalEffects { wobble: Some(3.0), wobble_rate: 1.0, line_tbc: tbc, ..SignalEffects::default() };
+            let mut sig = orig.clone();
+            fx.apply(&mut sig, crate::constants::SAMPLE_RATE, &mut StdRng::seed_from_u64(9), 0);
+            mean_abs_diff(&sig, &orig)
+        };
+        assert!(run(Some(1.0)) < 0.2 * run(None));
+    }
+
+    #[test]
     fn zero_strength_is_noop() {
         let orig = test_signal();
         let mut rng = StdRng::seed_from_u64(1);
         let mut sig = orig.clone();
-        apply_head_switch(&mut sig, 0.0, DEFAULT_HEAD_SWITCH_LINES, &mut rng, &TapeClock::off());
+        apply_head_switch(&mut sig, 0.0, DEFAULT_HEAD_SWITCH_LINES, 1.0, &mut rng, &TapeClock::off());
         apply_top_band(&mut sig, 0.0, &mut rng, &TapeClock::off());
         apply_vbi_data(&mut sig, 0.0, crate::constants::SAMPLE_RATE, &mut rng);
         let off = ChromaPathConfig::default();
@@ -2082,7 +2238,7 @@ mod tests {
         let n = 6;
         let mut rng = StdRng::seed_from_u64(2);
         let mut sig = orig.clone();
-        apply_head_switch(&mut sig, 1.0, n, &mut rng, &TapeClock::off());
+        apply_head_switch(&mut sig, 1.0, n, 1.0, &mut rng, &TapeClock::off());
         let expected: Vec<usize> = (260 - n..260).chain(523 - n..523).collect();
         assert_eq!(changed_lines(&orig, &sig), expected);
         // Front porch and sync stay untouched on the affected lines.

@@ -263,6 +263,27 @@ DVD presets select the DVD path (`--format dvd`); see [DVD-Video path](#dvd-vide
 }
 ```
 
+### Playback deck and capture chain
+
+The deck and capture stages are off unless set; `--deck` picks a profile that combines with the tape preset (the deck's values win where both set something):
+
+```bash
+# Worn tape played on a high-end S-VHS deck with TBC and noise reduction
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --preset lq --deck deck-svhs-tbc
+```
+
+| Profile | Settings |
+|---|---|
+| `deck-basic` | nothing extra: composite output, no TBC, no noise reduction (the default behaviour) |
+| `deck-svhs-tbc` | `--line-tbc 0.9 --frame-tbc 1 --deck-dnr 0.5 --comb 3d --video-out svideo` |
+| `deck-edit` | `--deck-sharpness 0 --edge-ringing 0` (edit mode, no enhancement) |
+
+- **Line TBC** (`--line-tbc`): re-times every line, removing most jitter and wobble and much of the head-switching displacement (the switching noise line stays).
+- **Frame TBC** (`--frame-tbc`): holds the picture vertically, removing `--v-jitter` (vertical bounce, a new tape effect: whole fields jump by whole lines).
+- **Deck noise reduction** (`--deck-dnr`): recursive, motion-adaptive temporal filter on the output frames; cleans noise in still areas and leaves smeared ghost trails behind motion. It needs consecutive frames, so it runs as a sequential stage after the parallel encode/decode and does nothing on single images (the GUI renders the previous 8 frames of a video so it shows in the preview).
+- **Deck sharpness** (`--deck-sharpness -1..1`): the deck's picture control; negative softens, 0 is edit mode (no enhancement), positive adds peaking. `--edge-ringing` still works as before.
+- **Decoder comb** (`--comb 2sample|1h|3d`): the TV or capture card's luma/chroma separation for composite signals. `3d` is a motion-adaptive frame comb that uses the previous frame in still areas (clean luma and chroma there) and falls back to the 2-sample comb where the picture moves. `--comb-1h` still selects the line comb.
+
 ### DVD-Video path
 
 `--format dvd` replaces the analog chain with a DVD-Video (NTSC) chain: mastering, MPEG-2 encoding within the DVD-Video limits, player decoding, and the player's output.
@@ -392,6 +413,18 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 | `--dvd-frame-type` | image, colorbars | Picture type returned for stills: `b` (default), `p`, `i` |
 | `--dvd-keep-mpeg2` | roundtrip, image, colorbars | Save the MPEG-2 stream (`.m2v` elementary, `.vob`/`.mpg` program stream) |
 
+### Playback deck / capture
+
+| Flag | Commands | Description |
+|---|---|---|
+| `--deck` | roundtrip, image, colorbars | Deck profile: `deck-basic`, `deck-svhs-tbc`, `deck-edit` |
+| `--line-tbc` | roundtrip, image, colorbars | Line time-base corrector strength (0–1) |
+| `--frame-tbc` | roundtrip, image, colorbars | Frame TBC / frame synchroniser strength (0–1) |
+| `--v-jitter` | roundtrip, image, colorbars | Vertical bounce, std dev in output rows |
+| `--deck-dnr` | roundtrip | Recursive temporal noise reduction (0–1); no effect on single images |
+| `--deck-sharpness` | roundtrip, image, colorbars | Deck sharpness control (−1 soft … 0 edit … 1 sharp) |
+| `--comb` | roundtrip, image, colorbars | Decoder comb: `2sample` (default), `1h`, `3d` |
+
 Run `ntsc-composite-simulator <command> -h` for full details.
 
 ## Third-party licences
@@ -480,6 +513,7 @@ The VHS simulation models both the recording and playback signal paths:
 
 Newest first.
 
+- **Playback deck and capture stages**: line TBC, frame TBC with a new vertical-bounce effect, recursive deck noise reduction (sequential stage), deck sharpness control, motion-adaptive 3D comb (`--comb 2sample|1h|3d`), deck profiles (`--deck`, and a "Playback deck" dropdown in the GUI).
 - **DVD presets** (`dvd-hq`, `dvd-mq`, `dvd-mq-ee`, `dvd-lq`, `dvd-interlaced`); `--vhs-preset` renamed to `--preset` (old name kept as an alias); roundtrip's x264 `--preset` is now `--x264-preset`.
 - **DVD-Video path** (`--format dvd`): mastering (aspect-correct Lanczos fit, pre-filter, DNR, edge enhancement), field-based 4:2:0, MPEG-2 within the DVD-Video limits via ffmpeg with soft pulldown for film, player chroma upsampling error, digital / S-Video / composite player output, kept MPEG-2 streams and `dvd-check`.
 - **S-Video connection** (`--video-out svideo`): the encoder can produce separate Y and C wires; the decoder takes luma from the Y wire without a comb filter and chroma from the C wire, so there is no cross-colour or dot crawl. Tape effects run per wire (luma effects on Y, colour effects on C, timing effects identically on both).

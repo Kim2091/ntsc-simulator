@@ -140,6 +140,60 @@ impl Decoder {
         }
     }
 
+    /// Decode with a motion-adaptive 3D (frame) comb filter.
+    ///
+    /// The NTSC subcarrier inverts from one frame to the next, so where the
+    /// picture is still, half the sum of the current and previous frame is
+    /// pure luma and half the difference pure chroma: no cross-colour and
+    /// no dot crawl.  Where the picture moves, the decoder falls back to
+    /// the 2-sample comb.  Motion is detected from the difference of the
+    /// two frames' comb-filtered luma, smoothed over ±4 samples; the blend
+    /// is fully 3D below about 2 IRE of difference and fully 2D above 6.
+    pub fn decode_frame_3d(
+        &mut self,
+        signal: &[f32],
+        prev: &[f32],
+        output_width: usize,
+        output_height: usize,
+        legacy_burst_phase: bool,
+    ) -> &[u8] {
+        let spl = SAMPLES_PER_LINE;
+        let ypl = spl + RIGHT_PAD;
+        self.prepare_output(output_width, output_height);
+        let ire = BLANKING_V / 40.0;
+        let (lo, hi) = (2.0 * ire, 6.0 * ire);
+        let mut diff = vec![0.0f32; spl];
+        for vis in 0..VISIBLE_LINES {
+            let abs = self.abs_lines[vis];
+            let s = abs * spl;
+            let cur = &signal[s..s + spl];
+            let old = &prev[s..s + spl];
+            let base = vis * spl;
+            let ybase = vis * ypl;
+            self.full_lines[base..base + spl].copy_from_slice(cur);
+            for n in 0..spl {
+                let l2 = |x: &[f32]| if n >= 2 { (x[n] + x[n - 2]) * 0.5 } else { x[n] };
+                diff[n] = (l2(cur) - l2(old)).abs();
+            }
+            for n in 0..spl {
+                let a = n.saturating_sub(4);
+                let b = (n + 5).min(spl);
+                let m = diff[a..b].iter().sum::<f32>() / (b - a) as f32;
+                let still = ((hi - m) / (hi - lo)).clamp(0.0, 1.0);
+                let (y2, c2) = if n >= 2 {
+                    ((cur[n] + cur[n - 2]) * 0.5, (cur[n] - cur[n - 2]) * 0.5)
+                } else {
+                    (cur[n] * 0.5, cur[n] * 0.5)
+                };
+                let y3 = (cur[n] + old[n]) * 0.5;
+                let c3 = (cur[n] - old[n]) * 0.5;
+                self.y_full[ybase + n] = y2 + still * (y3 - y2);
+                self.chroma_full[base + n] = c2 + still * (c3 - c2);
+            }
+        }
+        self.finish(output_width, output_height, legacy_burst_phase)
+    }
+
     /// Decode an S-Video signal pair: luma from the Y wire with no comb
     /// filter, chroma from the C wire, so there is no cross-colour or
     /// cross-luma.
