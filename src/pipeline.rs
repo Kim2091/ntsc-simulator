@@ -16,6 +16,7 @@ use rayon::prelude::*;
 use crate::colorbars;
 use crate::constants::SAMPLE_RATE;
 use crate::decoder::Decoder;
+use crate::dvd::{self, DvdConfig, DvdOutput};
 use crate::effects::SignalEffects;
 use crate::encoder::{Encoder, Wire};
 use crate::params::{frame_rng, ParamValues};
@@ -231,7 +232,7 @@ pub fn process_image_file(
     let out_w = width.map(|v| v as usize).unwrap_or(w);
     let out_h = height.map(|v| v as usize).unwrap_or(h);
 
-    let fx = resolve_effects(values);
+    let (fx, dvd_cfg) = resolve_all(values);
     log_sampled(values, &fx, progress);
     if !prefix.is_empty() {
         progress.log(prefix);
@@ -239,8 +240,14 @@ pub fn process_image_file(
     progress.log(&format!("Input: {} ({}x{})", input.display(), w, h));
 
     let t0 = Instant::now();
-    let rgb = render_frame(img_rgb.as_raw(), w, h, out_w, out_h, comb_1h, values, &fx, 0);
-    progress.log(&format!("  Encode + effects + decode: {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
+    let (rgb, out_w, out_h) = match &dvd_cfg {
+        Some(cfg) => {
+            log_dvd(cfg, progress);
+            dvd_still(img_rgb.as_raw(), w, h, w as f64 / h as f64, cfg, values, &fx, comb_1h, 0)?
+        }
+        None => (render_frame(img_rgb.as_raw(), w, h, out_w, out_h, comb_1h, values, &fx, 0), out_w, out_h),
+    };
+    progress.log(&format!("  Processing: {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0));
 
     save_rgb(output, out_w, out_h, rgb)?;
     progress.log(&format!("Output: {} ({}x{})", output.display(), out_w, out_h));
@@ -298,11 +305,17 @@ pub fn process_colorbars(
         progress.log(&format!("Source pattern saved: {}", src_path.display()));
     }
 
-    let fx = resolve_effects(values);
+    let (fx, dvd_cfg) = resolve_all(values);
     log_sampled(values, &fx, progress);
-    let rgb = render_frame(&bars_rgb, w, h, w, h, comb_1h, values, &fx, 0);
-    save_rgb(output, w, h, rgb)?;
-    progress.log(&format!("Output: {} ({}x{})", output.display(), w, h));
+    let (rgb, ow, oh) = match &dvd_cfg {
+        Some(cfg) => {
+            log_dvd(cfg, progress);
+            dvd_still(&bars_rgb, w, h, w as f64 / h as f64, cfg, values, &fx, comb_1h, 0)?
+        }
+        None => (render_frame(&bars_rgb, w, h, w, h, comb_1h, values, &fx, 0), w, h),
+    };
+    save_rgb(output, ow, oh, rgb)?;
+    progress.log(&format!("Output: {} ({}x{})", output.display(), ow, oh));
     Ok(())
 }
 
@@ -395,7 +408,9 @@ pub fn process_video_file(
     progress: &dyn Progress,
     prefix: &str,
 ) -> Result<()> {
-    if opts.telecine {
+    if values.choice("format") == "dvd" {
+        dvd_roundtrip(input, output, opts, values, progress, prefix)
+    } else if opts.telecine {
         roundtrip_telecine(input, output, opts, values, progress, prefix)
     } else {
         roundtrip(input, output, opts, values, progress, prefix)
@@ -659,6 +674,301 @@ fn roundtrip_telecine(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// DVD path
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Resolve the effects and, when `--format dvd`, the DVD settings.  The
+/// DVD ranges are sampled after the analog effects, so analog-only runs
+/// keep their exact random stream.
+pub fn resolve_all(values: &ParamValues) -> (SignalEffects, Option<DvdConfig>) {
+    let mut rng = values.file_rng();
+    let fx = values.to_signal_effects(&mut rng);
+    let dvd = (values.choice("format") == "dvd").then(|| DvdConfig::from_values(values, &mut rng));
+    (fx, dvd)
+}
+
+/// Display aspect ratio of a video (width/height × sample aspect).
+pub fn probe_dar(path: &Path) -> Option<f64> {
+    let out = tool_command("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,sample_aspect_ratio", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let parts: Vec<&str> = text.trim().split(',').collect();
+    let w: f64 = parts.first()?.parse().ok()?;
+    let h: f64 = parts.get(1)?.parse().ok()?;
+    let sar = parts
+        .get(2)
+        .and_then(|s| s.split_once(':'))
+        .and_then(|(a, b)| Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?)))
+        .filter(|(a, b)| *a > 0.0 && *b > 0.0)
+        .map(|(a, b)| a / b)
+        .unwrap_or(1.0);
+    Some(w / h * sar)
+}
+
+/// The player's output for one decoded picture: the frame itself
+/// (digital) or its S-Video / composite output captured through the
+/// NTSC decoder, with any explicitly set analog effects.  `f2` gives a
+/// second picture for the other field (3:2 pulldown on analog outputs).
+#[allow(clippy::too_many_arguments)]
+fn player_output(
+    rgb: &[u8],
+    f2: Option<&[u8]>,
+    cfg: &DvdConfig,
+    values: &ParamValues,
+    fx: &SignalEffects,
+    comb_1h: bool,
+    fnum: u32,
+) -> (Vec<u8>, usize, usize) {
+    if cfg.output == DvdOutput::Digital {
+        return dvd::digital_output(rgb, cfg);
+    }
+    let (src, sw, sh) = dvd::analog_source(rgb, cfg);
+    let src2 = f2.map(|f| dvd::analog_source(f, cfg).0);
+    let mut vals = values.clone();
+    vals.choices.insert("video-out", if cfg.output == DvdOutput::Svideo { "svideo" } else { "composite" });
+    let (ow, oh) = cfg.output_size();
+    let decode_w = if cfg.square { ow } else { 704 };
+    let out = TL_ENCODER.with(|enc| {
+        TL_DECODER.with(|dec| {
+            TL_SIGNAL_BUF.with(|sb| {
+                TL_SIGNAL_BUF_C.with(|sc| {
+                    analog_frame(
+                        &mut enc.borrow_mut(), &mut dec.borrow_mut(), &mut sb.borrow_mut(), &mut sc.borrow_mut(),
+                        &src, src2.as_deref(), sw, sh, decode_w, 480, fnum, comb_1h, &vals, fx, fx.is_active(),
+                    )
+                })
+            })
+        })
+    });
+    if cfg.square { (out, ow, oh) } else { (dvd::pad_to_720(&out, 480), 720, 480) }
+}
+
+/// Run a still picture through the DVD chain.  The picture is encoded as
+/// a short sequence (one GOP plus a few pictures) so that it gets real I,
+/// P and B pictures; the first picture of the requested type is returned.
+/// For a still the P and B pictures differ from the I picture only by the
+/// requantised residual.
+#[allow(clippy::too_many_arguments)]
+pub fn dvd_still(
+    pixels: &[u8],
+    w: usize,
+    h: usize,
+    src_dar: f64,
+    cfg: &DvdConfig,
+    values: &ParamValues,
+    fx: &SignalEffects,
+    comb_1h: bool,
+    frame: u64,
+) -> Result<(Vec<u8>, usize, usize)> {
+    let mastered = dvd::to_420(&dvd::master(pixels, w, h, src_dar, cfg), cfg.interlaced());
+    let mut enc = dvd::Encoder::start(cfg)?;
+    for _ in 0..cfg.gop + 4 {
+        enc.push(&mastered)?;
+    }
+    let encoded = enc.finish()?;
+    let types = encoded.stream.display_types();
+    let want = cfg.frame_type.to_ascii_uppercase();
+    let idx = types.iter().position(|&t| t == want).unwrap_or(0);
+    let pic = encoded.decoder()?.nth(idx).context("the MPEG-2 decoder returned too few frames")?;
+    let rgb = dvd::yuv420_to_rgb(&pic.frame, pic.interlaced, cfg.cue);
+    Ok(player_output(&rgb, None, cfg, values, fx, comb_1h, frame as u32))
+}
+
+/// Render a preview or still: the analog path at `out_w`×`out_h`, or the
+/// DVD path at its own output size.  Returns the RGB frame, its size and
+/// the values the ranges resolved to.
+#[allow(clippy::too_many_arguments)]
+pub fn render_preview(
+    pixels: &[u8],
+    w: usize,
+    h: usize,
+    src_dar: f64,
+    out_w: usize,
+    out_h: usize,
+    comb_1h: bool,
+    values: &ParamValues,
+    frame: u64,
+) -> Result<(Vec<u8>, usize, usize, Vec<String>)> {
+    let (fx, dvd) = resolve_all(values);
+    let mut sampled = values.sampled_summary(&fx);
+    match dvd {
+        Some(cfg) => {
+            sampled.extend(cfg.summary(values));
+            let (rgb, ow, oh) = dvd_still(pixels, w, h, src_dar, &cfg, values, &fx, comb_1h, frame)?;
+            Ok((rgb, ow, oh, sampled))
+        }
+        None => Ok((render_frame(pixels, w, h, out_w, out_h, comb_1h, values, &fx, frame), out_w, out_h, sampled)),
+    }
+}
+
+fn log_dvd(cfg: &DvdConfig, progress: &dyn Progress) {
+    progress.log(&format!(
+        "  DVD: {}x{} {} {}, {:.2} Mbit/s avg, {:.2} peak, GOP {}{}{}, output {:?}{}",
+        cfg.width,
+        cfg.height,
+        if cfg.widescreen { "16:9" } else { "4:3" },
+        if cfg.film { "23.976p soft pulldown" } else if cfg.interlaced() { "29.97i TFF" } else { "29.97p" },
+        cfg.bitrate,
+        cfg.maxrate,
+        cfg.gop,
+        if cfg.two_pass { ", 2-pass" } else { "" },
+        if cfg.low_rate_matrix { ", low-rate matrices" } else { "" },
+        cfg.output,
+        if cfg.square { " (square pixels)" } else { "" },
+    ));
+}
+
+/// DVD video roundtrip: master and encode the whole clip, then decode it,
+/// run the player output stage and write the result losslessly.
+fn dvd_roundtrip(
+    input: &Path,
+    output: &Path,
+    opts: &VideoOptions,
+    values: &ParamValues,
+    progress: &dyn Progress,
+    prefix: &str,
+) -> Result<()> {
+    let (fx, cfg) = resolve_all(values);
+    let cfg = cfg.expect("dvd format");
+    log_sampled(values, &fx, progress);
+    let summary = cfg.summary(values);
+    if !summary.is_empty() {
+        progress.log(&format!("  Randomized: {}", summary.join(", ")));
+    }
+    log_dvd(&cfg, progress);
+
+    let (in_w, in_h, _fps, _fps_raw, total_frames) = ffprobe_video(input)?;
+    let src_dar = probe_dar(input).unwrap_or(in_w as f64 / in_h as f64);
+    let (rn, rd) = cfg.frame_rate();
+    progress.log(&format!("Input: {} ({}x{}, display aspect {:.3}, {} frames)", input.display(), in_w, in_h, src_dar, total_frames));
+
+    // ── 1. Master and encode ──
+    let mut reader = spawn_ffmpeg_reader_with(input, values, progress, Some(&format!("fps={}/{}", rn, rd)))?;
+    let mut reader_buf = std::io::BufReader::new(reader.stdout.take().unwrap());
+    let frame_bytes = in_w * in_h * 3;
+    let batch = init_thread_pool(opts.threads);
+    let mut enc = dvd::Encoder::start(&cfg)?;
+    let t0 = Instant::now();
+    let mut done = 0u64;
+    progress.start(total_frames, if prefix.is_empty() { "DVD encode" } else { prefix });
+    loop {
+        if progress.is_cancelled() {
+            let _ = reader.kill();
+            progress.finish();
+            bail!(CANCELLED);
+        }
+        let mut frames = Vec::with_capacity(batch);
+        for _ in 0..batch {
+            let mut buf = vec![0u8; frame_bytes];
+            match reader_buf.read_exact(&mut buf) {
+                Ok(()) => frames.push(buf),
+                Err(_) => break,
+            }
+        }
+        if frames.is_empty() {
+            break;
+        }
+        let yuv: Vec<dvd::Yuv420> = frames
+            .par_iter()
+            .map(|f| dvd::to_420(&dvd::master(f, in_w, in_h, src_dar, &cfg), cfg.interlaced()))
+            .collect();
+        for y in &yuv {
+            enc.push(y)?;
+        }
+        done += frames.len() as u64;
+        progress.advance(frames.len() as u64, &format!("{:.1} fps", done as f64 / t0.elapsed().as_secs_f64()));
+    }
+    let _ = reader.wait();
+    progress.finish();
+    let encoded = enc.finish()?;
+    let n_pics = encoded.stream.pictures.len();
+    progress.log(&format!(
+        "  Encoded {} pictures ({}), {:.2} Mbit/s mean",
+        n_pics,
+        encoded.stream.display_types().iter().take(18).collect::<String>(),
+        encoded.es.len() as f64 * 8.0 / (n_pics as f64 * rd as f64 / rn as f64) / 1e6,
+    ));
+    if let Some(k) = &cfg.keep_mpeg2 {
+        progress.log(&format!("  MPEG-2 stream kept: {}", k.display()));
+    }
+
+    // ── 2. Decode, player output, write ──
+    let (ow, oh) = cfg.output_size();
+    let analog = cfg.output != DvdOutput::Digital;
+    // Film on an analog output: the player applies 3:2 pulldown and sends
+    // 29.97 fps interlaced video.
+    let pulldown = analog && cfg.film;
+    let interlaced_out = cfg.interlaced() || analog;
+    let fps_out = if cfg.film && !analog { "24000/1001" } else { "30000/1001" };
+    let mut writer = spawn_ffmpeg_writer(output, ow, oh, fps_out, opts, interlaced_out)?;
+    let mut writer_buf = std::io::BufWriter::new(writer.stdin.take().unwrap());
+    let mut raw_copy = open_raw_copy(opts)?;
+    let mut decoder = encoded.decoder()?;
+    progress.start(n_pics, "Player output");
+    let mut out_num = 0u32;
+    loop {
+        if progress.is_cancelled() {
+            drop(writer_buf);
+            let _ = writer.kill();
+            progress.finish();
+            bail!(CANCELLED);
+        }
+        // Batches are a multiple of 4 pictures so pulldown groups stay whole.
+        let pics: Vec<dvd::DecodedFrame> = decoder.by_ref().take(batch.max(1) * 4).collect();
+        if pics.is_empty() {
+            break;
+        }
+        let rgbs: Vec<Vec<u8>> = pics.par_iter().map(|p| dvd::yuv420_to_rgb(&p.frame, p.interlaced, cfg.cue)).collect();
+        // (field 1 picture, field 2 picture) per output frame.
+        let mut jobs: Vec<(usize, usize, u32)> = Vec::new();
+        if pulldown {
+            let mut i = 0;
+            while i < rgbs.len() {
+                let n = (rgbs.len() - i).min(4);
+                if n == 4 {
+                    for (a, b) in [(0, 0), (1, 1), (1, 2), (2, 3), (3, 3)] {
+                        jobs.push((i + a, i + b, out_num + jobs.len() as u32));
+                    }
+                } else {
+                    for k in 0..n {
+                        jobs.push((i + k, i + k, out_num + jobs.len() as u32));
+                    }
+                }
+                i += n;
+            }
+        } else {
+            for k in 0..rgbs.len() {
+                jobs.push((k, k, out_num + k as u32));
+            }
+        }
+        let results: Vec<Vec<u8>> = jobs
+            .par_iter()
+            .map(|&(a, b, fnum)| {
+                let f2 = (a != b).then(|| rgbs[b].as_slice());
+                player_output(&rgbs[a], f2, &cfg, values, &fx, opts.comb_1h, fnum).0
+            })
+            .collect();
+        for r in &results {
+            writer_buf.write_all(r).context("write failed")?;
+            if let Some(raw) = raw_copy.as_mut() {
+                raw.write_all(r)?;
+            }
+        }
+        out_num += results.len() as u32;
+        progress.advance(pics.len() as u64, "");
+    }
+    progress.finish();
+    drop(writer_buf);
+    let _ = writer.wait();
+    progress.log(&format!("Done: {} pictures -> {} frames in {:.1}s", n_pics, out_num, t0.elapsed().as_secs_f64()));
+    mux_audio(input, output);
+    Ok(())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // ffmpeg helpers
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -740,12 +1050,27 @@ pub fn input_colour(path: &Path, values: &ParamValues) -> InputColour {
 }
 
 fn spawn_ffmpeg_reader(input: &Path, values: &ParamValues, progress: &dyn Progress) -> Result<std::process::Child> {
+    spawn_ffmpeg_reader_with(input, values, progress, None)
+}
+
+/// The reader with an extra filter before the RGB conversion (e.g. a
+/// frame-rate conversion).
+fn spawn_ffmpeg_reader_with(
+    input: &Path,
+    values: &ParamValues,
+    progress: &dyn Progress,
+    pre_filter: Option<&str>,
+) -> Result<std::process::Child> {
     let colour = input_colour(input, values);
     progress.log(&format!("  Input colour: {}", colour.description));
+    let filter = match pre_filter {
+        Some(f) => format!("{},{}", f, colour.filter()),
+        None => colour.filter(),
+    };
     tool_command("ffmpeg")
         .arg("-i")
         .arg(input)
-        .args(["-vf", &colour.filter()])
+        .args(["-vf", &filter])
         .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "error", "pipe:1"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

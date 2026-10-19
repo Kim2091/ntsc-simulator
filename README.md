@@ -253,6 +253,37 @@ There are two families:
 }
 ```
 
+### DVD-Video path
+
+`--format dvd` replaces the analog chain with a DVD-Video (NTSC) chain: mastering, MPEG-2 encoding within the DVD-Video limits, player decoding, and the player's output.
+
+```bash
+# A video through a typical DVD (digital output, like a rip)
+ntsc-composite-simulator roundtrip input.mp4 -o dvd.mkv --format dvd --dvd-bitrate 6
+
+# Film title (23.976p with soft pulldown), halos and DNR from the master, played over composite,
+# keeping the MPEG-2 program stream
+ntsc-composite-simulator roundtrip film.mp4 -o dvd.mkv --format dvd --dvd-rate film \
+  --dvd-ee 0.6 --dvd-dnr 0.4 --dvd-output composite --dvd-keep-mpeg2 movie.vob
+
+# Check a stream against the DVD-Video limits
+ntsc-composite-simulator dvd-check movie.vob
+```
+
+The chain:
+
+1. **Mastering**: the source is fitted into the 704-sample active area (8 samples of black each side in a 720-wide frame) with a Lanczos-3 filter and the correct non-square sample aspect (10:11 for 4:3, 40:33 for 16:9 anamorphic), letterboxed or pillarboxed if its aspect differs. Optional studio stages: a pre-compression lowpass (`--dvd-prefilter`), edge-preserving noise reduction (`--dvd-dnr`) and edge enhancement halos (`--dvd-ee`).
+2. **4:2:0**: conversion to BT.601 studio-range Y'CbCr; chroma is subsampled per field for interlaced pictures (as interlaced 4:2:0 must be) and per frame for progressive ones, with MPEG-2 chroma siting.
+3. **MPEG-2 encode** with ffmpeg's `mpeg2video` (run as a separate program): Main Profile @ Main Level, 4:2:0, 720×480 / 704×480 / 352×480 / 352×240, 29.97 fps interlaced top field first or 23.976 fps progressive with soft 3:2 pulldown, 4:3 or 16:9 flags, closed GOPs with M = 3 and at most 18 pictures, VBR with `--dvd-bitrate` average and `--dvd-maxrate` peak (≤ 9.8 Mbit/s), VBV buffer 1 835 008 bits (224 KiB), 9-bit intra DC, optional low-rate quantiser matrices (`--dvd-matrix lowrate`) and two-pass (`--dvd-2pass`). ffmpeg cannot write pulldown flags, so the soft pulldown (repeat_first_field / top_field_first in the 2:3 pattern, 29.97 fps sequence rate) is patched into the stream here.
+4. **Player decode**: chroma upsampled per field for interlaced pictures; `--dvd-cue` blends in the progressive upsampling many players used (the chroma upsampling error: streaky, jagged colour edges on interlaced material).
+5. **Player output** (`--dvd-output`): `digital` (the decoded frames, like a rip), or `svideo` / `composite` through the NTSC encoder and decoder (film titles get 3:2 pulldown on the analog output). `--dvd-output-size square` scales the active area to 640×480 (854×480 for 16:9).
+
+Still images are encoded as a short sequence (one GOP plus a few pictures) so they get real I, P and B pictures; `--dvd-frame-type` picks which picture is returned (default `b`, since two thirds of the pictures on a DVD are B pictures). `--dvd-keep-mpeg2` saves the stream (`.m2v` elementary stream, `.vob`/`.mpg` DVD program stream). Tape and reception effects are not applied on the DVD path unless set explicitly, and then only on the analog outputs.
+
+`dvd-check` reports profile/level, chroma format, frame size, frame rate (and soft pulldown), aspect flag, maximum GOP length, closed GOPs, VBV buffer size, header and peak 1-second bit rate, and field order, plus ffprobe's view of the stream.
+
+**How accurate is it?** The streams meet the DVD-Video video limits listed above, but real discs were made with professional encoders (with their own rate control, motion search, quantiser matrices and adaptive quantisation), so their artefacts differ in detail from ffmpeg's `mpeg2video`, which is spec-compliant but not identical to any of them. ffmpeg's closed GOPs end on a P picture, so they are 3k+1 pictures long (15 gives 13). Only the video stream is produced (no audio, navigation or authoring); `dvd-check` checks the video limits only. Mastering and player stages are models of typical behaviour, not of a specific telecine or player.
+
 ## Options Reference
 
 ### General
@@ -328,6 +359,28 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 | `--temporal-coherence` | roundtrip | Tape-state coherence over time (0–1). 0 (default) re-rolls head-smear bands, wobble, head-switch shape and top-band tint every frame; 1 makes them drift slowly from frame to frame like a real tape. Chroma noise stays random |
 | `--vhs-preset` | roundtrip, image, colorbars | `lq`, `mq`, `hq`, `legacy-lq`, `legacy-mq` or `legacy-hq`: fills in all flags not given explicitly |
 | `--preset-file` | roundtrip, image, colorbars | JSON preset file; fills in flags not given explicitly, before `--vhs-preset` |
+
+### DVD path
+
+| Flag | Commands | Description |
+|---|---|---|
+| `--format` | roundtrip, image, colorbars | `analog` (default) or `dvd` |
+| `--dvd-size` | roundtrip, image, colorbars | `720x480` (default), `704x480`, `352x480`, `352x240` |
+| `--dvd-aspect` | roundtrip, image, colorbars | `4:3` (default) or `16:9` anamorphic |
+| `--dvd-rate` | roundtrip, image, colorbars | `interlaced` (29.97i TFF, default) or `film` (23.976p, soft pulldown) |
+| `--dvd-bitrate` | roundtrip, image, colorbars | Average video bit rate, Mbit/s (default 6) |
+| `--dvd-maxrate` | roundtrip, image, colorbars | Peak video bit rate, Mbit/s (default 9.5, at most 9.8) |
+| `--dvd-gop` | roundtrip, image, colorbars | Maximum GOP length (default 15, at most 18; closed GOPs come out 3k+1 long) |
+| `--dvd-matrix` | roundtrip, image, colorbars | `standard` (MPEG defaults) or `lowrate` quantiser matrices |
+| `--dvd-2pass` | roundtrip, image, colorbars | Two-pass VBR encode |
+| `--dvd-ee` | roundtrip, image, colorbars | Mastering edge enhancement halos (0–1) |
+| `--dvd-dnr` | roundtrip, image, colorbars | Mastering noise reduction (0–1) |
+| `--dvd-prefilter` | roundtrip, image, colorbars | Pre-compression luma lowpass (0–1) |
+| `--dvd-cue` | roundtrip, image, colorbars | Player chroma upsampling error (0–1) |
+| `--dvd-output` | roundtrip, image, colorbars | `digital` (default), `svideo`, `composite` |
+| `--dvd-output-size` | roundtrip, image, colorbars | `native` (default, e.g. 720×480) or `square` (640×480 / 854×480) |
+| `--dvd-frame-type` | image, colorbars | Picture type returned for stills: `b` (default), `p`, `i` |
+| `--dvd-keep-mpeg2` | roundtrip, image, colorbars | Save the MPEG-2 stream (`.m2v` elementary, `.vob`/`.mpg` program stream) |
 
 Run `ntsc-composite-simulator <command> -h` for full details.
 
@@ -417,6 +470,7 @@ The VHS simulation models both the recording and playback signal paths:
 
 Newest first.
 
+- **DVD-Video path** (`--format dvd`): mastering (aspect-correct Lanczos fit, pre-filter, DNR, edge enhancement), field-based 4:2:0, MPEG-2 within the DVD-Video limits via ffmpeg with soft pulldown for film, player chroma upsampling error, digital / S-Video / composite player output, kept MPEG-2 streams and `dvd-check`.
 - **S-Video connection** (`--video-out svideo`): the encoder can produce separate Y and C wires; the decoder takes luma from the Y wire without a comb filter and chroma from the C wire, so there is no cross-colour or dot crawl. Tape effects run per wire (luma effects on Y, colour effects on C, timing effects identically on both).
 - **Lossless, colour-correct video I/O**: lossless RGB output by default (FFV1 `.mkv` / x264 RGB `.mp4`, verified bit-exact), `--lossy` for the old x264 4:2:0 output; input converted with the source's colour matrix and range (`--input-matrix`, `--input-range`); `extract-frame`.
 - **GUI** (`ntsc-gui`) with live preview, presets and batch processing; library + CLI split with one shared parameter model; JSON presets (`--preset-file`); `legacy-*` presets.

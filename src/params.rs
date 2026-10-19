@@ -87,6 +87,7 @@ impl std::fmt::Display for RangeParam {
 /// group and the CLI help uses them as headings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Group {
+    Dvd,
     Tape,
     Colour,
     NoiseDropouts,
@@ -96,7 +97,8 @@ pub enum Group {
 }
 
 impl Group {
-    pub const ALL: [Group; 6] = [
+    pub const ALL: [Group; 7] = [
+        Group::Dvd,
         Group::Tape,
         Group::Colour,
         Group::NoiseDropouts,
@@ -107,6 +109,7 @@ impl Group {
 
     pub fn label(self) -> &'static str {
         match self {
+            Group::Dvd => "DVD",
             Group::Tape => "Tape",
             Group::Colour => "Colour",
             Group::NoiseDropouts => "Noise & dropouts",
@@ -159,6 +162,161 @@ const fn num_def(min: f32, max: f32, default: f32) -> Kind {
 
 /// All effect parameters, in signal-chain order.
 pub static SPECS: &[ParamSpec] = &[
+    // ── DVD ──
+    ParamSpec {
+        id: "format",
+        label: "Format",
+        help: "Signal path. analog: the NTSC composite / VHS simulation. dvd: DVD-Video, i.e. mastering, MPEG-2 \
+               encoding within the DVD-Video limits (via ffmpeg), player decode and player output. Tape and \
+               reception effects only apply on the DVD path when set explicitly and the player output is analog.",
+        unit: "",
+        group: Group::Dvd,
+        kind: Kind::Choice { options: &["analog", "dvd"], default: "analog" },
+    },
+    ParamSpec {
+        id: "dvd-size",
+        label: "Frame size",
+        help: "Coded frame size. 720x480 (full D1, most discs), 704x480, 352x480 (half D1, long-play discs: soft), \
+               352x240 (SIF, progressive, VCD-like quality).",
+        unit: "",
+        group: Group::Dvd,
+        kind: Kind::Choice { options: &["720x480", "704x480", "352x480", "352x240"], default: "720x480" },
+    },
+    ParamSpec {
+        id: "dvd-aspect",
+        label: "Aspect",
+        help: "Display aspect flag: 4:3, or 16:9 anamorphic (the picture is squeezed horizontally on disc). Sources \
+               with another aspect are letterboxed or pillarboxed.",
+        unit: "",
+        group: Group::Dvd,
+        kind: Kind::Choice { options: &["4:3", "16:9"], default: "4:3" },
+    },
+    ParamSpec {
+        id: "dvd-rate",
+        label: "Frame structure",
+        help: "interlaced: 29.97 fps interlaced, top field first (video-sourced discs). film: 23.976 fps progressive \
+               with soft 3:2 pulldown flags (repeat_first_field), as film titles are stored.",
+        unit: "",
+        group: Group::Dvd,
+        kind: Kind::Choice { options: &["interlaced", "film"], default: "interlaced" },
+    },
+    ParamSpec {
+        id: "dvd-bitrate",
+        label: "Average bit rate",
+        help: "Average video bit rate in Mbit/s (VBR). Typical: 7–8 high quality film, 5–6 average, 3–4 budget / \
+               long play. Lower rates show blocking, mosquito noise around edges and smeared texture.",
+        unit: "Mbit/s",
+        group: Group::Dvd,
+        kind: num_def(1.0, 9.8, 6.0),
+    },
+    ParamSpec {
+        id: "dvd-maxrate",
+        label: "Peak bit rate",
+        help: "Maximum video bit rate in Mbit/s (DVD-Video allows at most 9.8). Lower peaks starve complex scenes.",
+        unit: "Mbit/s",
+        group: Group::Dvd,
+        kind: num_def(2.0, 9.8, 9.5),
+    },
+    ParamSpec {
+        id: "dvd-gop",
+        label: "GOP length",
+        help: "Maximum pictures per GOP (DVD allows at most 18). GOPs are closed, with two B pictures between \
+               reference pictures (M = 3). ffmpeg ends each closed GOP on a P picture, so the actual length is the \
+               largest 3k+1 at or below this value: 15 gives 13, 16 to 18 give 16.",
+        unit: "pictures",
+        group: Group::Dvd,
+        kind: Kind::Number { min: 1.0, max: 18.0, default: Some(15.0), typical: 15.0, integer: true },
+    },
+    ParamSpec {
+        id: "dvd-matrix",
+        label: "Quant matrices",
+        help: "standard: the MPEG-2 default quantiser matrices. lowrate: steeper matrices that spend fewer bits on \
+               fine detail (softer picture, fewer blocks at low rates).",
+        unit: "",
+        group: Group::Dvd,
+        kind: Kind::Choice { options: &["standard", "lowrate"], default: "standard" },
+    },
+    ParamSpec {
+        id: "dvd-2pass",
+        label: "Two-pass encode",
+        help: "Two-pass VBR: distributes bits better over the whole clip (slower; spools frames to a temporary file).",
+        unit: "",
+        group: Group::Dvd,
+        kind: Kind::Flag,
+    },
+    ParamSpec {
+        id: "dvd-ee",
+        label: "Edge enhancement",
+        help: "Mastering edge enhancement (0–1): bright and dark outlines several pixels wide around edges, the \
+               classic DVD halo. Wider and softer than VHS peaking.",
+        unit: "",
+        group: Group::Dvd,
+        kind: num(0.0, 1.0, 0.5),
+    },
+    ParamSpec {
+        id: "dvd-dnr",
+        label: "Mastering DNR",
+        help: "Mastering noise reduction (0–1): edge-preserving smoothing that wipes out fine grain and texture \
+               (waxy faces, flat backgrounds).",
+        unit: "",
+        group: Group::Dvd,
+        kind: num(0.0, 1.0, 0.5),
+    },
+    ParamSpec {
+        id: "dvd-prefilter",
+        label: "Pre-filter",
+        help: "Pre-compression lowpass on luma (0–1), cutting horizontal detail from ~6 MHz down to ~3.8 MHz, as \
+               some studios did to save bits.",
+        unit: "",
+        group: Group::Dvd,
+        kind: num(0.0, 1.0, 0.5),
+    },
+    ParamSpec {
+        id: "dvd-cue",
+        label: "Chroma upsampling error",
+        help: "Player chroma upsampling error (0–1): many players upsampled interlaced 4:2:0 colour as if it were \
+               progressive, giving jagged, streaky colour edges on interlaced material.",
+        unit: "",
+        group: Group::Dvd,
+        kind: num(0.0, 1.0, 1.0),
+    },
+    ParamSpec {
+        id: "dvd-output",
+        label: "Player output",
+        help: "digital: the decoded frames as they are (like a rip). svideo / composite: the player's analog output \
+               captured through the NTSC decoder (composite adds cross-colour and dot crawl).",
+        unit: "",
+        group: Group::Dvd,
+        kind: Kind::Choice { options: &["digital", "svideo", "composite"], default: "digital" },
+    },
+    ParamSpec {
+        id: "dvd-output-size",
+        label: "Output pixels",
+        help: "native: the stored frame (e.g. 720x480 with non-square pixels). square: the active area scaled to \
+               square pixels (640x480 for 4:3, 854x480 for 16:9).",
+        unit: "",
+        group: Group::Dvd,
+        kind: Kind::Choice { options: &["native", "square"], default: "native" },
+    },
+    ParamSpec {
+        id: "dvd-frame-type",
+        label: "Still frame type",
+        help: "For still images: which decoded picture type to return. A still is encoded as a short sequence; b \
+               (default) is the most representative, since two thirds of the pictures on a DVD are B pictures with \
+               the coarsest quantisation.",
+        unit: "",
+        group: Group::Dvd,
+        kind: Kind::Choice { options: &["b", "p", "i"], default: "b" },
+    },
+    ParamSpec {
+        id: "dvd-keep-mpeg2",
+        label: "Keep MPEG-2 stream",
+        help: "Also save the spec-compliant MPEG-2 stream: .m2v as an elementary stream, .vob/.mpg as a DVD program \
+               stream.",
+        unit: "",
+        group: Group::Dvd,
+        kind: Kind::Text,
+    },
     // ── Tape ──
     ParamSpec {
         id: "vhs-luma-bw",

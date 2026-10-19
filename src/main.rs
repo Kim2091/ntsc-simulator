@@ -229,6 +229,12 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         input_range: String,
     },
+    /// Check an MPEG-2 stream (.m2v elementary stream or .vob/.mpg program
+    /// stream) against the DVD-Video NTSC video limits
+    DvdCheck {
+        /// MPEG-2 file
+        input: PathBuf,
+    },
     /// Generate SMPTE color bars through the NTSC pipeline
     Colorbars {
         /// Output image file
@@ -282,6 +288,60 @@ impl Progress for CliProgress {
             bar.finish_and_clear();
         }
     }
+}
+
+/// Print a DVD-Video compliance report for an MPEG-2 stream.
+fn dvd_check(input: &Path) -> Result<()> {
+    use ntsc_composite_simulator::{dvd, mpeg2};
+    let ext = input.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let es = if ext == "m2v" || ext == "mpv" {
+        std::fs::read(input).with_context(|| format!("cannot read {}", input.display()))?
+    } else {
+        // Extract the video elementary stream from a program stream.
+        let work = dvd::WorkDir::new()?;
+        let es_path = work.0.join("video.m2v");
+        let st = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(input)
+            .args(["-map", "0:v:0", "-c", "copy", "-f", "mpeg2video"])
+            .arg(&es_path)
+            .status()
+            .context("Failed to run ffmpeg")?;
+        if !st.success() {
+            anyhow::bail!("cannot extract the video stream from {}", input.display());
+        }
+        std::fs::read(&es_path)?
+    };
+    let a = mpeg2::analyze(&es)?;
+    println!("DVD-Video compliance: {}", input.display());
+    println!("{} pictures, {} GOPs; {} with repeat_first_field", a.pictures, a.stream.gops.len(), a.field_counts.0);
+    let types: String = a.stream.display_types().into_iter().take(36).collect();
+    println!("picture types (display order, first 36): {}", types);
+    let mut all_ok = true;
+    for (name, value, ok) in &a.checks {
+        println!("  [{}] {:<22} {}", if *ok { "ok" } else { "FAIL" }, name, value);
+        all_ok &= *ok;
+    }
+    if let Some(m) = a.stream.seq.intra_matrix {
+        println!("  custom intra matrix (zigzag): {:?}", m);
+    }
+    if let Some(m) = a.stream.seq.non_intra_matrix {
+        println!("  custom non-intra matrix (zigzag): {:?}", m);
+    }
+    let probe = std::process::Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-show_entries",
+               "stream=codec_name,profile,level,width,height,pix_fmt,field_order,sample_aspect_ratio,display_aspect_ratio,r_frame_rate,avg_frame_rate,color_space,color_range,color_primaries",
+               "-of", "default=nw=1"])
+        .arg(input)
+        .output();
+    if let Ok(o) = probe {
+        println!("ffprobe:");
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            println!("  {}", line);
+        }
+    }
+    println!("{}", if all_ok { "RESULT: compliant with the checked DVD-Video limits" } else { "RESULT: NOT compliant" });
+    Ok(())
 }
 
 fn load_preset(path: &Path) -> Result<presets::Preset> {
@@ -338,6 +398,7 @@ fn main() -> Result<()> {
             eprintln!("{} ({}x{}, {}) -> {}", input.display(), w, h, colour.description, output.display());
             Ok(())
         }
+        Commands::DvdCheck { input } => dvd_check(&input),
         Commands::Colorbars { output, save_source, width, height, comb_1h, effects } => {
             pipeline::process_colorbars(
                 &output, save_source.as_deref(), width, height, comb_1h, &effects.resolve()?, &progress,

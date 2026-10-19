@@ -37,6 +37,8 @@ pub struct RenderResult {
     pub ms: f64,
     /// What the ranges resolved to for this render.
     pub sampled: Vec<String>,
+    /// Set when the render failed (e.g. ffmpeg missing on the DVD path).
+    pub error: Option<String>,
 }
 
 pub struct Renderer {
@@ -57,19 +59,29 @@ impl Renderer {
                         req = newer;
                     }
                     let t0 = Instant::now();
-                    let fx = pipeline::resolve_effects(&req.values);
-                    let rgb = pipeline::render_frame(
-                        &req.src.rgb, req.src.w, req.src.h, req.out_w, req.out_h,
-                        req.comb_1h, &req.values, &fx, req.frame,
-                    );
-                    let sampled = req.values.sampled_summary(&fx);
-                    let result = RenderResult {
-                        id: req.id,
-                        rgb,
-                        w: req.out_w,
-                        h: req.out_h,
-                        ms: t0.elapsed().as_secs_f64() * 1000.0,
-                        sampled,
+                    let dar = req.src.w as f64 / req.src.h as f64;
+                    let result = match pipeline::render_preview(
+                        &req.src.rgb, req.src.w, req.src.h, dar, req.out_w, req.out_h,
+                        req.comb_1h, &req.values, req.frame,
+                    ) {
+                        Ok((rgb, w, h, sampled)) => RenderResult {
+                            id: req.id,
+                            rgb,
+                            w,
+                            h,
+                            ms: t0.elapsed().as_secs_f64() * 1000.0,
+                            sampled,
+                            error: None,
+                        },
+                        Err(e) => RenderResult {
+                            id: req.id,
+                            rgb: Vec::new(),
+                            w: 0,
+                            h: 0,
+                            ms: 0.0,
+                            sampled: Vec::new(),
+                            error: Some(format!("{:#}", e)),
+                        },
                     };
                     if res_tx.send(result).is_err() {
                         break;

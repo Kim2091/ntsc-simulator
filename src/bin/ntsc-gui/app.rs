@@ -332,7 +332,10 @@ impl App {
 
     fn update_render(&mut self, ctx: &egui::Context) {
         if let Some(result) = self.renderer.poll() {
-            if result.id > self.shown_id {
+            if result.id > self.shown_id && result.error.is_some() {
+                self.shown_id = result.id;
+                self.status = Some((false, format!("Render failed: {}", result.error.unwrap_or_default())));
+            } else if result.id > self.shown_id {
                 self.shown_id = result.id;
                 self.last_ms = result.ms;
                 self.sampled = result.sampled;
