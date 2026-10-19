@@ -1940,6 +1940,9 @@ fn apply_deck_sharpness(signal: &mut [f32], sharpness: f32, full_luma: bool) {
     }
 }
 
+/// Taps of the fractional-delay kernel used by `shift_segment`.
+const SHIFT_TAPS: usize = 2 * SHIFT_HALF_TAPS as usize;
+
 /// Shift `line[lo..hi]` right by `shift` samples (negative = left).
 /// Samples that would come from outside the segment read as blanking.
 ///
@@ -1951,18 +1954,11 @@ fn shift_segment(line: &mut [f32], lo: usize, hi: usize, shift: f32) {
     if shift.abs() < 1e-6 {
         return;
     }
-    let src: Vec<f32> = line[lo..hi].to_vec();
-    let at = |i: isize| -> f32 {
-        if i < 0 || i as usize >= src.len() {
-            BLANKING_V
-        } else {
-            src[i as usize]
-        }
-    };
+    let len = hi - lo;
     let whole = shift.floor() as isize;
     let frac = shift - whole as f32;
 
-    // out[j] = Σ_m src[j − whole − m] · L(m − frac)
+    // out[j] = Σ_m src[j − whole − m] · L(m − frac), m = 1 − H … H
     let sinc = |x: f32| {
         if x.abs() < 1e-6 {
             1.0
@@ -1972,17 +1968,58 @@ fn shift_segment(line: &mut [f32], lo: usize, hi: usize, shift: f32) {
         }
     };
     let a = SHIFT_HALF_TAPS as f32;
-    let taps: Vec<(isize, f32)> = (1 - SHIFT_HALF_TAPS..=SHIFT_HALF_TAPS)
-        .map(|m| {
-            let x = m as f32 - frac;
-            (m, if x.abs() < a { sinc(x) * sinc(x / a) } else { 0.0 })
-        })
-        .collect();
-    let norm = 1.0 / taps.iter().map(|&(_, w)| w).sum::<f32>();
+    let mut taps = [0.0f32; SHIFT_TAPS];
+    for (t, w) in taps.iter_mut().enumerate() {
+        let x = (t as isize + 1 - SHIFT_HALF_TAPS) as f32 - frac;
+        *w = if x.abs() < a { sinc(x) * sinc(x / a) } else { 0.0 };
+    }
+    let norm = 1.0 / taps.iter().sum::<f32>();
 
-    for (j, out) in line[lo..hi].iter_mut().enumerate() {
-        let i0 = j as isize - whole;
-        *out = norm * taps.iter().map(|&(m, w)| w * at(i0 - m)).sum::<f32>();
+    // The segment with blanking around it: ext[k] = src[k − whole − H].
+    let mut ext = [BLANKING_V; SAMPLES_PER_LINE + SHIFT_TAPS - 1];
+    let ext = &mut ext[..len + SHIFT_TAPS - 1];
+    let first = -whole - SHIFT_HALF_TAPS;
+    for (k, e) in ext.iter_mut().enumerate() {
+        let i = first + k as isize;
+        if i >= 0 && (i as usize) < len {
+            *e = line[lo + i as usize];
+        }
+    }
+    shift_taps(ext, &taps, norm, &mut line[lo..hi]);
+}
+
+/// Output samples computed together by `shift_taps`.
+const SHIFT_LANES: usize = 32;
+
+multiversion! {
+    /// `out[j] = norm · Σ_t taps[t]·ext[j + SHIFT_TAPS − 1 − t]`, the sum
+    /// taken in order of `t` from −0.0 as `Iterator::sum` does.  Blocks of
+    /// outputs are computed side by side so the loop vectorises.
+    fn shift_taps(ext: &[f32], taps: &[f32; SHIFT_TAPS], norm: f32, out: &mut [f32]) {
+        let n = out.len();
+        assert!(ext.len() + 1 >= n + SHIFT_TAPS);
+        let mut j = 0;
+        while j + SHIFT_LANES <= n {
+            let mut acc = [-0.0f32; SHIFT_LANES];
+            for (t, &w) in taps.iter().enumerate() {
+                let at = j + SHIFT_TAPS - 1 - t;
+                let s: &[f32; SHIFT_LANES] = ext[at..at + SHIFT_LANES].try_into().unwrap();
+                for l in 0..SHIFT_LANES {
+                    acc[l] += w * s[l];
+                }
+            }
+            for l in 0..SHIFT_LANES {
+                out[j + l] = norm * acc[l];
+            }
+            j += SHIFT_LANES;
+        }
+        for (j, o) in out.iter_mut().enumerate().skip(j) {
+            let mut acc = -0.0f32;
+            for (t, &w) in taps.iter().enumerate() {
+                acc += w * ext[j + SHIFT_TAPS - 1 - t];
+            }
+            *o = norm * acc;
+        }
     }
 }
 
