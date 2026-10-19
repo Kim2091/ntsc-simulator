@@ -18,7 +18,7 @@ Simulate the NTSC composite video signal encoding and decoding pipeline. Process
 - **Physically-motivated signal degradation**: noise (snow), multipath ghosting, attenuation, horizontal jitter
 - **Realistic multipath ghosting model**: multiple reflections, phase shift (polarity inversion), HF rolloff, sub-sample delay interpolation, dynamic amplitude modulation
 - **VHS tape-path simulation**: luma bandwidth limiting, color-under chroma processing, tape dropouts, edge ringing, luminance-dependent noise, head-wear smearing, causal rightward trailing, head-switching noise, top-of-frame chroma bands, and closed-caption data lines
-- **VHS quality presets**: `--vhs-preset lq|mq|hq` sets every VHS effect at once
+- **Presets**: `--vhs-preset lq|mq|hq` sets the full VHS look at once; `legacy-lq|mq|hq` reproduce the original tape-path settings; custom presets load from JSON with `--preset-file`
 - **Range parameters**: all numeric effect arguments accept `min..max` ranges — a random value is sampled per file in batch mode for natural variation
 - **Two comb filter modes**: horizontal 2-sample delay (default) and 1H line-delay
 - Parallel frame processing via rayon
@@ -158,9 +158,9 @@ ntsc-composite-simulator image photo.png -o vhs.png \
   --head-switch 0.7 --head-switch-lines 6 --top-band 0.5 --vbi-data 0.5
 ```
 
-#### Quality presets
+#### Presets
 
-`--vhs-preset` fills in every VHS flag you did not pass. Flags you pass explicitly always win, so a preset is a starting point:
+`--vhs-preset` fills in every flag you did not pass. Flags you pass explicitly always win, so a preset is a starting point:
 
 ```bash
 # Worn EP-mode tape
@@ -168,21 +168,53 @@ ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --vhs-preset lq
 
 # Typical tape, but without the closed-caption dashes
 ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --vhs-preset mq --vbi-data 0
+
+# The original tape-path-only look
+ntsc-composite-simulator roundtrip input.mp4 -o output.mp4 --vhs-preset legacy-mq
 ```
 
-| Flag | `lq` | `mq` | `hq` |
-|---|---|---|---|
-| `--vhs-luma-bw` | 1.6 | 3 | 3 |
-| `--color-under-bw` | 400..450 | 400..450 | 300..400 |
-| `--edge-ringing` | 0.3..0.4 | 0.25..0.35 | 0.2..0.3 |
-| `--luma-noise` | 0.025..0.035 | 0.02..0.03 | 0.015..0.025 |
-| `--tape-dropout-rate` | 1 | 0..1 | 0 |
-| `--head-smear` | 0.2..0.3 | 0.15..0.2 | 0.1..0.15 |
-| `--tape-trail` | 0.75..0.9 | 0.6..0.75 | 0.5..0.7 |
-| `--head-switch` | 0.8..1.0 | 0.55..0.7 | 0.35..0.45 |
-| `--head-switch-lines` | 7 | 6 | 5 |
-| `--top-band` | 0.6..0.8 | 0.4..0.55 | 0.2..0.3 |
-| `--vbi-data` | 0.6..0.8 | 0.4..0.55 | 0.25..0.35 |
+There are two families:
+
+- `lq`, `mq`, `hq`: the full VHS look (tape path, head switching, top bands, caption line, colour-under noise and blur, chroma delay, wobble, and temporal coherence for video).
+- `legacy-lq`, `legacy-mq`, `legacy-hq`: exactly the original tape-path settings (the first seven rows below) and nothing else. With the same `--seed` they give byte-identical output to passing those seven flags by hand.
+
+| Flag | `lq` | `mq` | `hq` | in `legacy-*` |
+|---|---|---|---|---|
+| `--vhs-luma-bw` | 1.6 | 3 | 3 | yes |
+| `--color-under-bw` | 400..450 | 400..450 | 300..400 | yes |
+| `--edge-ringing` | 0.3..0.4 | 0.25..0.35 | 0.2..0.3 | yes |
+| `--luma-noise` | 0.025..0.035 | 0.02..0.03 | 0.015..0.025 | yes |
+| `--tape-dropout-rate` | 1 | 0..1 | 0 | yes |
+| `--head-smear` | 0.2..0.3 | 0.15..0.2 | 0.1..0.15 | yes |
+| `--tape-trail` | 0.75..0.9 | 0.6..0.75 | 0.5..0.7 | yes |
+| `--head-switch` | 0.8..1.0 | 0.55..0.7 | 0.35..0.45 | no |
+| `--head-switch-lines` | 7 | 6 | 5 | no |
+| `--top-band` | 0.6..0.8 | 0.4..0.55 | 0.2..0.3 | no |
+| `--vbi-data` | 0.6..0.8 | 0.4..0.55 | 0.25..0.35 | no |
+| `--chroma-noise` | 0.025..0.035 | 0.015..0.025 | 0.008..0.015 | no |
+| `--chroma-phase-noise` | 0 | 0 | 0 | no |
+| `--chroma-vblur` | 0.6..0.8 | 0.5..0.7 | 0.5 | no |
+| `--chroma-delay` | 2..3 | 1.5..2.5 | 1..2 | no |
+| `--chroma-delay-v` | 1 | 0..1 | 0 | no |
+| `--wobble` | 1..1.5 | 0.5..1 | 0.3..0.6 | no |
+| `--temporal-coherence` | 1 | 1 | 1 | no |
+
+#### Preset files
+
+`--preset-file <path>` reads a JSON preset (the GUI saves the same format). Its values fill in flags not given explicitly, before `--vhs-preset`. Values are written as on the command line: a number, a `"min..max"` string, `true`/`false` for switches, or text; `seed` is optional.
+
+```json
+{
+  "name": "My tape",
+  "params": {
+    "vhs-luma-bw": "1.6",
+    "color-under-bw": "400..450",
+    "chroma-delay": 2,
+    "ghost-dynamic": true
+  },
+  "seed": 42
+}
+```
 
 ## Options Reference
 
@@ -254,7 +286,8 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 | `--wobble` | roundtrip, image, colorbars | Correlated time-base wobble: peak horizontal displacement in output pixels (typical 0.5–3); smooth across lines, burst moves with the line so hue is kept |
 | `--wobble-rate` | roundtrip, image, colorbars | Wobble frequency scale (default 1.0 = periods of ~20–300 lines) |
 | `--temporal-coherence` | roundtrip | Tape-state coherence over time (0–1). 0 (default) re-rolls head-smear bands, wobble, head-switch shape and top-band tint every frame; 1 makes them drift slowly from frame to frame like a real tape. Chroma noise stays random |
-| `--vhs-preset` | roundtrip, image, colorbars | `lq`, `mq` or `hq`: fills in all VHS flags not given explicitly |
+| `--vhs-preset` | roundtrip, image, colorbars | `lq`, `mq`, `hq`, `legacy-lq`, `legacy-mq` or `legacy-hq`: fills in all flags not given explicitly |
+| `--preset-file` | roundtrip, image, colorbars | JSON preset file; fills in flags not given explicitly, before `--vhs-preset` |
 
 Run `ntsc-composite-simulator <command> -h` for full details.
 

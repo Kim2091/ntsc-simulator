@@ -1,9 +1,9 @@
 //! Command-line front end for the NTSC composite simulator.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::builder::PossibleValuesParser;
 use clap::{Arg, ArgAction, ArgMatches, Args, Command, FromArgMatches, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -29,6 +29,7 @@ struct Cli {
 struct EffectArgs {
     values: ParamValues,
     vhs_preset: Option<String>,
+    preset_file: Option<PathBuf>,
 }
 
 fn parse_range(s: &str) -> Result<RangeParam, String> {
@@ -65,7 +66,21 @@ impl Args for EffectArgs {
                 .long("vhs-preset")
                 .value_parser(PossibleValuesParser::new(names))
                 .help_heading("Presets and seed")
-                .help("VHS preset. Fills in every flag that is not given explicitly; explicit flags always win."),
+                .help(
+                    "Built-in preset: lq, mq, hq (full VHS look) or legacy-lq, legacy-mq, legacy-hq (the original \
+                     tape-path settings only). Fills in every flag that is not given explicitly; explicit flags always win.",
+                ),
+        )
+        .arg(
+            Arg::new("preset-file")
+                .long("preset-file")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help_heading("Presets and seed")
+                .help(
+                    "JSON preset file (as saved by the GUI). Its values fill in flags not given explicitly, \
+                     before --vhs-preset.",
+                ),
         )
     }
 
@@ -97,7 +112,11 @@ impl FromArgMatches for EffectArgs {
             }
         }
         values.seed = m.get_one::<u64>("seed").copied();
-        Ok(Self { values, vhs_preset: m.get_one::<String>("vhs-preset").cloned() })
+        Ok(Self {
+            values,
+            vhs_preset: m.get_one::<String>("vhs-preset").cloned(),
+            preset_file: m.get_one::<PathBuf>("preset-file").cloned(),
+        })
     }
 
     fn update_from_arg_matches(&mut self, m: &ArgMatches) -> Result<(), clap::Error> {
@@ -107,14 +126,18 @@ impl FromArgMatches for EffectArgs {
 }
 
 impl EffectArgs {
-    /// The final values: explicit flags, then the preset for the rest.
-    fn resolve(&self) -> ParamValues {
+    /// The final values: explicit flags first, then the preset file, then
+    /// the built-in preset for whatever is still unset.
+    fn resolve(&self) -> Result<ParamValues> {
         let mut values = self.values.clone();
+        if let Some(path) = &self.preset_file {
+            values.fill_from(&load_preset(path)?.values);
+        }
         if let Some(name) = &self.vhs_preset {
             let preset = presets::builtin(name).expect("validated by clap");
             values.fill_from(&preset.to_values());
         }
-        values
+        Ok(values)
     }
 }
 
@@ -228,6 +251,10 @@ impl Progress for CliProgress {
     }
 }
 
+fn load_preset(path: &Path) -> Result<presets::Preset> {
+    presets::load_preset_file(path).context("--preset-file")
+}
+
 fn make_progress_bar(total_frames: usize, prefix: &str) -> ProgressBar {
     let label = if prefix.is_empty() { "Processing" } else { prefix };
     if total_frames > 0 {
@@ -256,17 +283,17 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Image { input, output, width, height, comb_1h, effects } => {
-            pipeline::process_images(&input, &output, width, height, comb_1h, &effects.resolve(), &progress)
+            pipeline::process_images(&input, &output, width, height, comb_1h, &effects.resolve()?, &progress)
         }
         Commands::Roundtrip {
             input, output, width, height, comb_1h, crf, preset, lossless, threads, telecine, effects,
         } => {
             let opts = VideoOptions { width, height, comb_1h, crf, preset, lossless, threads, telecine };
-            pipeline::process_videos(&input, &output, &opts, &effects.resolve(), &progress)
+            pipeline::process_videos(&input, &output, &opts, &effects.resolve()?, &progress)
         }
         Commands::Colorbars { output, save_source, width, height, comb_1h, effects } => {
             pipeline::process_colorbars(
-                &output, save_source.as_deref(), width, height, comb_1h, &effects.resolve(), &progress,
+                &output, save_source.as_deref(), width, height, comb_1h, &effects.resolve()?, &progress,
             )
         }
     }
