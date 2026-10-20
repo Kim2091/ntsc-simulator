@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::effects::{splitmix64, GhostConfig, SignalEffects, DEFAULT_HEAD_SWITCH_LINES};
+use crate::effects::{splitmix64, Doc, GhostConfig, SignalEffects, DEFAULT_HEAD_SWITCH_LINES};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Range parameters
@@ -426,6 +426,14 @@ pub static SPECS: &[ParamSpec] = &[
         unit: "µs",
         group: Group::NoiseDropouts,
         kind: num_def(1.0, 60.0, 15.0),
+    },
+    ParamSpec {
+        id: "doc",
+        label: "Dropout compensator",
+        help: "What the deck does with long dropouts. composite: copies the whole line above, colour included                (the original behaviour; the copied colour comes out in the complementary hue). luma: copies the                luma of the line above and mutes the colour, as real decks do, so patches are colourless. off: no                compensator, every dropout is a white or black streak.",
+        unit: "",
+        group: Group::NoiseDropouts,
+        kind: Kind::Choice { options: &["composite", "luma", "off"], default: "composite" },
     },
     // ── Timing ──
     ParamSpec {
@@ -897,6 +905,11 @@ impl ParamValues {
             deck_dnr: None,
             stage_seed: 0,
             deck_nc: None,
+            doc: match self.choice("doc") {
+                "luma" => Doc::Luma,
+                "off" => Doc::Off,
+                _ => Doc::Composite,
+            },
         };
         if fx.wobble.is_some() {
             fx.wobble_rate = req("wobble-rate").sample(rng);

@@ -88,6 +88,7 @@ pub static BUILTIN: &[BuiltinPreset] = &[
             ("wobble", "1..1.5"),
             ("temporal-coherence", "1"),
             ("deck-nc", "6"),
+            ("doc", "luma"),
         ]),
     },
     BuiltinPreset {
@@ -107,6 +108,7 @@ pub static BUILTIN: &[BuiltinPreset] = &[
             ("wobble", "0.5..1"),
             ("temporal-coherence", "1"),
             ("deck-nc", "6"),
+            ("doc", "luma"),
         ]),
     },
     BuiltinPreset {
@@ -126,6 +128,7 @@ pub static BUILTIN: &[BuiltinPreset] = &[
             ("wobble", "0.3..0.6"),
             ("temporal-coherence", "1"),
             ("deck-nc", "6"),
+            ("doc", "luma"),
         ]),
     },
     BuiltinPreset {

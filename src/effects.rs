@@ -24,6 +24,7 @@ use crate::constants::{
 };
 use crate::encoder::Wire;
 use crate::filters;
+use crate::iir;
 use crate::profile;
 use crate::simd::multiversion;
 use crate::vhs::{self, DeckLuma};
@@ -168,6 +169,8 @@ pub struct SignalEffects {
     pub stage_seed: u64,
     /// Deck noise canceller limiter threshold in IRE.  `None` = off.
     pub deck_nc: Option<f32>,
+    /// What the dropout compensator does with long dropouts.
+    pub doc: Doc,
 }
 
 /// Default number of active lines per field affected by head switching.
@@ -358,8 +361,8 @@ impl SignalEffects {
         }
         if let Some(rate) = self.tape_dropout_rate {
             let _p = profile::scope("fx dropout");
-            run(wires, rng, &all, &mut |s, _, rng| {
-                apply_tape_dropout(s, rate, self.tape_dropout_len, sample_rate, rng)
+            run(wires, rng, &all, &mut |s, w, rng| {
+                apply_tape_dropout_doc(s, rate, self.tape_dropout_len, sample_rate, rng, self.doc, w)
             });
         }
         if let Some(amp) = self.wobble {
@@ -795,6 +798,107 @@ fn apply_tape_dropout(
         } else {
             // First line — fill with blanking
             signal[start_idx..end_idx].fill(BLANKING_V);
+        }
+    }
+}
+
+/// What the deck's dropout compensator does with a long dropout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Doc {
+    /// Copies the whole signal of the line above, colour included.  The
+    /// subcarrier of the line above is inverted, so the patch decodes in
+    /// the complementary hue.  Kept for compatibility.
+    #[default]
+    Composite,
+    /// Copies the luma of the line above and mutes the colour, as real
+    /// decks do: a colourless patch.
+    Luma,
+    /// No compensator: every dropout is a white or black streak.
+    Off,
+}
+
+/// Length of the raised-cosine ramps when colour is muted, in samples.
+pub(crate) const MUTE_RAMP: usize = 4;
+
+/// Mute the colour of `chroma[lo..hi]` with short ramps inside the
+/// segment.
+pub(crate) fn mute_segment(chroma: &mut [f32], lo: usize, hi: usize, rest: f32) {
+    for j in lo..hi {
+        let d = (j - lo).min(hi - 1 - j);
+        let keep = if d < MUTE_RAMP { 0.5 + 0.5 * (std::f32::consts::PI * d as f32 / MUTE_RAMP as f32).cos() } else { 0.0 };
+        chroma[j] = rest + keep * (chroma[j] - rest);
+    }
+}
+
+/// `apply_tape_dropout` with a choice of compensator.  The dropouts are
+/// placed exactly as there (same random draws); `Doc::Composite` is
+/// `apply_tape_dropout` itself.
+#[allow(clippy::too_many_arguments)]
+fn apply_tape_dropout_doc(
+    signal: &mut [f32],
+    dropout_rate: f32,
+    avg_len_us: f32,
+    sample_rate: f64,
+    rng: &mut impl Rng,
+    doc: Doc,
+    wire: Wire,
+) {
+    if doc == Doc::Composite {
+        apply_tape_dropout(signal, dropout_rate, avg_len_us, sample_rate, rng);
+        return;
+    }
+    let spl = SAMPLES_PER_LINE;
+    let avg_len_samples = (avg_len_us as f64 * sample_rate / 1e6).max(4.0);
+    let prob_per_line = (dropout_rate / TOTAL_LINES as f32).clamp(0.0, 1.0);
+    let mut group = vhs::LaneGroup::new();
+
+    for line in 0..TOTAL_LINES {
+        if rng.random::<f32>() >= prob_per_line {
+            continue;
+        }
+        let base = line * spl;
+        if base + spl > signal.len() {
+            break;
+        }
+        let offset = (rng.random::<f32>() * ACTIVE_SAMPLES as f32) as usize;
+        let start_idx = base + ACTIVE_START + offset;
+        let u: f32 = rng.random::<f32>().max(1e-10);
+        let len = (-u.ln() * avg_len_samples as f32).max(4.0).min((ACTIVE_SAMPLES - offset) as f32) as usize;
+        let end_idx = (start_idx + len).min(base + spl);
+        let streak = len < 20 || doc == Doc::Off || line == 0;
+        // A streak's level: mostly white, sometimes black (the carrier
+        // lost after a bright area).
+        let level = if streak {
+            let r = rng.random::<f32>();
+            if len >= 20 && r < 0.3 { BLANKING_V + 7.5 * IRE_V } else { BLANKING_V + 0.4 + r * 0.25 }
+        } else {
+            0.0
+        };
+        let (lo, hi) = (start_idx - base, end_idx - base);
+        match wire {
+            // Colour is muted over the whole dropout.
+            Wire::Chroma => mute_segment(&mut signal[base..base + spl], lo, hi, BLANKING_V),
+            Wire::Luma => {
+                if streak {
+                    signal[start_idx..end_idx].fill(level);
+                } else {
+                    signal.copy_within(start_idx - spl..end_idx - spl, start_idx);
+                }
+            }
+            Wire::Composite => {
+                if streak {
+                    signal[start_idx..end_idx].fill(level);
+                } else {
+                    // Luma of the line above, colour muted.
+                    group.load(signal, &[line - 1, line], false);
+                    let r = vhs::REGION_START;
+                    let mut chroma: Vec<f32> = (0..spl - r).map(|j| group.chroma[j * iir::LANES + 1]).collect();
+                    mute_segment(&mut chroma, lo - r, hi - r, 0.0);
+                    for j in lo..hi {
+                        signal[base + j] = group.luma[(j - r) * iir::LANES] + chroma[j - r];
+                    }
+                }
+            }
         }
     }
 }
@@ -2222,6 +2326,23 @@ mod tests {
         // The window does not fully cancel a carrier whose amplitude varies,
         // so a few percent remain (about 1 IRE here).
         assert!(max_luma < 0.05 * max_chroma, "luma changed: {max_luma} vs {max_chroma}");
+    }
+
+    #[test]
+    fn luma_doc_patches_are_colourless_not_inverted() {
+        let orig = encode_flat([200, 40, 40]);
+        let count_inverted = |doc: Doc| {
+            let mut sig = orig.clone();
+            let mut rng = StdRng::seed_from_u64(12);
+            apply_tape_dropout_doc(&mut sig, 300.0, 15.0, crate::constants::SAMPLE_RATE, &mut rng, doc, Wire::Composite);
+            let mut dec = crate::decoder::Decoder::new();
+            let out = dec.decode_frame(&sig, 640, 480, false, false).to_vec();
+            out.chunks_exact(3).filter(|p| p[1] as i32 > p[0] as i32 + 20).count()
+        };
+        // Short dropouts are flat streaks whose sharp edges give a little
+        // cross-colour in the decoder; long ones must not invert the hue.
+        let (composite, luma) = (count_inverted(Doc::Composite), count_inverted(Doc::Luma));
+        assert!(composite > 1000 && luma * 10 < composite, "{composite} {luma}");
     }
 
     #[test]
