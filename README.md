@@ -65,6 +65,8 @@ target/release/ntsc-gui photo.png
 
 Optional start-up arguments: `--preset <name>`, `--deck <name>`, `--time <seconds>` (for videos), `--view split|side|after`, `--zoom fit|1|2|4`, `--process`, `--screenshot <png>` (save a window screenshot once the preview has rendered, then exit).
 
+**Crash reports**: the GUI has no console, so panics and failed memory allocations are appended to `%LOCALAPPDATA%\ntsc-simulator\crash.log` (on other systems `~/.local/share/ntsc-simulator/crash.log`) with the thread, the message, the source location and a backtrace. A crash on the UI thread also shows a message box with the file's path. A panic in a background job (preview render, frame grab, playback, Process…) is logged and shown as an error in the status bar or the Process dialog instead of closing the program. Release builds keep line tables (`ntsc_gui.pdb` next to the `.exe` on Windows) so the backtrace names files and lines; keep the `.pdb` with the `.exe`.
+
 ## Usage
 
 ### Roundtrip video through NTSC
@@ -597,6 +599,7 @@ Items 1, 4–7 and 12 are the classic model, kept unchanged for the `legacy-*` p
 
 Newest first.
 
+- **GUI crash log**: panics and failed allocations are written with a backtrace to `%LOCALAPPDATA%\ntsc-simulator\crash.log`; panics in background jobs end that job with an error instead of the program. Release builds keep line tables in a separate `.pdb` (`debug = "line-tables-only"`, no longer stripped).
 - **GUI video playback**: **Play** / **Pause** (Space) plays the processed video in the preview at the source frame rate, with loop, scrubbing while playing, live setting changes, before/after and zoom. Real time by default (late frames are not shown and, unless the deck noise reduction is on, skipped), or **Every frame**; the status bar shows the achieved fps and dropped frames. Shown frames are byte-identical to a `roundtrip` with the same settings and seed; the roundtrip's frame processing now lives in `pipeline::FrameProcessor`, which both use (output unchanged).
 - **No echo outlines from `deck-svhs-tbc` on motion**: thin lines and outlines in moving footage no longer leave crisp copies where they were in earlier frames. The deck noise reduction detected motion from a 3×3 mean of the frame difference, which diluted the difference of thin detail to a third so it counted as still and was blended back frame after frame; it now lowpasses the signed difference, spreads the motion signal over ±2 pixels and ±1 row, and blends luma and colour by separate motion signals, which also cleans still areas more (static luma noise 1.70 -> 0.74 instead of 0.83, colour noise halved). The 3D comb detected motion only against the frame two back, so whatever was only in the previous frame was copied in; with the FM tape models it now also checks the previous frame's luma (classic-model output unchanged). `lq --deck deck-svhs-tbc` video lock updated; a composite variant is locked too.
 - **`deck-edit` matches pro-deck EDIT mode**: besides no sharpening it turns the noise canceller and the colour noise reducer off, as the JVC BR-S422 does for dubbing; source enhancement (`--edge-ringing`) and the line noise reducer are left alone.

@@ -12,6 +12,8 @@ use eframe::egui;
 use ntsc_composite_simulator::params::ParamValues;
 use ntsc_composite_simulator::pipeline;
 
+use crate::crash;
+
 /// An RGB image used as the preview source.
 pub struct SourceImage {
     pub rgb: Vec<u8>,
@@ -50,7 +52,8 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(ctx: egui::Context) -> Self {
+    /// `crash_test` makes every render panic (to test crash reports).
+    pub fn new(ctx: egui::Context, crash_test: bool) -> Self {
         let (tx, req_rx) = channel::<RenderRequest>();
         let (res_tx, rx) = channel::<RenderResult>();
         std::thread::Builder::new()
@@ -64,10 +67,17 @@ impl Renderer {
                     let t0 = Instant::now();
                     let dar = req.src.w as f64 / req.src.h as f64;
                     let history: Vec<&[u8]> = req.src.history.iter().map(|f| f.as_slice()).collect();
-                    let result = match pipeline::render_preview_sequence(
-                        &history, &req.src.rgb, req.src.w, req.src.h, dar, req.out_w, req.out_h,
-                        req.comb_1h, &req.values, req.frame,
-                    ) {
+                    let rendered = crash::catch(|| {
+                        if crash_test {
+                            panic!("crash test in the render thread");
+                        }
+                        pipeline::render_preview_sequence(
+                            &history, &req.src.rgb, req.src.w, req.src.h, dar, req.out_w, req.out_h,
+                            req.comb_1h, &req.values, req.frame,
+                        )
+                    })
+                    .and_then(|r| r.map_err(|e| format!("{:#}", e)));
+                    let result = match rendered {
                         Ok((rgb, w, h, sampled)) => RenderResult {
                             id: req.id,
                             rgb,
@@ -84,7 +94,7 @@ impl Renderer {
                             h: 0,
                             ms: 0.0,
                             sampled: Vec::new(),
-                            error: Some(format!("{:#}", e)),
+                            error: Some(e),
                         },
                     };
                     if res_tx.send(result).is_err() {
@@ -121,13 +131,16 @@ pub fn grab_frame_async(
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         // The frame plus the 8 before it (for the deck noise reduction).
-        let r = pipeline::ffprobe_video(&path)
-            .and_then(|(w, h, ..)| {
-                let mut frames = pipeline::grab_video_frames(&path, time_s, 9, &values)?;
-                let rgb = frames.pop().unwrap();
-                Ok(SourceImage { rgb, w, h, history: frames })
-            })
-            .map_err(|e| format!("{:#}", e));
+        let r = crash::catch(|| {
+            pipeline::ffprobe_video(&path)
+                .and_then(|(w, h, ..)| {
+                    let mut frames = pipeline::grab_video_frames(&path, time_s, 9, &values)?;
+                    let rgb = frames.pop().unwrap();
+                    Ok(SourceImage { rgb, w, h, history: frames })
+                })
+                .map_err(|e| format!("{:#}", e))
+        })
+        .and_then(|r| r);
         let _ = tx.send(r);
         ctx.request_repaint();
     });

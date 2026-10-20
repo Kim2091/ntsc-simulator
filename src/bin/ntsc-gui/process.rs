@@ -317,13 +317,14 @@ impl ProcessDialog {
         };
         let st = state.clone();
         let handle = std::thread::spawn(move || {
-            let r = match kind {
+            let r = crate::crash::catch(|| match kind {
                 JobKind::Image => pipeline::process_images(
                     &input, &output, s.size.map(|z| z.0), s.size.map(|z| z.1), s.comb_1h, &s.values, &*st,
                 ),
                 JobKind::Video => pipeline::process_videos(&input, &output, &opts, &s.values, &*st),
-            };
-            *st.result.lock().unwrap() = Some(r.map_err(|e| format!("{:#}", e)));
+            })
+            .and_then(|r| r.map_err(|e| format!("{:#}", e)));
+            *st.result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r);
             ctx.request_repaint();
         });
         self.message = None;

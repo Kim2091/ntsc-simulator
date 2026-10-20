@@ -4,6 +4,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod crash;
 mod params_ui;
 mod playback;
 mod process;
@@ -75,10 +76,24 @@ pub struct GuiArgs {
     /// Output size WxH instead of the automatic size
     #[arg(long, hide = true)]
     pub size: Option<String>,
+    /// Test the crash reports: panic in the "render" worker or on the
+    /// "ui" thread once the window is up, or fail an "alloc"ation
+    #[arg(long, hide = true)]
+    pub crash_test: Option<String>,
 }
 
+#[global_allocator]
+static ALLOC: crash::LoggingAlloc = crash::LoggingAlloc;
+
 fn main() -> eframe::Result {
+    crash::install();
     let args = GuiArgs::parse();
+    if args.crash_test.as_deref() == Some("alloc") {
+        // A request no system can meet; the failure is logged, then the
+        // process aborts as Rust does for any failed allocation.
+        let v: Vec<u8> = Vec::with_capacity(isize::MAX as usize / 2);
+        std::hint::black_box(&v);
+    }
     if let Some(n) = args.threads {
         rayon::ThreadPoolBuilder::new().num_threads(n.max(1)).build_global().ok();
     }

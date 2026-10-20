@@ -36,7 +36,10 @@ required-features = ["gui"]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-strip = true
+# Line tables (on Windows in a separate .pdb next to the .exe) so the GUI's
+# crash log has a readable backtrace; they do not change the code.
+debug = "line-tables-only"
+strip = false
 
 # Optimised but quick to build, for running the test suite:
 # cargo test --profile fasttest

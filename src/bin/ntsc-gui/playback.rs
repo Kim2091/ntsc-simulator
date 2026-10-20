@@ -16,13 +16,15 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use ntsc_composite_simulator::params::ParamValues;
 use ntsc_composite_simulator::pipeline::{self, FrameProcessor};
+
+use crate::crash;
 
 /// Frames processed before the first shown one when the deck noise
 /// reduction is on, so its recursive state builds up (as in the still
@@ -113,9 +115,13 @@ impl Playback {
         let spawned = std::thread::Builder::new()
             .name("playback".into())
             .spawn(move || {
-                if let Err(e) = run(&ctx, &req, &st, &ch, &cl, &tx, batch) {
+                // A panic (logged by the crash hook) ends playback with an
+                // error instead of taking the program down.
+                let result = crash::catch(|| run(&ctx, &req, &st, &ch, &cl, &tx, batch))
+                    .and_then(|r| r.map_err(|e| format!("{:#}", e)));
+                if let Err(e) = result {
                     if !st.load(Ordering::Relaxed) {
-                        let _ = tx.send(Msg::Error(format!("{:#}", e)));
+                        let _ = tx.send(Msg::Error(e));
                     }
                 }
                 ctx.request_repaint();
@@ -197,7 +203,7 @@ impl Playback {
                     break;
                 }
             };
-            let mut clock = self.clock.lock().unwrap();
+            let mut clock = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
             let (t0, f0) = *clock.get_or_insert((now, f.frame));
             let due = t0 + Duration::from_secs_f64(f.frame.saturating_sub(f0) as f64 / fps);
             if due > now {
@@ -237,7 +243,7 @@ impl Playback {
     /// Stop ffmpeg and let the threads end.  `join` waits for them.
     pub fn stop(&mut self, join: bool) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(mut c) = self.child.lock().unwrap().take() {
+        if let Some(mut c) = self.child.lock().unwrap_or_else(PoisonError::into_inner).take() {
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -291,7 +297,7 @@ fn run(
     let mut c = pipeline::spawn_frame_reader(&req.path, &req.values, read_from, req.fps)?;
     let stdout = c.stdout.take().expect("piped stdout");
     {
-        let mut slot = child.lock().unwrap();
+        let mut slot = child.lock().unwrap_or_else(PoisonError::into_inner);
         if stop.load(Ordering::Relaxed) {
             let _ = c.kill();
             let _ = c.wait();
@@ -314,7 +320,7 @@ fn run(
     })?;
     let result = process(ctx, req, stop, clock, tx, batch, &mut processor, warmup, &src_rx);
     drop(src_rx);
-    if let Some(mut c) = child.lock().unwrap().take() {
+    if let Some(mut c) = child.lock().unwrap_or_else(PoisonError::into_inner).take() {
         let _ = c.kill();
         let _ = c.wait();
     }
@@ -366,7 +372,7 @@ fn process(
         }
         // Real time: when this batch would finish after its first frame is
         // due, continue at the first frame that can still be on time.
-        let anchor = *clock.lock().unwrap();
+        let anchor = *clock.lock().unwrap_or_else(PoisonError::into_inner);
         if let (true, Some((t0, f0))) = (can_skip, anchor) {
             let ready_at = Instant::now() + batch_time;
             let target = f0 + (ready_at.saturating_duration_since(t0).as_secs_f64() * fps).ceil() as u64;

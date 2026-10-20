@@ -115,6 +115,8 @@ pub struct App {
     /// Scripted playback pauses before the capture (--play-pause).
     play_pause: bool,
     auto_paused: Option<Instant>,
+    /// Panic once the preview has rendered (--crash-test ui).
+    crash_test_ui: bool,
 }
 
 fn bars_source() -> SourceImage {
@@ -151,7 +153,7 @@ impl App {
             before_tex: None,
             after_tex: None,
             after_rgb: None,
-            renderer: Renderer::new(cc.egui_ctx.clone()),
+            renderer: Renderer::new(cc.egui_ctx.clone(), args.crash_test.as_deref() == Some("render")),
             next_id: 1,
             shown_id: 0,
             sent_key: None,
@@ -177,6 +179,7 @@ impl App {
             auto_play: (args.play || args.play_seconds.is_some()).then_some((args.play_seconds, None)),
             play_pause: args.play_pause,
             auto_paused: None,
+            crash_test_ui: args.crash_test.as_deref() == Some("ui"),
         };
         app.deck = args.deck.as_deref().and_then(presets::deck).map(|d| d.name);
         if let Some((w, h)) = args.size.as_deref().and_then(|s| s.split_once('x')) {
@@ -1094,6 +1097,9 @@ fn rand_seed() -> u64 {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if self.crash_test_ui && self.shown_id > 0 {
+            panic!("crash test on the UI thread");
+        }
         self.handle_drops(&ctx);
         self.poll_grab(&ctx);
 
