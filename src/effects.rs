@@ -361,6 +361,18 @@ impl SignalEffects {
             let _p = profile::scope("fx vbi-data");
             run(wires, rng, &luma_on, &mut |s, _, rng| apply_vbi_data(s, strength, sample_rate, rng));
         }
+        // With the FM tape model, edge enhancement is part of the source:
+        // it is recorded, so the tape path acts on it.
+        if self.tape_model == TapeModel::Fm {
+            if let Some(gain) = self.edge_ringing {
+                let _p = profile::scope("fx edge ringing");
+                each(wires, &mut |s, w| {
+                    if luma_on(w) {
+                        apply_edge_ringing(s, gain, sample_rate, w == Wire::Luma);
+                    }
+                });
+            }
+        }
         // VHS tape-path effects
         if self.tape_model == TapeModel::Fm {
             let _p = profile::scope("fx tape path (fm model)");
@@ -391,7 +403,7 @@ impl SignalEffects {
             let _p = profile::scope("fx chroma path");
             run(wires, rng, &chroma_on, &mut |s, _, rng| apply_chroma_path(s, &chroma_cfg, sample_rate, rng));
         }
-        if let Some(gain) = self.edge_ringing {
+        if let Some(gain) = self.edge_ringing.filter(|_| self.tape_model == TapeModel::Classic) {
             let _p = profile::scope("fx edge ringing");
             each(wires, &mut |s, w| {
                 if luma_on(w) {

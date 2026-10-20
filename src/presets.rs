@@ -62,20 +62,22 @@ const LEGACY_HQ: [(&str, &str); 7] = [
     ("tape-trail", "0.5..0.7"),
 ];
 
-/// Concatenate a legacy set with extra values at compile time.
-macro_rules! with_extra {
-    ($base:expr, [$($extra:expr),* $(,)?]) => {{
-        const B: [(&str, &str); 7] = $base;
-        &[B[0], B[1], B[2], B[3], B[4], B[5], B[6], $($extra),*]
-    }};
-}
-
 pub static BUILTIN: &[BuiltinPreset] = &[
     BuiltinPreset {
         name: "lq",
         group: "VHS",
         description: "Worn EP-mode tape: soft, noisy, torn bottom, colour blotches and wobble",
-        values: with_extra!(LEGACY_LQ, [
+        values: &[
+            ("tape-model", "fm"),
+            ("vhs-luma-bw", "2.8"),
+            ("color-under-bw", "400..450"),
+            ("nl-emphasis", "1"),
+            ("tape-snr", "36..39"),
+            ("dropouts", "40..100"),
+            ("dropout-span", "2..4"),
+            ("edge-ringing", "0.3..0.4"),
+            ("head-smear", "0.2..0.3"),
+            ("tape-trail", "0.75..0.9"),
             ("head-switch", "0.8..1.0"),
             ("head-switch-point", "5.5..7.5"),
             ("flagging", "0.4..0.6"),
@@ -90,13 +92,24 @@ pub static BUILTIN: &[BuiltinPreset] = &[
             ("temporal-coherence", "1"),
             ("deck-nc", "6"),
             ("doc", "luma"),
-        ]),
+            ("comb", "trap"),
+        ],
     },
     BuiltinPreset {
         name: "mq",
         group: "VHS",
-        description: "Typical rental tape",
-        values: with_extra!(LEGACY_MQ, [
+        description: "Typical rental tape (LP-like wear)",
+        values: &[
+            ("tape-model", "fm"),
+            ("vhs-luma-bw", "2.9"),
+            ("color-under-bw", "400..450"),
+            ("nl-emphasis", "0.5..1"),
+            ("tape-snr", "41..43"),
+            ("dropouts", "15..30"),
+            ("dropout-span", "1..2"),
+            ("edge-ringing", "0.25..0.35"),
+            ("head-smear", "0.15..0.2"),
+            ("tape-trail", "0.6..0.75"),
             ("head-switch", "0.55..0.7"),
             ("head-switch-point", "6..7"),
             ("flagging", "0.25..0.4"),
@@ -111,13 +124,23 @@ pub static BUILTIN: &[BuiltinPreset] = &[
             ("temporal-coherence", "1"),
             ("deck-nc", "6"),
             ("doc", "luma"),
-        ]),
+            ("comb", "trap"),
+        ],
     },
     BuiltinPreset {
         name: "hq",
         group: "VHS",
         description: "Clean SP recording",
-        values: with_extra!(LEGACY_HQ, [
+        values: &[
+            ("tape-model", "fm"),
+            ("vhs-luma-bw", "3"),
+            ("color-under-bw", "400"),
+            ("nl-emphasis", "0..0.5"),
+            ("tape-snr", "44..45"),
+            ("dropouts", "5..15"),
+            ("edge-ringing", "0.2..0.3"),
+            ("head-smear", "0.1..0.15"),
+            ("tape-trail", "0.5..0.7"),
             ("head-switch", "0.35..0.45"),
             ("head-switch-point", "6..7"),
             ("flagging", "0.15..0.25"),
@@ -132,7 +155,8 @@ pub static BUILTIN: &[BuiltinPreset] = &[
             ("temporal-coherence", "1"),
             ("deck-nc", "6"),
             ("doc", "luma"),
-        ]),
+            ("comb", "trap"),
+        ],
     },
     BuiltinPreset {
         name: "dvd-hq",
