@@ -7,9 +7,27 @@
 //! their own stream, derived from the file's stage seed, the frame number
 //! and a stage key, so turning one on never changes the draws of another.
 
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+
 use crate::constants::{ACTIVE_START, SAMPLES_PER_LINE, TOTAL_LINES};
-use crate::effects::{FIELD_ACTIVE_LINES, IRE_V};
+use crate::effects::{splitmix64, FIELD_ACTIVE_LINES, IRE_V};
 use crate::iir::{self, Biquad, LANES};
+
+// ────────────────────────────────────────────────────────────────────────────
+// Per-stage random streams
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Seed of a stage's random stream for one frame (or field, or any other
+/// index).
+pub(crate) fn stage_seed(seed: u64, index: u64, key: u64) -> u64 {
+    splitmix64(seed ^ splitmix64(key ^ splitmix64(index.wrapping_add(0x5747_A6E0))))
+}
+
+/// A stage's random stream for one frame (or other index).
+pub(crate) fn stage_rng(seed: u64, index: u64, key: u64) -> StdRng {
+    StdRng::seed_from_u64(stage_seed(seed, index, key))
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Luma/chroma split

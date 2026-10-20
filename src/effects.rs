@@ -185,6 +185,17 @@ pub struct SignalEffects {
     pub flagging: Option<f32>,
     /// Which tape model runs the tape path.
     pub tape_model: TapeModel,
+    /// FM tape model: white and dark clip (% of the sync-to-white span).
+    pub white_clip: f32,
+    pub dark_clip: f32,
+    /// FM tape model: nonlinear emphasis strength.  `None` = off.
+    pub nl_emphasis: Option<f32>,
+    /// FM tape model: tape noise S/N in dB.  `None` = no tape noise.
+    pub tape_snr: Option<f32>,
+    /// FM tape model: counted dropouts per minute.  `None` = none.
+    pub dropouts: Option<f32>,
+    /// FM tape model: most consecutive fields one tape defect hits.
+    pub dropout_span: usize,
 }
 
 /// How the tape path is simulated.
@@ -356,6 +367,15 @@ impl SignalEffects {
             let cfg = TapeFm {
                 luma_bw: self.vhs_luma_bw.unwrap_or(3.0e6),
                 chroma_bw: self.color_under_bw.unwrap_or(400e3),
+                white_clip: self.white_clip,
+                dark_clip: self.dark_clip,
+                nl_emphasis: self.nl_emphasis.unwrap_or(0.0),
+                snr_db: self.tape_snr,
+                dropouts_per_min: self.dropouts,
+                dropout_span: self.dropout_span,
+                doc: self.doc != Doc::Off,
+                seed: self.stage_seed,
+                frame,
             };
             each(wires, &mut |s, w| tape::apply_tape_fm(s, &cfg, w));
         } else if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {

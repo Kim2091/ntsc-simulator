@@ -1,23 +1,49 @@
 //! The FM tape model (`--tape-model fm`): the VHS record and playback
 //! chain built from the format's circuits instead of a single lowpass.
 //!
-//! Per active line:
+//! **Record** (per active line):
 //!   1. The recording deck separates luma and chroma with a band filter
 //!      around the subcarrier (fsc ± 0.6 MHz); luma detail inside the band
 //!      stays in the chroma and is recorded as cross-colour.
 //!   2. Chroma is limited to the colour-under bandwidth.
-//!   3. Luma passes the record lowpass and, on playback, the lowpass after
-//!      the FM demodulator.  Both are causal 2nd-order Butterworth
-//!      sections; together they are −3 dB at 0.66 × and −10 dB at 1.0 ×
-//!      the luma bandwidth (240 TVL ≈ 3.0 MHz for SP).  The luma is then
-//!      advanced by the filters' group delay, as decks delay-match luma
-//!      and chroma.
+//!   3. Luma passes the record lowpass, the nonlinear emphasis (if on), the
+//!      main pre-emphasis H(s) = (1 + sT)/(1 + sT/(1+X)) with T = 1.3 µs and
+//!      X = 4 (a +14 dB shelf, corners 122 and 612 kHz), and the white and
+//!      dark clips (160 % and 40 % of the sync-to-white span from the sync
+//!      tip by default: +184 and −96 IRE).  Every large sharp edge
+//!      overshoots the clips by far, so part of it is cut off.
+//!
+//! **Tape**, in the emphasised domain: FM noise and dropouts (see
+//! `TapeFm`).
+//!
+//! **Playback**: the lowpass after the FM demodulator, the main
+//! de-emphasis with the playback deck's own T and X (each deck is within
+//! the format's tolerance, T ± 0.05 µs and X ± 0.3, so record and playback
+//! rarely match exactly), and the nonlinear de-emphasis.  The luma is then
+//! advanced by the lowpass filters' group delay, as decks delay-match luma
+//! and chroma.
+//!
+//! What this looks like: small edges and fine detail are restored as they
+//! were (up to the luma bandwidth), but the clipped part of a large edge is
+//! missing after de-emphasis, so high-contrast edges are softened with a
+//! causal smear: a white object on black rises slowly at its left edge and
+//! leaves a light trail into the black after its right edge, decaying over
+//! about 1-3 µs.  Noise added on the tape comes out rising with frequency
+//! up to the lowpass (fine, horizontally streaky grain), and the demodulated
+//! spike of a dropout gets a tail to the right.
+//!
+//! The record and playback luma lowpass are causal 2nd-order Butterworth
+//! sections, together −3 dB at 0.66 × and −10 dB at 1.0 × the luma
+//! bandwidth (240 TVL ≈ 3.0 MHz for SP).
+
+use rand::Rng;
+use rand_distr::{Distribution, LogNormal};
 
 use crate::constants::{BLANKING_V, SAMPLES_PER_LINE, TOTAL_LINES};
-use crate::effects::IRE_V;
+use crate::effects::{hash_signed, mute_segment, FIELD_ACTIVE_LINES, IRE_V};
 use crate::encoder::Wire;
-use crate::iir::{self, Biquad, LANES};
-use crate::vhs::{active_line_groups, LaneGroup};
+use crate::iir::{self, Biquad, FastNoise, LANES};
+use crate::vhs::{active_line_groups, stage_rng, stage_seed, LaneGroup, PRE_ROLL, REGION_LEN};
 
 /// Settings of the FM tape model.
 #[derive(Clone, Copy, Debug)]
@@ -26,6 +52,29 @@ pub struct TapeFm {
     pub luma_bw: f32,
     /// Colour-under bandwidth (−6 dB), Hz.
     pub chroma_bw: f32,
+    /// White clip, % of the sync-to-white span above the sync tip.
+    pub white_clip: f32,
+    /// Dark clip, % of the sync-to-white span below the sync tip.
+    pub dark_clip: f32,
+    /// Nonlinear emphasis strength (0 = off, 1 = the JVC curve: up to about
+    /// +7 dB for small high-frequency signals, +2 dB at full level).
+    pub nl_emphasis: f32,
+    /// Luma S/N of the tape noise in dB (unweighted, after de-emphasis, on
+    /// a flat 50 IRE field, without nonlinear de-emphasis).  `None` = no
+    /// tape noise.
+    pub snr_db: Option<f32>,
+    /// Dropouts per minute counted as the industry does (≥ 15 µs and
+    /// ≥ 16 dB deep); shorter and shallower ones are added in proportion.
+    /// `None` = none.
+    pub dropouts_per_min: Option<f32>,
+    /// Most consecutive fields one tape defect can hit (1 for SP; up to 3-4
+    /// for EP, whose tracks are a third as wide).
+    pub dropout_span: usize,
+    /// Whether the playback deck has a dropout compensator.
+    pub doc: bool,
+    /// Seed of the per-stage random streams, and the frame number.
+    pub seed: u64,
+    pub frame: u64,
 }
 
 /// Corner of each of the two luma lowpass sections relative to the luma
@@ -33,34 +82,342 @@ pub struct TapeFm {
 /// 1.21·fc.
 const LUMA_CORNER: f64 = 1.0 / 1.21;
 
+/// Main emphasis time constant (s) and divider ratio, nominal.
+const EMPH_T: f64 = 1.3e-6;
+const EMPH_X: f64 = 4.0;
+
+/// Nonlinear emphasis: band (highpass and lowpass corners, Hz), the gain
+/// for the smallest signals and the envelope (IRE) at which it halves.
+const NL_HP_HZ: f64 = 0.82e6;
+const NL_LP_HZ: f64 = 2.0e6;
+const NL_GAIN: f32 = 2.0;
+const NL_KNEE_IRE: f32 = 7.0;
+/// Release of the nonlinear emphasis envelope follower, seconds.
+const NL_RELEASE_S: f64 = 0.4e-6;
+
+/// Weight of the previous sample in the FM noise shaper n = w[k] − c·w[k−1]:
+/// its amplitude rises with frequency (the FM noise triangle) over a small
+/// flat floor.
+const FM_NOISE_SHAPE: f32 = 0.85;
+
+/// Stage keys of the random streams.
+const KEY_NOISE: u64 = 0x7A9E_0001;
+const KEY_DROPOUTS: u64 = 0x7A9E_0002;
+const KEY_TOLERANCE: u64 = 0x7A9E_0003;
+
+/// Samples a dropout compensator takes to switch over (≈ 0.3 µs): the start
+/// of every compensated dropout still shows as a short streak.
+const DOC_DELAY: usize = 4;
+
+/// The record and playback emphasis networks of one tape, within the
+/// format's tolerance (fixed per tape seed).
+fn emphasis_pair(seed: u64) -> (Biquad, Biquad) {
+    let u = |k: i64| hash_signed(seed, KEY_TOLERANCE, k);
+    let (t_rec, x_rec) = (EMPH_T + 0.05e-6 * u(0) as f64, EMPH_X + 0.3 * u(1) as f64);
+    let (t_pb, x_pb) = (EMPH_T + 0.05e-6 * u(2) as f64, EMPH_X + 0.3 * u(3) as f64);
+    (Biquad::shelf1(t_rec, t_rec / (1.0 + x_rec)), Biquad::shelf1(t_pb / (1.0 + x_pb), t_pb))
+}
+
+/// One dropout on the tape.
+#[derive(Clone, Copy, Debug)]
+struct Dropout {
+    /// Absolute line and region sample range.
+    line: usize,
+    x0: usize,
+    x1: usize,
+    /// RF loss in dB.
+    depth_db: f32,
+}
+
+/// Fraction of all dropouts that the industry counts (≥ 15 µs, ≥ 16 dB):
+/// lengths are log-normal with a median of 4 µs (mode ≈ 1.8 µs) and
+/// σ = 0.9, depths uniform in 10-40 dB.
+const COUNTED_FRACTION: f32 = 0.071 * 0.8;
+const DROPOUT_MEDIAN_US: f32 = 4.0;
+const DROPOUT_SIGMA: f32 = 0.9;
+const DROPOUT_MIN_US: f32 = 0.5;
+
+/// Fields per minute (NTSC).
+const FIELDS_PER_MIN: f32 = 59.94 * 60.0;
+
+/// The dropouts that start in global field `field` (2 × frame + field of
+/// the frame) and the number of fields each one lasts.
+fn field_dropouts(cfg: &TapeFm, field: u64) -> Vec<(Dropout, usize)> {
+    let Some(rate) = cfg.dropouts_per_min.filter(|r| *r > 0.0) else { return Vec::new() };
+    let mut rng = stage_rng(cfg.seed, field, KEY_DROPOUTS);
+    let mean = rate / COUNTED_FRACTION / FIELDS_PER_MIN;
+    // Poisson count by inversion.
+    let (mut n, mut p, l) = (0usize, rng.random::<f32>(), (-mean).exp());
+    while p > l && n < 200 {
+        n += 1;
+        p *= rng.random::<f32>();
+    }
+    let lengths = LogNormal::new(DROPOUT_MEDIAN_US.ln(), DROPOUT_SIGMA).unwrap();
+    let (first, end) = FIELD_ACTIVE_LINES[(field % 2) as usize];
+    (0..n)
+        .map(|_| {
+            let line = first + (rng.random::<f32>() * (end - first) as f32) as usize;
+            let us: f32 = lengths.sample(&mut rng).max(DROPOUT_MIN_US);
+            let len = (us * 1e-6 * crate::constants::SAMPLE_RATE as f32).round() as usize;
+            let x0 = PRE_ROLL + (rng.random::<f32>() * (REGION_LEN - PRE_ROLL) as f32) as usize;
+            let depth_db = 10.0 + 30.0 * rng.random::<f32>();
+            let span = 1 + (rng.random::<f32>() * cfg.dropout_span.max(1) as f32) as usize;
+            (Dropout { line, x0, x1: (x0 + len).min(REGION_LEN), depth_db }, span.min(cfg.dropout_span.max(1)))
+        })
+        .collect()
+}
+
+/// Every dropout visible in the two fields of the frame: those starting in
+/// a field, and those of up to three earlier fields that are wide enough to
+/// reach it (on the neighbouring track, at the same place, a field later).
+/// Dropouts reaching a field of the other parity land on the same line
+/// index of that field.
+fn frame_dropouts(cfg: &TapeFm) -> Vec<Dropout> {
+    let mut out = Vec::new();
+    if cfg.dropouts_per_min.is_none_or(|r| r <= 0.0) {
+        return out;
+    }
+    for f in 0..2u64 {
+        let field = 2 * cfg.frame + f;
+        for back in 0..4u64 {
+            let Some(src) = field.checked_sub(back) else { break };
+            for (d, span) in field_dropouts(cfg, src) {
+                if back as usize >= span {
+                    continue;
+                }
+                let (from_first, _) = FIELD_ACTIVE_LINES[(src % 2) as usize];
+                let (to_first, to_end) = FIELD_ACTIVE_LINES[f as usize];
+                let line = (to_first + (d.line - from_first)).min(to_end - 1);
+                out.push(Dropout { line, ..d });
+            }
+        }
+    }
+    out
+}
+
+/// Gain from white noise through the FM noise shaper, the playback lowpass
+/// and the de-emphasis to the output, as an rms factor.
+fn noise_gain(playback: &[Biquad], deemph: Biquad) -> f32 {
+    let mut sections: Vec<Biquad> = playback.to_vec();
+    sections.push(deemph);
+    // Convolve the shaper with the sections' impulse response.
+    let g = Biquad::impulse(&sections, 4096);
+    let mut sum = 0.0f64;
+    for k in 0..4095 {
+        let v = g[k + 1] as f64 - FM_NOISE_SHAPE as f64 * g[k] as f64;
+        sum += v * v;
+    }
+    sum += (g[0] as f64).powi(2);
+    sum.sqrt() as f32
+}
+
 /// Run the FM tape model on one wire.
 pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
     if signal.len() < TOTAL_LINES * SAMPLES_PER_LINE {
         return;
     }
+    let q = std::f64::consts::FRAC_1_SQRT_2;
     let fc = cfg.luma_bw as f64 * LUMA_CORNER;
-    let record = [Biquad::lowpass(fc, std::f64::consts::FRAC_1_SQRT_2)];
-    let playback = [Biquad::lowpass(fc, std::f64::consts::FRAC_1_SQRT_2)];
+    let record = [Biquad::lowpass(fc, q)];
+    let playback = [Biquad::lowpass(fc, q)];
     let both: Vec<Biquad> = record.iter().chain(&playback).copied().collect();
     let advance = iir::dc_group_delay(&both).round() as usize;
-    let colour_under = [Biquad::lowpass(cfg.chroma_bw as f64, std::f64::consts::FRAC_1_SQRT_2)];
+    let colour_under = [Biquad::lowpass(cfg.chroma_bw as f64, q)];
+    let (pre, de) = emphasis_pair(cfg.seed);
+    let white = -40.0 + 1.4 * cfg.white_clip;
+    let dark = -40.0 - 1.4 * cfg.dark_clip;
+    let nl = NlEmphasis::new(cfg.nl_emphasis);
+    let dropouts = frame_dropouts(cfg);
+    let do_luma = wire != Wire::Chroma;
 
-    let mut g = LaneGroup::new();
-    for lines in active_line_groups() {
-        g.load(signal, &lines, wire == Wire::Luma);
+    // ── Record ──
+    let groups_lines = active_line_groups();
+    let mut groups: Vec<LaneGroup> = Vec::with_capacity(groups_lines.len());
+    for lines in &groups_lines {
+        let mut g = LaneGroup::new();
+        g.load(signal, lines, wire == Wire::Luma);
         if wire != Wire::Luma {
             iir::zero_phase_lanes(&colour_under, &mut g.i);
             iir::zero_phase_lanes(&colour_under, &mut g.q);
             g.remodulate();
         }
-        if wire != Wire::Chroma {
+        if do_luma {
             to_ire(&mut g.luma);
             iir::causal_lanes(&record, &mut g.luma);
+            nl.record(&mut g.luma);
+            pre.run_lanes(&mut g.luma);
+            for v in g.luma.iter_mut() {
+                *v = v.clamp(dark, white);
+            }
+        }
+        groups.push(g);
+    }
+
+    // ── Tape ──
+    if do_luma {
+        let sigma = cfg.snr_db.map(|snr| 100.0 * 10f32.powf(-snr / 20.0) / noise_gain(&playback, de));
+        let mut noise = FastNoise::new(stage_seed(cfg.seed, cfg.frame, KEY_NOISE));
+        let mut white_n = vec![0.0f32; REGION_LEN + 1];
+        let mut line = vec![0.0f32; REGION_LEN];
+        let mut prev = vec![0.0f32; REGION_LEN];
+        for gi in 0..groups.len() {
+            let n_lanes = groups[gi].lines.len();
+            for l in 0..n_lanes {
+                let g = &mut groups[gi];
+                let abs = g.lines[l];
+                let first_of_field = FIELD_ACTIVE_LINES.iter().any(|&(a, _)| a == abs);
+                for j in 0..REGION_LEN {
+                    line[j] = g.luma[j * LANES + l];
+                }
+                if let Some(sigma) = sigma {
+                    noise.fill(&mut white_n);
+                    for j in 0..REGION_LEN {
+                        // Higher carrier (brighter, or an emphasised
+                        // overshoot): more head loss, lower CNR.
+                        let level = 0.85 + 0.3 * (line[j] / 100.0).clamp(-0.4, 1.84);
+                        line[j] += sigma * level * (white_n[j + 1] - FM_NOISE_SHAPE * white_n[j]);
+                    }
+                }
+                for d in dropouts.iter().filter(|d| d.line == abs) {
+                    render_dropout(&mut line, &prev, d, cfg.doc && !first_of_field, sigma.unwrap_or(1.0), &mut noise, white, dark);
+                }
+                for j in 0..REGION_LEN {
+                    g.luma[j * LANES + l] = line[j];
+                }
+                prev.copy_from_slice(&line);
+            }
+        }
+    }
+
+    // ── Playback ──
+    for g in groups.iter_mut() {
+        if do_luma {
             iir::causal_lanes(&playback, &mut g.luma);
+            de.run_lanes(&mut g.luma);
+            nl.playback(&mut g.luma);
             advance_lanes(&mut g.luma, advance);
             from_ire(&mut g.luma);
         }
+        // Decks mute the colour over a dropout.
+        if wire != Wire::Luma {
+            for d in dropouts.iter().filter(|d| d.depth_db >= FULL_DROPOUT_DB) {
+                if let Some(l) = g.lines.iter().position(|&x| x == d.line) {
+                    mute_lane(&mut g.chroma, l, d.x0, d.x1);
+                }
+            }
+        }
         g.store(signal);
+    }
+}
+
+/// RF loss (dB) below which the limiters absorb a dropout, and from which
+/// it is a full dropout (carrier lost).
+const ABSORBED_DB: f32 = 12.0;
+const FULL_DROPOUT_DB: f32 = 20.0;
+
+/// Render one dropout on a line in the emphasised domain.
+#[allow(clippy::too_many_arguments)]
+fn render_dropout(line: &mut [f32], prev: &[f32], d: &Dropout, doc: bool, sigma: f32, noise: &mut FastNoise, white: f32, dark: f32) {
+    if d.depth_db < ABSORBED_DB || d.x1 <= d.x0 {
+        return;
+    }
+    if d.depth_db < FULL_DROPOUT_DB {
+        // A partial loss: the carrier is still there, the noise rises.
+        let extra = 10f32.powf((d.depth_db - ABSORBED_DB) / 20.0) * sigma.max(0.5) * 2.0;
+        for v in &mut line[d.x0..d.x1] {
+            *v += extra * noise.normal();
+        }
+        return;
+    }
+    // The carrier is gone: the demodulator puts out noise around a level
+    // far from the picture.  After a bright area the limiter loses the
+    // weak high carrier first and the streak goes black, otherwise it is
+    // mostly white.
+    let before = line[d.x0.saturating_sub(3)];
+    let black = before > 70.0 || noise.uniform() < 0.25;
+    let level = if black { -30.0 } else { 115.0 };
+    let raw_end = if doc { (d.x0 + DOC_DELAY).min(d.x1) } else { d.x1 };
+    for v in &mut line[d.x0..raw_end] {
+        *v = (level + 20.0 * noise.normal()).clamp(dark, white);
+    }
+    // The compensator repeats the line above (it may itself be a repeat).
+    if doc {
+        line[raw_end..d.x1].copy_from_slice(&prev[raw_end..d.x1]);
+    }
+}
+
+/// Mute lane `l` of a lane-layout chroma buffer over region samples
+/// `x0..x1`.
+fn mute_lane(chroma: &mut [f32], l: usize, x0: usize, x1: usize) {
+    let mut tmp: Vec<f32> = (x0..x1).map(|j| chroma[j * LANES + l]).collect();
+    let n = tmp.len();
+    mute_segment(&mut tmp, 0, n, 0.0);
+    for (k, j) in (x0..x1).enumerate() {
+        chroma[j * LANES + l] = tmp[k];
+    }
+}
+
+/// The nonlinear emphasis pair: on record, extra gain for small
+/// high-frequency signals (a band around 1.3 MHz, up to about +7 dB for
+/// the smallest, +2 dB at full level); on playback, the matching cut,
+/// which also lowers tape noise on flat areas by up to about 7 dB but not
+/// next to large edges.  The record stage sits before the main emphasis
+/// and the playback stage after the main de-emphasis, mirror images.
+struct NlEmphasis {
+    gain: f32,
+    band: [Biquad; 2],
+    release: f32,
+}
+
+impl NlEmphasis {
+    fn new(strength: f32) -> Self {
+        Self {
+            gain: NL_GAIN * strength.max(0.0),
+            band: [Biquad::highpass1(NL_HP_HZ), Biquad::lowpass1(NL_LP_HZ)],
+            release: (-1.0 / (NL_RELEASE_S * crate::constants::SAMPLE_RATE)).exp() as f32,
+        }
+    }
+
+    fn g(&self, env: f32) -> f32 {
+        self.gain / (1.0 + env / NL_KNEE_IRE)
+    }
+
+    /// The band signal and its envelope, per sample (lane layout).
+    fn band_env(&self, buf: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let mut h = buf.to_vec();
+        iir::causal_lanes(&self.band, &mut h);
+        let mut env = vec![0.0f32; h.len()];
+        let mut e = [0.0f32; LANES];
+        for (j, chunk) in h.chunks_exact(LANES).enumerate() {
+            for l in 0..LANES {
+                e[l] = chunk[l].abs().max(e[l] * self.release);
+                env[j * LANES + l] = e[l];
+            }
+        }
+        (h, env)
+    }
+
+    fn record(&self, buf: &mut [f32]) {
+        if self.gain <= 0.0 {
+            return;
+        }
+        let (h, env) = self.band_env(buf);
+        for k in 0..buf.len() {
+            buf[k] += self.g(env[k]) * h[k];
+        }
+    }
+
+    fn playback(&self, buf: &mut [f32]) {
+        if self.gain <= 0.0 {
+            return;
+        }
+        let (h, env) = self.band_env(buf);
+        for k in 0..buf.len() {
+            // The recorded band was (1 + g) times the original; estimate
+            // the original envelope, then undo that gain.
+            let g1 = self.g(env[k] / (1.0 + self.g(env[k])));
+            buf[k] -= g1 / (1.0 + g1) * h[k];
+        }
     }
 }
 
@@ -89,5 +446,111 @@ fn advance_lanes(buf: &mut [f32], d: usize) {
         for l in 0..LANES {
             buf[j * LANES + l] = buf[(n - d - 1) * LANES + l];
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> TapeFm {
+        TapeFm {
+            luma_bw: 3.0e6,
+            chroma_bw: 400e3,
+            white_clip: 160.0,
+            dark_clip: 40.0,
+            nl_emphasis: 0.0,
+            snr_db: None,
+            dropouts_per_min: None,
+            dropout_span: 1,
+            doc: true,
+            seed: 1,
+            frame: 0,
+        }
+    }
+
+    /// A flat line at `a` IRE with a step to `b` IRE in the middle, on
+    /// every active line; returns (signal, step sample).
+    fn step_signal(a: f32, b: f32) -> (Vec<f32>, usize) {
+        let mut sig = vec![BLANKING_V; TOTAL_LINES * SAMPLES_PER_LINE];
+        let mid = 500;
+        for &(f, e) in &FIELD_ACTIVE_LINES {
+            for line in f..e {
+                for n in crate::constants::ACTIVE_START..SAMPLES_PER_LINE {
+                    let ire = if n < mid { a } else { b };
+                    sig[line * SAMPLES_PER_LINE + n] = BLANKING_V + ire * IRE_V;
+                }
+            }
+        }
+        (sig, mid)
+    }
+
+    fn ire_at(sig: &[f32], n: usize) -> f32 {
+        (sig[100 * SAMPLES_PER_LINE + n] - BLANKING_V) / IRE_V
+    }
+
+    #[test]
+    fn small_edges_pass_large_edges_smear() {
+        // A 10 IRE step is far below the clips: it settles within ~1 µs.
+        let (mut sig, mid) = step_signal(40.0, 50.0);
+        apply_tape_fm(&mut sig, &cfg(), Wire::Luma);
+        assert!((ire_at(&sig, mid + 20) - 50.0).abs() < 0.5, "{}", ire_at(&sig, mid + 20));
+        // A black-to-white step is clipped: 1.4 µs (20 samples) after the
+        // edge the white is still well short of 100 IRE.
+        let (mut sig, mid) = step_signal(7.5, 100.0);
+        apply_tape_fm(&mut sig, &cfg(), Wire::Luma);
+        let v = ire_at(&sig, mid + 20);
+        assert!(v < 95.0 && v > 60.0, "{v}");
+        assert!((ire_at(&sig, mid + 150) - 100.0).abs() < 1.0);
+        // White to black leaves a light trail.
+        let (mut sig, mid) = step_signal(100.0, 7.5);
+        apply_tape_fm(&mut sig, &cfg(), Wire::Luma);
+        let v = ire_at(&sig, mid + 20);
+        assert!(v > 12.0, "{v}");
+    }
+
+    #[test]
+    fn noise_is_calibrated() {
+        let (mut sig, _) = step_signal(50.0, 50.0);
+        let c = TapeFm { snr_db: Some(43.0), ..cfg() };
+        apply_tape_fm(&mut sig, &c, Wire::Luma);
+        let mut sum2 = 0.0f64;
+        let mut n = 0.0;
+        for line in 40..250 {
+            for k in crate::constants::ACTIVE_START + 40..SAMPLES_PER_LINE - 40 {
+                let v = (sig[line * SAMPLES_PER_LINE + k] - BLANKING_V) / IRE_V - 50.0;
+                sum2 += (v * v) as f64;
+                n += 1.0;
+            }
+        }
+        let snr = 20.0 * (100.0 / (sum2 / n).sqrt()).log10();
+        assert!((snr - 43.0).abs() < 0.5, "{snr}");
+    }
+
+    #[test]
+    fn nl_emphasis_lowers_noise_on_flat_areas() {
+        let rms = |nl: f32| {
+            let (mut sig, _) = step_signal(50.0, 50.0);
+            let c = TapeFm { snr_db: Some(40.0), nl_emphasis: nl, ..cfg() };
+            apply_tape_fm(&mut sig, &c, Wire::Luma);
+            let v: Vec<f32> = (crate::constants::ACTIVE_START + 40..SAMPLES_PER_LINE - 40)
+                .map(|k| (sig[100 * SAMPLES_PER_LINE + k] - BLANKING_V) / IRE_V - 50.0)
+                .collect();
+            (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
+        };
+        assert!(rms(1.0) < 0.85 * rms(0.0), "{} {}", rms(1.0), rms(0.0));
+    }
+
+    #[test]
+    fn dropout_counts_follow_the_rate() {
+        let c = TapeFm { dropouts_per_min: Some(20.0), ..cfg() };
+        let total: usize = (0..3600u64).map(|f| field_dropouts(&c, f).len()).sum();
+        let counted: usize = (0..3600u64)
+            .flat_map(|f| field_dropouts(&c, f))
+            .filter(|(d, _)| (d.x1 - d.x0) as f32 >= 15e-6 * crate::constants::SAMPLE_RATE as f32 && d.depth_db >= 16.0)
+            .count();
+        // One minute of fields: about 20 counted, 350 in all.
+        assert!((10..35).contains(&counted), "{counted}");
+        assert!(total > 200, "{total}");
     }
 }

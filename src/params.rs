@@ -362,6 +362,47 @@ pub static SPECS: &[ParamSpec] = &[
         kind: num(0.0, 3.0, 0.3),
     },
     ParamSpec {
+        id: "white-clip",
+        label: "White clip",
+        help: "FM tape model: the recorder's white clip after pre-emphasis, in % of the sync-to-white span above \
+               the sync tip (VHS standard 160, HQ decks 170–200). Large sharp edges overshoot it and are cut, so \
+               they come out softened with a trail to the right; a higher clip gives crisper bright edges.",
+        unit: "%",
+        group: Group::Tape,
+        kind: num_def(120.0, 220.0, 160.0),
+    },
+    ParamSpec {
+        id: "dark-clip",
+        label: "Dark clip",
+        help: "FM tape model: the recorder's dark clip after pre-emphasis, in % of the sync-to-white span below \
+               the sync tip (VHS standard 40 ± 10). It cuts the undershoot of edges falling to black: lower \
+               values leave a lighter trail after bright objects.",
+        unit: "%",
+        group: Group::Tape,
+        kind: num_def(20.0, 60.0, 40.0),
+    },
+    ParamSpec {
+        id: "nl-emphasis",
+        label: "Nonlinear emphasis",
+        help: "Opt-in, FM tape model. Nonlinear emphasis (0–1; always used in EP, deck-dependent in SP): extra \
+               boost for small high-frequency signals on record, undone on playback. Tape noise on flat, \
+               low-detail areas drops by up to about 7 dB while noise beside large edges stays (edge noise).",
+        unit: "",
+        group: Group::Tape,
+        kind: num(0.0, 1.0, 1.0),
+    },
+    ParamSpec {
+        id: "tape-snr",
+        label: "Tape S/N",
+        help: "Opt-in, FM tape model. Luma signal-to-noise ratio of the tape noise in dB (decks: 43–45 SP, about \
+               41 LP/EP; worn tapes lower). The noise is added in the emphasised FM domain, so after de-emphasis \
+               it rises with frequency up to the luma lowpass: fine, horizontally streaky grain, about the same \
+               in dark and bright areas, a little stronger in whites and beside large edges.",
+        unit: "dB",
+        group: Group::Tape,
+        kind: num(25.0, 55.0, 43.0),
+    },
+    ParamSpec {
         id: "head-smear",
         label: "Head-wear smear",
         help: "Worn-head symmetric luma blur (0.3–1.0). Soft horizontal smudging that varies in bands down the frame.",
@@ -430,10 +471,32 @@ pub static SPECS: &[ParamSpec] = &[
     ParamSpec {
         id: "tape-dropout-rate",
         label: "Dropouts",
-        help: "Average tape dropouts per frame (2–20). Short white streaks or repeated line segments.",
+        help: "Dropouts of the original model, average per frame. Short white streaks or repeated line segments. \
+               Real tapes have about 5–30 counted dropouts per minute (well under 0.1 per frame); Dropouts per \
+               minute is the research-based model.",
         unit: "/frame",
         group: Group::NoiseDropouts,
         kind: num(0.0, 30.0, 2.0),
+    },
+    ParamSpec {
+        id: "dropouts",
+        label: "Dropouts per minute",
+        help: "Opt-in, FM tape model. Dropouts per minute as the industry counts them (at least 15 µs long and \
+               16 dB deep; typical 5–30, cheap or worn stock more); shorter and shallower ones are added in \
+               proportion, most 1–2 µs long. Each is a white or black streak with a soft tail to the right, or \
+               with a dropout compensator a colourless repeat of the line above (Dropout compensator).",
+        unit: "/min",
+        group: Group::NoiseDropouts,
+        kind: num(0.0, 200.0, 20.0),
+    },
+    ParamSpec {
+        id: "dropout-span",
+        label: "Dropout span",
+        help: "FM tape model: most consecutive fields one tape defect hits (1 for SP; 2 for LP; 3–4 for EP, whose \
+               tracks are a third as wide, so the same dropout repeats in the next fields).",
+        unit: "fields",
+        group: Group::NoiseDropouts,
+        kind: Kind::Number { min: 1.0, max: 4.0, default: Some(1.0), typical: 1.0, integer: true },
     },
     ParamSpec {
         id: "tape-dropout-len",
@@ -993,6 +1056,12 @@ impl ParamValues {
                 _ => HeadSwitchAfter::Black,
             },
             flagging: None,
+            white_clip: 160.0,
+            dark_clip: 40.0,
+            nl_emphasis: None,
+            tape_snr: None,
+            dropouts: None,
+            dropout_span: 1,
             tape_model: match self.choice("tape-model") {
                 "fm" => TapeModel::Fm,
                 _ => TapeModel::Classic,
@@ -1023,6 +1092,12 @@ impl ParamValues {
         // Stages with their own random streams (drawn after everything
         // above, so older parameter sets keep their exact values).
         fx.deck_nc = s("deck-nc", rng);
+        fx.white_clip = req("white-clip").sample(rng);
+        fx.dark_clip = req("dark-clip").sample(rng);
+        fx.nl_emphasis = s("nl-emphasis", rng);
+        fx.tape_snr = s("tape-snr", rng);
+        fx.dropouts = s("dropouts", rng);
+        fx.dropout_span = req("dropout-span").sample(rng).round().max(1.0) as usize;
         fx.deck_ynr = s("deck-ynr", rng);
         fx.deck_cnr = s("deck-cnr", rng);
         fx.head_switch_point = s("head-switch-point", rng);
@@ -1107,6 +1182,12 @@ impl ParamValues {
         opt("deck_sharpness", "deck-sharpness", fx.deck_sharpness);
         opt("deck_dnr", "deck-dnr", fx.deck_dnr);
         opt("deck_nc", "deck-nc", fx.deck_nc);
+        opt("white_clip", "white-clip", Some(fx.white_clip));
+        opt("dark_clip", "dark-clip", Some(fx.dark_clip));
+        opt("nl_emphasis", "nl-emphasis", fx.nl_emphasis);
+        opt("tape_snr", "tape-snr", fx.tape_snr);
+        opt("dropouts", "dropouts", fx.dropouts);
+        opt("dropout_span", "dropout-span", Some(fx.dropout_span as f32));
         opt("deck_ynr", "deck-ynr", fx.deck_ynr);
         opt("deck_cnr", "deck-cnr", fx.deck_cnr);
         opt("head_switch_point", "head-switch-point", fx.head_switch_point);
