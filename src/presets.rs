@@ -87,6 +87,7 @@ pub static BUILTIN: &[BuiltinPreset] = &[
             ("chroma-delay-v", "1"),
             ("wobble", "1..1.5"),
             ("temporal-coherence", "1"),
+            ("deck-nc", "6"),
         ]),
     },
     BuiltinPreset {
@@ -105,6 +106,7 @@ pub static BUILTIN: &[BuiltinPreset] = &[
             ("chroma-delay-v", "0..1"),
             ("wobble", "0.5..1"),
             ("temporal-coherence", "1"),
+            ("deck-nc", "6"),
         ]),
     },
     BuiltinPreset {
@@ -123,6 +125,7 @@ pub static BUILTIN: &[BuiltinPreset] = &[
             ("chroma-delay-v", "0"),
             ("wobble", "0.3..0.6"),
             ("temporal-coherence", "1"),
+            ("deck-nc", "6"),
         ]),
     },
     BuiltinPreset {

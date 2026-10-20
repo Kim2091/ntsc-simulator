@@ -26,6 +26,7 @@ use crate::encoder::Wire;
 use crate::filters;
 use crate::profile;
 use crate::simd::multiversion;
+use crate::vhs::{self, DeckLuma};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Ghost configuration
@@ -163,6 +164,10 @@ pub struct SignalEffects {
     /// Deck recursive (temporal) noise reduction, applied to decoded frames
     /// in frame order by the pipeline.  `None` = off.
     pub deck_dnr: Option<f32>,
+    /// Seed of the per-stage random streams of the stages in `vhs`.
+    pub stage_seed: u64,
+    /// Deck noise canceller limiter threshold in IRE.  `None` = off.
+    pub deck_nc: Option<f32>,
 }
 
 /// Default number of active lines per field affected by head switching.
@@ -192,6 +197,12 @@ impl SignalEffects {
             || self.wobble.is_some()
             || self.v_jitter.is_some()
             || self.deck_sharpness.is_some()
+            || self.deck_luma().is_active()
+    }
+
+    /// Settings of the deck's playback luma circuits.
+    fn deck_luma(&self) -> DeckLuma {
+        DeckLuma { nc_ire: self.deck_nc.unwrap_or(0.0).max(0.0) }
     }
 
     /// Settings for the playback chroma path; zero turns a stage off.
@@ -369,6 +380,17 @@ impl SignalEffects {
             let _p = profile::scope("fx head switch");
             run(wires, rng, &all, &mut |s, _, rng| {
                 apply_head_switch(s, strength, self.head_switch_lines, 1.0 - 0.75 * tbc, rng, &clock)
+            });
+        }
+        // The deck's playback luma circuits act on everything the tape and
+        // the heads produced.
+        let deck_luma = self.deck_luma();
+        if deck_luma.is_active() {
+            let _p = profile::scope("fx deck luma (nc/ynr/peaking)");
+            each(wires, &mut |s, w| {
+                if luma_on(w) {
+                    vhs::apply_deck_luma(s, &deck_luma, w == Wire::Luma);
+                }
             });
         }
         if let Some(amp) = self.noise {
@@ -600,7 +622,7 @@ const RINGING_FILTER_TAPS: usize = 91;
 /// Apply FIR filter in-place via direct convolution with edge extension.
 ///
 /// `scratch` is reused across calls to avoid repeated allocation.
-fn apply_fir_inplace(buf: &mut [f32], kernel: &[f32], scratch: &mut Vec<f32>) {
+pub(crate) fn apply_fir_inplace(buf: &mut [f32], kernel: &[f32], scratch: &mut Vec<f32>) {
     let n = buf.len();
     let k = kernel.len();
     let half = k / 2;
@@ -698,7 +720,7 @@ fn apply_vhs_tape_path(
 /// Split one line into luma and chroma with the 2-sample comb.  On an
 /// S-Video Y wire (`full_luma`) there is no chroma, so the whole signal is
 /// luma: luma-domain effects then act on all of it.
-fn comb_split(line: &[f32], luma: &mut [f32], chroma: &mut [f32], full_luma: bool) {
+pub(crate) fn comb_split(line: &[f32], luma: &mut [f32], chroma: &mut [f32], full_luma: bool) {
     if full_luma {
         luma.copy_from_slice(line);
         chroma.fill(0.0);
@@ -1062,7 +1084,7 @@ pub fn splitmix64(mut x: u64) -> u64 {
 }
 
 /// Hash of (seed, key, knot) mapped to [−1, 1].
-fn hash_signed(seed: u64, key: u64, knot: i64) -> f32 {
+pub(crate) fn hash_signed(seed: u64, key: u64, knot: i64) -> f32 {
     let h = splitmix64(seed ^ splitmix64(key ^ splitmix64(knot as u64)));
     (h >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
 }
@@ -1070,7 +1092,7 @@ fn hash_signed(seed: u64, key: u64, knot: i64) -> f32 {
 /// Smooth 1-D value noise in [−1, 1]: random values at integer `t`,
 /// joined with a smoothstep.  The same arguments always give the same
 /// value, so any frame can be computed on its own.
-fn drift(seed: u64, key: u64, t: f64) -> f32 {
+pub(crate) fn drift(seed: u64, key: u64, t: f64) -> f32 {
     let k0 = t.floor();
     let f = (t - k0) as f32;
     let w = f * f * (3.0 - 2.0 * f);
@@ -1153,13 +1175,13 @@ impl TapeClock {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Voltage of one IRE unit (blanking = 0 IRE, sync tip = −40 IRE).
-const IRE_V: f32 = BLANKING_V / 40.0;
+pub(crate) const IRE_V: f32 = BLANKING_V / 40.0;
 
 /// First and one-past-last absolute line of the active picture in each field.
-const FIELD_ACTIVE_LINES: [(usize, usize); 2] = [(20, 260), (283, 523)];
+pub(crate) const FIELD_ACTIVE_LINES: [(usize, usize); 2] = [(20, 260), (283, 523)];
 
 /// Draw a standard-normal sample.
-fn randn(rng: &mut impl Rng) -> f32 {
+pub(crate) fn randn(rng: &mut impl Rng) -> f32 {
     Normal::new(0.0f32, 1.0).unwrap().sample(rng)
 }
 
@@ -1169,7 +1191,7 @@ fn randn(rng: &mut impl Rng) -> f32 {
 /// within the line; the return value is `φ`.  Correlating against
 /// `cos(π/2·n)` gives `A/2·cos φ` per sample, and against `sin(π/2·n)`
 /// gives `−A/2·sin φ`.
-fn measure_burst_phase(line: &[f32]) -> f32 {
+pub(crate) fn measure_burst_phase(line: &[f32]) -> f32 {
     let cos_lut: [f32; 4] = [1.0, 0.0, -1.0, 0.0];
     let sin_lut: [f32; 4] = [0.0, 1.0, 0.0, -1.0];
     let mut c = 0.0f32;
@@ -1530,7 +1552,7 @@ fn apply_head_switch<R: Rng>(
 
 /// Blend `row[start..start + len]` (clipped to the row) toward `level(j)`
 /// by `mix`, with raised-cosine edges `ramp` samples long.
-fn blend_segment(row: &mut [f32], start: usize, len: usize, ramp: f32, level: impl Fn(usize) -> f32, mix: f32) {
+pub(crate) fn blend_segment(row: &mut [f32], start: usize, len: usize, ramp: f32, level: impl Fn(usize) -> f32, mix: f32) {
     let end = (start + len).min(row.len());
     for j in start.min(end)..end {
         let d = (j - start).min(end - 1 - j) as f32;
@@ -2033,7 +2055,7 @@ const SHIFT_TAPS: usize = 2 * SHIFT_HALF_TAPS as usize;
 /// Linear interpolation would not do: at 4×fsc it scales the subcarrier by
 /// `sqrt((1−f)² + f²)`, down to −3 dB at half a sample, so lines with
 /// different fractional shifts would decode with different saturation.
-fn shift_segment(line: &mut [f32], lo: usize, hi: usize, shift: f32) {
+pub(crate) fn shift_segment(line: &mut [f32], lo: usize, hi: usize, shift: f32) {
     if shift.abs() < 1e-6 {
         return;
     }

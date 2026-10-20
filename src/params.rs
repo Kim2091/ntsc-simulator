@@ -597,6 +597,14 @@ pub static SPECS: &[ParamSpec] = &[
         kind: num(0.0, 1.0, 0.5),
     },
     ParamSpec {
+        id: "deck-nc",
+        label: "Noise canceller",
+        help: "Opt-in. The deck's luma noise canceller (coring): high-frequency detail smaller than this many IRE                (typical 4–10) is removed together with the noise. Flat areas look clean and slightly waxy, fine                low-contrast texture (skin, fabric, grass) disappears, strong edges keep their noise. Nearly every                VCR from the mid-80s has one.",
+        unit: "IRE",
+        group: Group::Deck,
+        kind: num(0.0, 15.0, 7.0),
+    },
+    ParamSpec {
         id: "deck-sharpness",
         label: "Deck sharpness",
         help: "Deck picture / sharpness control (−1 to 1): negative softens, 0 is the edit setting (no enhancement), \
@@ -887,6 +895,8 @@ impl ParamValues {
             v_jitter: None,
             deck_sharpness: None,
             deck_dnr: None,
+            stage_seed: 0,
+            deck_nc: None,
         };
         if fx.wobble.is_some() {
             fx.wobble_rate = req("wobble-rate").sample(rng);
@@ -905,6 +915,13 @@ impl ParamValues {
         fx.v_jitter = s("v-jitter", rng);
         fx.deck_sharpness = s("deck-sharpness", rng);
         fx.deck_dnr = s("deck-dnr", rng);
+        // Stages with their own random streams (drawn after everything
+        // above, so older parameter sets keep their exact values).
+        fx.deck_nc = s("deck-nc", rng);
+        fx.stage_seed = match self.seed {
+            Some(seed) => mix_seed(seed, 0x57A6E),
+            None => rng.random(),
+        };
         fx
     }
 
@@ -980,6 +997,7 @@ impl ParamValues {
         opt("v_jitter", "v-jitter", fx.v_jitter);
         opt("deck_sharpness", "deck-sharpness", fx.deck_sharpness);
         opt("deck_dnr", "deck-dnr", fx.deck_dnr);
+        opt("deck_nc", "deck-nc", fx.deck_nc);
         parts
     }
 
