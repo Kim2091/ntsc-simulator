@@ -86,6 +86,10 @@ pub struct TapeFm {
     pub bw_inversion: f32,
     /// Level difference between the two heads, as a fraction.
     pub head_level_step: f32,
+    /// Simulate the FM RF channel itself (modulate, head and tape
+    /// response, RF noise, limiter and demodulator) instead of adding
+    /// shaped noise in the emphasised domain.
+    pub rf: bool,
     /// Seed of the per-stage random streams, and the frame number.
     pub seed: u64,
     pub frame: u64,
@@ -343,6 +347,10 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
         let mut clicks = FastNoise::new(stage_seed(cfg.seed, cfg.frame, KEY_CLICKS));
         let mut white_n = vec![0.0f32; REGION_LEN + 1];
         let mut line = vec![0.0f32; REGION_LEN];
+        let mut rf_channel = cfg.rf.then(|| {
+            let target = 100.0 * 10f32.powf(-cfg.snr_db.unwrap_or(45.0) / 20.0);
+            RfChannel::new(stage_seed(cfg.seed, cfg.frame, KEY_NOISE), target, &playback, de)
+        });
         let mut prev = vec![0.0f32; REGION_LEN];
         for gi in 0..groups.len() {
             let n_lanes = groups[gi].lines.len();
@@ -360,7 +368,14 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
                     None if loss > 0.0 => base * (m - 1.0),
                     None => 0.0,
                 };
-                if s_line > 0.0 {
+                let field = usize::from(abs >= FIELD_ACTIVE_LINES[1].0);
+                if let Some(rf) = rf_channel.as_mut() {
+                    let half = groups_lines.len() / 2;
+                    let other = if gi >= half { gi - half } else { gi + half };
+                    let o = recorded.get(other).map(|o| (o.as_slice(), l));
+                    let line_drops: Vec<Dropout> = dropouts.iter().filter(|d| d.line == abs).copied().collect();
+                    rf.line(&mut line, o, loss, &line_drops, field, cfg);
+                } else if s_line > 0.0 {
                     noise.fill(&mut white_n);
                     for j in 0..REGION_LEN {
                         // Higher carrier (brighter, or an emphasised
@@ -369,11 +384,10 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
                         line[j] += s_line * level * (white_n[j + 1] - FM_NOISE_SHAPE * white_n[j]);
                     }
                 }
-                if loss > 1.0 {
+                if loss > 1.0 && rf_channel.is_none() {
                     rf_line_loss(&mut line, loss, &mut clicks, white, dark);
                 }
-                let field = usize::from(abs >= FIELD_ACTIVE_LINES[1].0);
-                if !recorded.is_empty() {
+                if !recorded.is_empty() && rf_channel.is_none() {
                     // Group `gi` of one field and of the other differ by
                     // half the groups.
                     let half = groups_lines.len() / 2;
@@ -391,7 +405,16 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
                     inversion(&mut line, cfg.bw_inversion, loss, white, dark, &mut inversions);
                 }
                 for d in dropouts.iter().filter(|d| d.line == abs) {
-                    render_dropout(&mut line, &prev, d, cfg.doc && !first_of_field, sigma.unwrap_or(1.0), &mut noise, white, dark);
+                    if rf_channel.is_some() {
+                        // The RF channel made the streak; the compensator
+                        // still replaces it.
+                        if cfg.doc && !first_of_field && d.depth_db >= FULL_DROPOUT_DB {
+                            let from = (d.x0 + DOC_DELAY).min(d.x1);
+                            line[from..d.x1].copy_from_slice(&prev[from..d.x1]);
+                        }
+                    } else {
+                        render_dropout(&mut line, &prev, d, cfg.doc && !first_of_field, sigma.unwrap_or(1.0), &mut noise, white, dark);
+                    }
                 }
                 for j in 0..REGION_LEN {
                     g.luma[j * LANES + l] = line[j];
@@ -520,6 +543,236 @@ fn crosstalk_beats(line: &mut [f32], other: &[f32], l: usize, cfg: &TapeFm, fiel
         let diff = *v - other[j * LANES + l];
         phase += std::f32::consts::TAU * (HZ_PER_IRE * diff + offset) * dt;
         *v += r * diff * phase.cos();
+    }
+}
+
+/// RF sample rate: twice the video rate (8 × fsc, as a CX capture card).
+const RF_RATE: f64 = 2.0 * crate::constants::SAMPLE_RATE;
+/// FM carrier at the sync tip (−40 IRE).
+const SYNC_TIP_HZ: f32 = 3.4e6;
+/// Head and tape response: the upper FM sideband falls off above about
+/// 5.5 MHz; the record highpass clears the colour-under band below 1.2 MHz.
+const RF_LOWPASS_HZ: f64 = 5.5e6;
+const RF_HIGHPASS_HZ: f64 = 1.2e6;
+
+/// The FM channel itself (`--tape-model rf`).  Per line, at 8 × fsc:
+///   1. the emphasised luma sets the carrier frequency (3.4 MHz at the
+///      sync tip, 4.4 MHz at white, 7.14 kHz per IRE; the clips limit it
+///      to about 3.0-5.0 MHz) and a phasor is rotated by it;
+///   2. the head and tape response (highpass 1.2 MHz, lowpass 5.5 MHz,
+///      so the upper sideband is weaker than the lower one), the RF level
+///      (head contact loss, dropouts) and the neighbouring track's carrier
+///      (luma crosstalk, at the given ratio) shape it;
+///   3. white RF noise is added (calibrated so that a flat 50 IRE field
+///      gives the tape S/N after de-emphasis);
+///   4. a limiter and an FM demodulator (the phase step between samples)
+///      recover the frequency, and pairs of samples are averaged back to
+///      4 × fsc.
+/// FM noise, its triangular spectrum, clicks when the carrier is weak,
+/// streaks in dropouts and the beats of crosstalk all come out of this
+/// instead of being added separately.
+struct RfChannel {
+    noise: FastNoise,
+    sigma: f32,
+    shape: [Biquad; 2],
+    re: Vec<f32>,
+    im: Vec<f32>,
+    other_re: Vec<f32>,
+    other_im: Vec<f32>,
+    amp: Vec<f32>,
+    other_line: Vec<f32>,
+}
+
+impl RfChannel {
+    fn new(seed: u64, target_ire: f32, playback: &[Biquad], de: Biquad) -> Self {
+        let mut ch = Self {
+            noise: FastNoise::new(seed ^ 0x52_46),
+            sigma: 0.0,
+            shape: [
+                Biquad::highpass1_at(RF_HIGHPASS_HZ, RF_RATE),
+                Biquad::lowpass_at(RF_LOWPASS_HZ, std::f64::consts::FRAC_1_SQRT_2, RF_RATE),
+            ],
+            re: Vec::new(),
+            im: Vec::new(),
+            other_re: Vec::new(),
+            other_im: Vec::new(),
+            amp: Vec::new(),
+            other_line: Vec::new(),
+        };
+        // Calibrate: the output noise of a flat 50 IRE line at a known RF
+        // noise level (the channel is linear in the noise at good CNR).
+        let probe = 0.02;
+        ch.sigma = probe;
+        let mut sum2 = 0.0f64;
+        let mut n = 0.0f64;
+        let cfg_free = RfLine { loss_db: 0.0, crosstalk: 0.0, interleave: 0.0 };
+        for _ in 0..6 {
+            let mut line = vec![50.0f32; REGION_LEN];
+            ch.process(&mut line, None, &cfg_free, &[]);
+            for s in playback {
+                s.run(&mut line);
+            }
+            de.run(&mut line);
+            for &v in &line[200..REGION_LEN - 50] {
+                sum2 += ((v - 50.0) as f64).powi(2);
+                n += 1.0;
+            }
+        }
+        let measured = (sum2 / n).sqrt() as f32;
+        ch.sigma = probe * target_ire / measured.max(1e-6);
+        ch
+    }
+
+    fn line(&mut self, line: &mut [f32], other: Option<(&[f32], usize)>, loss_db: f32, drops: &[Dropout], field: usize, cfg: &TapeFm) {
+        let mut other_line = std::mem::take(&mut self.other_line);
+        other_line.clear();
+        if let Some((o, l)) = other {
+            other_line.extend((0..REGION_LEN).map(|j| o[j * LANES + l]));
+        }
+        let rl = RfLine {
+            loss_db,
+            crosstalk: cfg.luma_crosstalk,
+            interleave: if cfg.ep_interleave == 0.0 {
+                0.0
+            } else if field == 0 {
+                0.5 * INTERLEAVE_HZ
+            } else {
+                -0.5 * INTERLEAVE_HZ
+            },
+        };
+        self.process(line, (!other_line.is_empty()).then_some(other_line.as_slice()), &rl, drops);
+        self.other_line = other_line;
+    }
+
+    /// Modulate, pass the channel, demodulate one line (IRE, emphasised).
+    fn process(&mut self, line: &mut [f32], other: Option<&[f32]>, rl: &RfLine, drops: &[Dropout]) {
+        let n = line.len();
+        let n2 = 2 * n;
+        let k = std::f32::consts::TAU / RF_RATE as f32;
+        let hz_ire = 1.0e6 / 140.0;
+        let freq = |e: f32| SYNC_TIP_HZ + (e + 40.0) * hz_ire;
+        // Carrier amplitude: RF loss, dropouts (with 0.2 µs edges).
+        self.amp.clear();
+        self.amp.resize(n2, 10f32.powf(-rl.loss_db / 20.0));
+        for d in drops {
+            let g = 10f32.powf(-d.depth_db / 20.0);
+            let ramp = 6.0;
+            for j in (2 * d.x0).saturating_sub(6)..(2 * d.x1 + 6).min(n2) {
+                let into = (j as f32 - (2 * d.x0) as f32 + ramp).min((2 * d.x1) as f32 + ramp - j as f32) / ramp;
+                let w = into.clamp(0.0, 1.0);
+                self.amp[j] *= 1.0 - w * (1.0 - g);
+            }
+        }
+        modulate(line, rl.interleave, freq, k, Some(&self.amp), 1.0, &mut self.re, &mut self.im);
+        if let (Some(o), true) = (other, rl.crosstalk > 0.0) {
+            modulate(o, -rl.interleave, freq, k, None, rl.crosstalk, &mut self.other_re, &mut self.other_im);
+            for j in 0..n2 {
+                self.re[j] += self.other_re[j];
+                self.im[j] += self.other_im[j];
+            }
+        }
+        for s in &self.shape {
+            s.run(&mut self.re);
+            s.run(&mut self.im);
+        }
+        for j in 0..n2 {
+            self.re[j] += self.sigma * self.noise.normal();
+            self.im[j] += self.sigma * self.noise.normal();
+        }
+        // Limiter and demodulator: the phase step between samples.
+        let mut prev = (self.re[0], self.im[0]);
+        let mut out_prev = line[0];
+        for j in 0..n2 {
+            let (a, b) = (self.re[j], self.im[j]);
+            let (x, y) = (a * prev.0 + b * prev.1, b * prev.0 - a * prev.1);
+            prev = (a, b);
+            let f = fast_atan2(y, x) / k - rl.interleave;
+            let ire = ((f - SYNC_TIP_HZ) / hz_ire - 40.0).clamp(-140.0, 280.0);
+            if j % 2 == 1 {
+                line[j / 2] = 0.5 * (out_prev + ire);
+            }
+            out_prev = ire;
+        }
+    }
+}
+
+/// Settings of one line of the RF channel.
+struct RfLine {
+    loss_db: f32,
+    crosstalk: f32,
+    /// Carrier offset of this head (EP interleave), Hz.
+    interleave: f32,
+}
+
+/// FM-modulate `e` (IRE, 4 × fsc) at 8 × fsc into an analytic carrier of
+/// amplitude `gain` × `amp[j]` (`amp` absent: 1), in `re` / `im`.
+#[allow(clippy::too_many_arguments)]
+fn modulate(
+    e: &[f32],
+    offset: f32,
+    freq: impl Fn(f32) -> f32,
+    k: f32,
+    amp: Option<&[f32]>,
+    gain: f32,
+    re: &mut Vec<f32>,
+    im: &mut Vec<f32>,
+) {
+    let n2 = 2 * e.len();
+    re.resize(n2, 0.0);
+    im.resize(n2, 0.0);
+    let (mut pr, mut pi) = (1.0f32, 0.0f32);
+    for j in 0..n2 {
+        // Linear interpolation to the RF rate.
+        let a = e[j / 2];
+        let b = e[(j / 2 + 1).min(e.len() - 1)];
+        let v = if j % 2 == 0 { a } else { 0.5 * (a + b) };
+        let w = k * (freq(v) + offset);
+        let (s, c) = sin_cos_small(w);
+        let nr = pr * c - pi * s;
+        pi = pr * s + pi * c;
+        pr = nr;
+        if j % 64 == 63 {
+            let m = 1.0 / (pr * pr + pi * pi).sqrt();
+            pr *= m;
+            pi *= m;
+        }
+        let a = gain * amp.map_or(1.0, |a| a[j]);
+        re[j] = a * pr;
+        im[j] = a * pi;
+    }
+}
+
+/// sin and cos of a small angle (|w| < 1.6) by Taylor series, accurate to
+/// about 1e-7.
+#[inline]
+fn sin_cos_small(w: f32) -> (f32, f32) {
+    let w2 = w * w;
+    let s = w * (1.0 - w2 / 6.0 * (1.0 - w2 / 20.0 * (1.0 - w2 / 42.0 * (1.0 - w2 / 72.0))));
+    let c = 1.0 - w2 / 2.0 * (1.0 - w2 / 12.0 * (1.0 - w2 / 30.0 * (1.0 - w2 / 56.0 * (1.0 - w2 / 90.0))));
+    (s, c)
+}
+
+/// atan2 with a minimax polynomial, error about 1e-5 rad.
+#[inline]
+fn fast_atan2(y: f32, x: f32) -> f32 {
+    let (ax, ay) = (x.abs(), y.abs());
+    let (num, den, swap) = if ay > ax { (ax, ay, true) } else { (ay, ax, false) };
+    if den == 0.0 {
+        return 0.0;
+    }
+    let t = num / den;
+    let t2 = t * t;
+    let mut r = t * (0.999_977_26 + t2 * (-0.332_623_47 + t2 * (0.193_543_46 + t2 * (-0.116_432_87 + t2 * (0.052_653_32 + t2 * -0.011_721_2)))));
+    if swap {
+        r = std::f32::consts::FRAC_PI_2 - r;
+    }
+    if x < 0.0 {
+        r = std::f32::consts::PI - r;
+    }
+    if y < 0.0 {
+        -r
+    } else {
+        r
     }
 }
 
@@ -676,6 +929,7 @@ mod tests {
             luma_crosstalk: 0.0,
             bw_inversion: 0.0,
             head_level_step: 0.0,
+            rf: false,
             seed: 1,
             frame: 0,
         }
@@ -737,6 +991,23 @@ mod tests {
         }
         let snr = 20.0 * (100.0 / (sum2 / n).sqrt()).log10();
         assert!((snr - 43.0).abs() < 0.5, "{snr}");
+    }
+
+    #[test]
+    fn rf_channel_reproduces_levels_and_noise() {
+        // A flat field comes back at its level with the set S/N.
+        let (mut sig, _) = step_signal(50.0, 50.0);
+        let c = TapeFm { snr_db: Some(43.0), rf: true, ..cfg() };
+        apply_tape_fm(&mut sig, &c, Wire::Luma);
+        let v: Vec<f32> = (100..250)
+            .flat_map(|line| (crate::constants::ACTIVE_START + 60..SAMPLES_PER_LINE - 40).map(move |k| (line, k)))
+            .map(|(line, k)| (sig[line * SAMPLES_PER_LINE + k] - BLANKING_V) / IRE_V)
+            .collect();
+        let mean = v.iter().sum::<f32>() / v.len() as f32;
+        let rms = (v.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / v.len() as f32).sqrt();
+        assert!((mean - 50.0).abs() < 0.5, "{mean}");
+        let snr = 20.0 * (100.0 / rms).log10();
+        assert!((snr - 43.0).abs() < 1.0, "{snr}");
     }
 
     #[test]

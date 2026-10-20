@@ -31,6 +31,21 @@ impl Biquad {
         Self::from_f64((1.0 - cs) / 2.0 / a0, (1.0 - cs) / a0, (1.0 - cs) / 2.0 / a0, -2.0 * cs / a0, (1.0 - alpha) / a0)
     }
 
+    /// `lowpass` at sample rate `fs`.
+    pub fn lowpass_at(fc: f64, q: f64, fs: f64) -> Self {
+        let w = 2.0 * std::f64::consts::PI * fc / fs;
+        let (sn, cs) = w.sin_cos();
+        let alpha = sn / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        Self::from_f64((1.0 - cs) / 2.0 / a0, (1.0 - cs) / a0, (1.0 - cs) / 2.0 / a0, -2.0 * cs / a0, (1.0 - alpha) / a0)
+    }
+
+    /// One-pole highpass with its −3 dB point at `fc`, at sample rate `fs`.
+    pub fn highpass1_at(fc: f64, fs: f64) -> Self {
+        let k = (std::f64::consts::PI * fc / fs).tan();
+        Self::from_f64(1.0 / (1.0 + k), -1.0 / (1.0 + k), 0.0, (k - 1.0) / (k + 1.0), 0.0)
+    }
+
     /// One-pole lowpass with its −3 dB point at `fc` (bilinear, prewarped).
     pub fn lowpass1(fc: f64) -> Self {
         let k = (std::f64::consts::PI * fc / SAMPLE_RATE).tan();

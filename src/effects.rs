@@ -229,6 +229,8 @@ pub enum TapeModel {
     Classic,
     /// The VHS record and playback circuits (`tape::apply_tape_fm`).
     Fm,
+    /// As `Fm`, with the FM RF channel itself simulated.
+    Rf,
 }
 
 /// Default number of active lines per field affected by head switching.
@@ -403,7 +405,7 @@ impl SignalEffects {
         }
         // With the FM tape model, edge enhancement is part of the source:
         // it is recorded, so the tape path acts on it.
-        if self.tape_model == TapeModel::Fm {
+        if self.tape_model != TapeModel::Classic {
             if let Some(gain) = self.edge_ringing {
                 let _p = profile::scope("fx edge ringing");
                 each(wires, &mut |s, w| {
@@ -414,7 +416,7 @@ impl SignalEffects {
             }
         }
         // VHS tape-path effects
-        if self.tape_model == TapeModel::Fm {
+        if self.tape_model != TapeModel::Classic {
             let _p = profile::scope("fx tape path (fm model)");
             let cfg = TapeFm {
                 luma_bw: self.vhs_luma_bw.unwrap_or(3.0e6),
@@ -432,6 +434,7 @@ impl SignalEffects {
                 luma_crosstalk: 0.1 * self.luma_crosstalk.unwrap_or(0.0).clamp(0.0, 1.0),
                 bw_inversion: self.bw_inversion.unwrap_or(0.0).clamp(0.0, 1.0),
                 head_level_step: 0.01 * self.head_level_step.unwrap_or(0.0),
+                rf: self.tape_model == TapeModel::Rf,
                 seed: self.stage_seed,
                 frame,
             };

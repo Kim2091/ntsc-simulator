@@ -330,10 +330,12 @@ pub static SPECS: &[ParamSpec] = &[
                (legacy output). fm: the record and playback circuits of the format: the recording deck's \
                band-filter luma/chroma split (fine luma near the subcarrier is recorded as cross-colour), the \
                record and playback luma lowpass filters (−10 dB at Luma bandwidth, causal like the analog \
-               circuits) and the colour-under filter. Opt-in; the newer tape stages need it.",
+               circuits) and the colour-under filter. Opt-in; the newer tape stages need it. rf: as fm, but the FM \
+               carrier itself is simulated (modulated at 3.4–4.4 MHz, head and tape response, RF noise, limiter, \
+               demodulator): noise, sparkles, dropout streaks and crosstalk beats come out of the channel. Slower.",
         unit: "",
         group: Group::Tape,
-        kind: Kind::Choice { options: &["classic", "fm"], default: "classic" },
+        kind: Kind::Choice { options: &["classic", "fm", "rf"], default: "classic" },
     },
     ParamSpec {
         id: "vhs-luma-bw",
@@ -1196,6 +1198,7 @@ impl ParamValues {
             tracking_bars: None,
             tape_model: match self.choice("tape-model") {
                 "fm" => TapeModel::Fm,
+                "rf" => TapeModel::Rf,
                 _ => TapeModel::Classic,
             },
             doc: match self.choice("doc") {
