@@ -195,6 +195,7 @@ fn analog_frame(
     effects_active: bool,
 ) -> Vec<u8> {
     let legacy = values.flag("legacy-burst-phase");
+    set_capture_peaking(dec, fx);
     let encode = |enc: &mut Encoder, wire: Wire, out: &mut Vec<f32>, f1: &[u8], f2: Option<&[u8]>, fnum: u32| {
         enc.wire = wire;
         let s = match f2 {
@@ -542,9 +543,28 @@ fn received_signal_tl(
 
 /// Decode a received signal with the 3D comb, given the two frames
 /// before it as received, on the calling worker thread's decoder.
-fn decode_3d_tl(signal: &[f32], prev: &[f32], prev2: &[f32], out_w: usize, out_h: usize, values: &ParamValues) -> Vec<u8> {
+#[allow(clippy::too_many_arguments)]
+fn decode_3d_tl(
+    signal: &[f32],
+    prev: &[f32],
+    prev2: &[f32],
+    out_w: usize,
+    out_h: usize,
+    values: &ParamValues,
+    fx: &SignalEffects,
+) -> Vec<u8> {
     let legacy = values.flag("legacy-burst-phase");
-    TL_DECODER.with(|dec| dec.borrow_mut().decode_frame_3d(signal, prev, prev2, out_w, out_h, legacy).to_vec())
+    TL_DECODER.with(|dec| {
+        let mut dec = dec.borrow_mut();
+        set_capture_peaking(&mut dec, fx);
+        dec.decode_frame_3d(signal, prev, prev2, out_w, out_h, legacy).to_vec()
+    })
+}
+
+/// The capture chip's luma peaking, from the effects.
+fn set_capture_peaking(dec: &mut Decoder, fx: &SignalEffects) {
+    dec.peaking_gain = fx.capture_peaking.unwrap_or(0.0).max(0.0);
+    dec.peaking_hz = fx.capture_peaking_mhz as f64 * 1e6;
 }
 
 /// Stop both ffmpeg processes after a cancel.
@@ -665,7 +685,7 @@ fn roundtrip(
                         // Frame 1 has only frame 0 before it, which stands in
                         // for the frame two back as well.
                         let prev2 = signal(fnum.saturating_sub(2));
-                        decode_3d_tl(signal(fnum), signal(fnum - 1), prev2, out_w, out_h, values)
+                        decode_3d_tl(signal(fnum), signal(fnum - 1), prev2, out_w, out_h, values, &fx)
                     } else {
                         full_frame(i)
                     }

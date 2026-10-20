@@ -35,6 +35,10 @@ pub struct Decoder {
     output: Vec<u8>,
     /// Cached output dimensions for buffer invalidation
     cached_out_dims: (usize, usize),
+    /// Capture-chip luma peaking: gain at the centre frequency (0 = off,
+    /// 1 = +6 dB) and centre frequency in Hz.
+    pub peaking_gain: f32,
+    pub peaking_hz: f64,
 }
 
 impl Decoder {
@@ -69,6 +73,8 @@ impl Decoder {
             q_raw: vec![0.0f32; VISIBLE_LINES * iq_padded_len],
             output: Vec::new(),
             cached_out_dims: (0, 0),
+            peaking_gain: 0.0,
+            peaking_hz: 2.6e6,
         }
     }
 
@@ -293,6 +299,21 @@ impl Decoder {
             ypl,
             &mut self.luma_scratch,
         );
+
+        // Capture-chip peaking: the sample minus the mean of its two
+        // neighbours half a period of the centre frequency away.
+        if self.peaking_gain > 0.0 {
+            let d = (SAMPLE_RATE / (2.0 * self.peaking_hz)).round().max(1.0) as usize;
+            let g = 0.5 * self.peaking_gain;
+            let mut row = vec![0.0f32; ypl];
+            for vis in 0..VISIBLE_LINES {
+                let y = &mut self.y_full[vis * ypl..(vis + 1) * ypl];
+                row.copy_from_slice(y);
+                for n in d..ypl - d {
+                    y[n] = row[n] + g * (row[n] - 0.5 * (row[n - d] + row[n + d]));
+                }
+            }
+        }
 
         // Undo composite voltage scaling on luma
         for v in &mut self.y_full {

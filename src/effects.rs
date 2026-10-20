@@ -208,6 +208,12 @@ pub struct SignalEffects {
     pub head_level_step: Option<f32>,
     /// FM tape model: tape generations (dubs), at least 1.
     pub generations: usize,
+    /// Apply snow, ghosts and attenuation before the tape path (an off-air
+    /// recording) instead of after it.
+    pub reception_before_tape: bool,
+    /// Capture-chip luma peaking gain (0-2) and centre frequency (MHz).
+    pub capture_peaking: Option<f32>,
+    pub capture_peaking_mhz: f32,
     /// Colour-under noise bandwidth in Hz.  `None` = the original noise.
     pub chroma_noise_bw: Option<f32>,
     /// Adjacent-track chroma crosstalk strength (0-1).  `None` = off.
@@ -379,6 +385,22 @@ impl SignalEffects {
             let _p = profile::scope("fx vbi-data");
             run(wires, rng, &luma_on, &mut |s, _, rng| apply_vbi_data(s, strength, sample_rate, rng));
         }
+        // An off-air recording: the reception effects are recorded, so
+        // the tape path band-limits the snow and keeps the ghosts.
+        if self.reception_before_tape {
+            if let Some(amp) = self.noise {
+                let _p = profile::scope("fx noise");
+                run(wires, rng, &all, &mut |s, _, rng| apply_noise(s, amp, rng));
+            }
+            if !self.ghosts.is_empty() {
+                let _p = profile::scope("fx ghosting");
+                run(wires, rng, &all, &mut |s, _, rng| apply_ghosting(s, &self.ghosts, sample_rate, rng));
+            }
+            if let Some(strength) = self.attenuation {
+                let _p = profile::scope("fx attenuation");
+                each(wires, &mut |s, _| apply_attenuation(s, strength));
+            }
+        }
         // With the FM tape model, edge enhancement is part of the source:
         // it is recorded, so the tape path acts on it.
         if self.tape_model == TapeModel::Fm {
@@ -499,17 +521,19 @@ impl SignalEffects {
                 }
             });
         }
-        if let Some(amp) = self.noise {
-            let _p = profile::scope("fx noise");
-            run(wires, rng, &all, &mut |s, _, rng| apply_noise(s, amp, rng));
-        }
-        if !self.ghosts.is_empty() {
-            let _p = profile::scope("fx ghosting");
-            run(wires, rng, &all, &mut |s, _, rng| apply_ghosting(s, &self.ghosts, sample_rate, rng));
-        }
-        if let Some(strength) = self.attenuation {
-            let _p = profile::scope("fx attenuation");
-            each(wires, &mut |s, _| apply_attenuation(s, strength));
+        if !self.reception_before_tape {
+            if let Some(amp) = self.noise {
+                let _p = profile::scope("fx noise");
+                run(wires, rng, &all, &mut |s, _, rng| apply_noise(s, amp, rng));
+            }
+            if !self.ghosts.is_empty() {
+                let _p = profile::scope("fx ghosting");
+                run(wires, rng, &all, &mut |s, _, rng| apply_ghosting(s, &self.ghosts, sample_rate, rng));
+            }
+            if let Some(strength) = self.attenuation {
+                let _p = profile::scope("fx attenuation");
+                each(wires, &mut |s, _| apply_attenuation(s, strength));
+            }
         }
         if let Some(amp) = self.jitter {
             let _p = profile::scope("fx jitter");

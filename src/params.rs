@@ -774,6 +774,16 @@ pub static SPECS: &[ParamSpec] = &[
         kind: Kind::Text,
     },
     ParamSpec {
+        id: "reception-before-tape",
+        label: "Recorded off air",
+        help: "Apply snow, ghosts and attenuation before the tape path, as on an off-air recording: the VCR records \
+               them, so the snow is band-limited and softened by the tape. Off: they come after the tape, like a \
+               VCR's RF output into a TV.",
+        unit: "",
+        group: Group::Reception,
+        kind: Kind::Flag,
+    },
+    ParamSpec {
         id: "attenuation",
         label: "Attenuation",
         help: "Signal attenuation (0–1). Lowers contrast and saturation toward blanking.",
@@ -852,6 +862,24 @@ pub static SPECS: &[ParamSpec] = &[
         unit: "",
         group: Group::Deck,
         kind: num(-1.0, 1.0, 0.0),
+    },
+    ParamSpec {
+        id: "capture-peaking",
+        label: "Capture peaking",
+        help: "Opt-in. The capture chip's luma peaking gain (0–2; 1 = +6 dB at the centre frequency). TVP5150 chips \
+               default to off, SAA7113 to a small boost (about 0.25 at 4.1 MHz). On VHS it mostly lifts noise above \
+               the tape's luma bandwidth: crisper grain, thin halos.",
+        unit: "",
+        group: Group::Deck,
+        kind: num(0.0, 2.0, 0.25),
+    },
+    ParamSpec {
+        id: "capture-peaking-mhz",
+        label: "Capture peaking centre",
+        help: "Centre frequency of the capture peaking in MHz (TVP5150 2.6; SAA7113 2.6, 2.9, 3.8 or 4.1).",
+        unit: "MHz",
+        group: Group::Deck,
+        kind: num_def(1.5, 4.5, 2.6),
     },
     ParamSpec {
         id: "comb",
@@ -1161,6 +1189,9 @@ impl ParamValues {
             bw_inversion: None,
             head_level_step: None,
             generations: 1,
+            reception_before_tape: self.flag("reception-before-tape"),
+            capture_peaking: None,
+            capture_peaking_mhz: 2.6,
             chroma_crosstalk: None,
             tracking_bars: None,
             tape_model: match self.choice("tape-model") {
@@ -1206,6 +1237,8 @@ impl ParamValues {
         fx.bw_inversion = s("bw-inversion", rng);
         fx.head_level_step = s("head-level-step", rng);
         fx.generations = req("generations").sample(rng).round().max(1.0) as usize;
+        fx.capture_peaking = s("capture-peaking", rng);
+        fx.capture_peaking_mhz = req("capture-peaking-mhz").sample(rng);
         fx.tracking_bars = s("tracking-bars", rng);
         fx.dropout_span = req("dropout-span").sample(rng).round().max(1.0) as usize;
         fx.deck_ynr = s("deck-ynr", rng);
@@ -1305,6 +1338,7 @@ impl ParamValues {
         opt("bw_inversion", "bw-inversion", fx.bw_inversion);
         opt("head_level_step", "head-level-step", fx.head_level_step);
         opt("generations", "generations", Some(fx.generations as f32));
+        opt("capture_peaking", "capture-peaking", fx.capture_peaking);
         opt("tracking_bars", "tracking-bars", fx.tracking_bars);
         opt("dropout_span", "dropout-span", Some(fx.dropout_span as f32));
         opt("deck_ynr", "deck-ynr", fx.deck_ynr);
