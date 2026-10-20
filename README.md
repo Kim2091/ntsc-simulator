@@ -599,6 +599,7 @@ Items 1, 4–7 and 12 are the classic model, kept unchanged for the `legacy-*` p
 
 Newest first.
 
+- **GUI playback: no restart loop on an unreadable video**: with **Loop** on, a run that ended without showing a frame restarted ffmpeg on every UI frame; it now stops with a message. Headless playback tests (`playback_combinations_on_real_videos`, `still_preview_with_history_on_real_videos`, ignored by default, videos from `NTSC_PLAY_TEST_VIDEOS`) run every preset, deck, comb and connection, quick restarts, the end of the video and the still preview with its frame history.
 - **GUI playback: pausing after opening another file**: opening a file or the colour bars forgets the last played frame, so a pause right after cannot install the old video's frame with the new video's size (the still preview then rendered a mis-sized frame and its render thread died).
 - **GUI playback: no panic when a settings change is debounced**: the wait before restarting playback is measured once, so the remaining time can no longer underflow (`Duration` subtraction panics, which closed the GUI).
 - **GUI file dialogs no longer block the window**: Open…, Save PNG…, preset Load…/Save… and the Process dialog's File…/Folder…/Browse… run the native dialog on its own thread. Shown inside the UI callback, a dialog stopped winit's event loop and winit buffered every incoming event without a limit while it was open; one such session ran out of memory and closed the GUI (0xc0000409).

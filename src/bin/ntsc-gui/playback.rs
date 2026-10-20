@@ -444,3 +444,137 @@ fn process(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Headless playback runs on real videos, as the GUI drives them.  Run
+    //! with `NTSC_PLAY_TEST_VIDEOS="a.mkv;b.mp4" cargo test --bin ntsc-gui
+    //! -- --ignored --nocapture`.
+
+    use super::*;
+    use crate::params_ui::ParamEditor;
+    use std::path::Path;
+    use ntsc_composite_simulator::presets;
+
+    /// The values the GUI uses for a preset, deck, comb and connection.
+    fn gui_values(preset: &str, deck: Option<&str>, comb: &str, out: &str) -> ParamValues {
+        let mut v = deck.and_then(presets::deck).map(|d| d.to_values()).unwrap_or_default();
+        v.fill_from(&presets::builtin(preset).unwrap().to_values());
+        let mut v = ParamEditor::from_values(&v).to_values();
+        v.set_from_str("comb", comb).unwrap();
+        v.set_from_str("video-out", out).unwrap();
+        v.seed = Some(1);
+        v
+    }
+
+    fn request(path: &Path, first_frame: u64, values: ParamValues, every_frame: bool) -> PlayRequest {
+        let (in_w, in_h, fps, ..) = pipeline::ffprobe_video(path).unwrap();
+        PlayRequest { path: path.to_path_buf(), first_frame, fps, in_w, in_h, out_w: 640, out_h: 480, comb_1h: false, values, every_frame }
+    }
+
+    /// Poll until `want` frames were shown, the video ended or `limit`
+    /// passed; checks every frame's size and order.
+    fn play(pb: &mut Playback, want: usize, limit: Duration) -> (usize, bool) {
+        let t0 = Instant::now();
+        let (mut n, mut last) = (0, None);
+        while t0.elapsed() < limit {
+            let p = pb.poll();
+            if let Some(e) = p.error {
+                panic!("playback error: {e}");
+            }
+            if let Some(f) = p.frame {
+                let r = &pb.request;
+                assert_eq!(f.rgb.len(), r.out_w * r.out_h * 3);
+                assert_eq!(f.src.len(), r.in_w * r.in_h * 3);
+                assert!(last.is_none_or(|l| f.frame > l), "frame {} after {:?}", f.frame, last);
+                last = Some(f.frame);
+                n += 1;
+                if n >= want {
+                    return (n, false);
+                }
+            }
+            if p.ended {
+                return (n, true);
+            }
+            std::thread::sleep(p.wake_in.unwrap_or(Duration::from_millis(2)).min(Duration::from_millis(20)));
+        }
+        (n, false)
+    }
+
+    #[test]
+    #[ignore]
+    fn playback_combinations_on_real_videos() {
+        let Some(list) = std::env::var_os("NTSC_PLAY_TEST_VIDEOS") else { return };
+        let ctx = egui::Context::default();
+        for path in std::env::split_paths(&list) {
+            let (_, _, fps, ..) = pipeline::ffprobe_video(&path).unwrap();
+            let frames = (pipeline::video_duration(&path).unwrap() * fps).floor() as u64;
+            eprintln!("{} ({} frames)", path.display(), frames);
+            let mut k = 0u64;
+            for preset in ["lq", "mq", "hq"] {
+                for deck in [None, Some("deck-basic"), Some("deck-svhs-tbc"), Some("deck-edit")] {
+                    for comb in ["trap", "2sample", "1h", "3d"] {
+                        for out in ["composite", "svideo"] {
+                            k += 1;
+                            let start = (k * 37) % frames;
+                            let v = gui_values(preset, deck, comb, out);
+                            let mut pb = Playback::start(ctx.clone(), request(&path, start, v, k % 2 == 0));
+                            let (n, ended) = play(&mut pb, 4, Duration::from_secs(60));
+                            assert!(n > 0 || ended, "{preset} {deck:?} {comb} {out} from {start}: no frames");
+                            pb.stop(false);
+                        }
+                    }
+                }
+                eprintln!("  {preset}: ok");
+            }
+            // Restarts in quick succession (settings changes, scrubbing),
+            // dropping each playback before it has finished starting.
+            for i in 0..20u64 {
+                let v = gui_values(["lq", "mq", "hq"][i as usize % 3], Some("deck-svhs-tbc"), "3d", "composite");
+                let mut pb = Playback::start(ctx.clone(), request(&path, (i * 53) % frames, v, false));
+                if i % 4 == 3 {
+                    play(&mut pb, 2, Duration::from_secs(30));
+                }
+                pb.stop(false);
+            }
+            // Play into the end, as the loop does, then from the start.
+            let v = gui_values("lq", Some("deck-svhs-tbc"), "trap", "composite");
+            let mut pb = Playback::start(ctx.clone(), request(&path, frames.saturating_sub(12), v.clone(), true));
+            let (_, ended) = play(&mut pb, usize::MAX, Duration::from_secs(60));
+            assert!(ended, "no end of video");
+            drop(pb);
+            let mut pb = Playback::start(ctx.clone(), request(&path, 0, v, false));
+            assert!(play(&mut pb, 3, Duration::from_secs(30)).0 == 3);
+            // Past the end: the reader returns nothing and playback ends.
+            let v = gui_values("lq", None, "trap", "composite");
+            let mut pb = Playback::start(ctx.clone(), request(&path, frames + 50, v, false));
+            assert!(play(&mut pb, 1, Duration::from_secs(30)).1, "no end past the last frame");
+            eprintln!("  restarts, end and loop: ok");
+        }
+    }
+
+    /// The still preview of a video frame with its 8-frame history, as the
+    /// GUI renders it, for every preset and deck.
+    #[test]
+    #[ignore]
+    fn still_preview_with_history_on_real_videos() {
+        let Some(list) = std::env::var_os("NTSC_PLAY_TEST_VIDEOS") else { return };
+        for path in std::env::split_paths(&list) {
+            let (w, h, fps, ..) = pipeline::ffprobe_video(&path).unwrap();
+            for (i, t) in [0.0, 0.1, 2.0, pipeline::video_duration(&path).unwrap() - 0.05].into_iter().enumerate() {
+                for deck in [None, Some("deck-basic"), Some("deck-svhs-tbc"), Some("deck-edit")] {
+                    let v = gui_values(["lq", "mq", "hq", "lq"][i], deck, ["trap", "3d", "1h", "2sample"][i], "composite");
+                    let mut frames = pipeline::grab_video_frames(&path, t, 9, &v).unwrap();
+                    let rgb = frames.pop().unwrap();
+                    let history: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+                    let (out, ow, oh, _) = pipeline::render_preview_sequence(
+                        &history, &rgb, w, h, w as f64 / h as f64, 640, 480, false, &v, (t * fps).round() as u64,
+                    )
+                    .unwrap();
+                    assert_eq!(out.len(), ow * oh * 3);
+                }
+            }
+            eprintln!("{}: still previews ok", path.display());
+        }
+    }
+}

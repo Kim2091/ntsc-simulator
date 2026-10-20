@@ -639,9 +639,15 @@ impl App {
             return;
         }
         if poll.ended {
-            if self.play_loop {
+            // A run that showed nothing (unreadable video) does not loop,
+            // or it would restart ffmpeg on every frame.
+            let shown = self.playback.as_ref().map_or(0, |pb| pb.shown);
+            if self.play_loop && shown > 0 {
                 self.start_playback(ctx, 0);
             } else {
+                if shown == 0 {
+                    self.status = Some((false, "Playback ended without a frame: ffmpeg returned none from here".into()));
+                }
                 self.pause(ctx);
             }
             return;
