@@ -383,7 +383,7 @@ impl App {
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) {
             self.load_preset_file(path);
         } else if pipeline::is_video_path(path) {
-            self.stop_playback();
+            self.stop_playback_for_new_source();
             let duration = pipeline::video_duration(path).unwrap_or(0.0);
             let (w, h, fps) = pipeline::ffprobe_video(path).map(|v| (v.0, v.1, v.2)).unwrap_or((0, 0, 29.97));
             let time = (duration * 0.1).min(10.0);
@@ -395,7 +395,7 @@ impl App {
         } else {
             match image::open(path) {
                 Ok(img) => {
-                    self.stop_playback();
+                    self.stop_playback_for_new_source();
                     let rgb = img.to_rgb8();
                     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
                     self.source = Source::Image(path.to_path_buf());
@@ -552,6 +552,13 @@ impl App {
         }
     }
 
+    /// Stop playback before another source is opened.  The last played
+    /// frame belongs to the old source, so pausing must not keep it.
+    fn stop_playback_for_new_source(&mut self) {
+        self.stop_playback();
+        self.play_shown = None;
+    }
+
     /// Stop playback and keep the last shown frame as the still preview.
     fn pause(&mut self, ctx: &egui::Context) {
         let Some(mut pb) = self.playback.take() else { return };
@@ -565,6 +572,9 @@ impl App {
         let Some((frame, src)) = self.play_shown.take() else { return };
         let values = self.current_values();
         let Source::Video { path, fps, time, w, h, .. } = &mut self.source else { return };
+        if src.len() != *w * *h * 3 {
+            return;
+        }
         *time = frame as f64 / *fps;
         let (path, t, w, h) = (path.clone(), *time, *w, *h);
         self.frame = frame;
@@ -725,7 +735,7 @@ impl App {
                 self.open_dialog(ui.ctx());
             }
             if !matches!(self.source, Source::Bars) && ui.button("Colour bars").on_hover_text("Go back to the built-in test pattern").clicked() {
-                self.stop_playback();
+                self.stop_playback_for_new_source();
                 self.source = Source::Bars;
                 let ctx = ui.ctx().clone();
                 self.set_source_image(&ctx, bars_source());
