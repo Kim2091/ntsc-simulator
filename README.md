@@ -515,6 +515,7 @@ The VHS simulation models both the recording and playback signal paths:
 
 Newest first.
 
+- **3D comb independent of `--threads`**: frame 1 now uses frame 0 as received for both earlier frames, and telecine runs carry the previous batch's frames across batch boundaries, so `--comb 3d` output is the same at any thread count (frame 1 of `--comb 3d` roundtrips changes; nothing else does).
 - **Faster processing, same output**: S-Video runs each tape effect and the encoder's band-limiting once instead of per wire, the 3D comb makes each frame's signal once instead of three times, and the colour-under noise, line shifts, deck noise reduction, decoder resize and DVD mastering are vectorised. On one thread at 640x480: `--preset lq` 16.8 -> 28.5 fps, `legacy-lq` 22 -> 40 fps, `lq --deck deck-svhs-tbc` 11.2 -> 25 fps, `lq --comb 3d` 6 -> 25 fps. Output is bit-identical to before.
 - **Portable builds**: release builds no longer use `target-cpu=native`, so a binary built on a new CPU runs on older ones (no illegal-instruction crashes); hot loops pick AVX2 or SSE2 at run time. Tape-path, ringing and other FIR filters are vectorised; output is unchanged bit for bit.
 - **GUI copy frame and pan limits**: **Copy frame** / Ctrl+C copies the processed preview to the clipboard; zoomed-out frames stay centred and zoomed-in frames cannot be dragged past their edges.

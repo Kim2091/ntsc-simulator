@@ -641,9 +641,9 @@ fn roundtrip(
             )
         };
         let results: Vec<Vec<u8>> = if frame_3d {
-            // From frame 2 on, the 3D comb's previous frames are the two
-            // frames before as received, so each frame's signal is made
-            // once and shared.
+            // From frame 1 on, the 3D comb's previous frames are the frames
+            // before as received, so each frame's signal is made once and
+            // shared.  This keeps the output independent of the batch size.
             let signals: Vec<Vec<f32>> = (0..batch_count)
                 .into_par_iter()
                 .map(|i| received_signal_tl(&frame_pool[i], in_w, in_h, frame_num + i as u32, values, &fx, effects_active))
@@ -658,8 +658,11 @@ fn roundtrip(
                 .into_par_iter()
                 .map(|i| {
                     let fnum = frame_num + i as u32;
-                    if fnum >= 2 {
-                        decode_3d_tl(signal(fnum), signal(fnum - 1), signal(fnum - 2), out_w, out_h, values)
+                    if fnum >= 1 {
+                        // Frame 1 has only frame 0 before it, which stands in
+                        // for the frame two back as well.
+                        let prev2 = signal(fnum.saturating_sub(2));
+                        decode_3d_tl(signal(fnum), signal(fnum - 1), prev2, out_w, out_h, values)
                     } else {
                         full_frame(i)
                     }
@@ -745,6 +748,9 @@ fn roundtrip_telecine(
     progress.log(&format!("  Workers: {}", num_cpus));
 
     let mut ntsc_num = 0u32;
+    // Sources (field 1, field 2) of the last two NTSC frames of the
+    // previous batch, for the 3D comb.
+    let mut last_srcs: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let mut film_idx = 0u32;
     let total_start = Instant::now();
     progress.start(total_frames, prefix);
@@ -802,11 +808,21 @@ fn roundtrip_telecine(
             .enumerate()
             .map(|(j, &(f1_idx, f2_idx, fnum))| {
                 let f2 = (f1_idx != f2_idx).then(|| film_buf[f2_idx].as_slice());
-                // The two previous NTSC frames of this batch (at the start
-                // of a batch the frame itself stands in).
-                let job = |k: usize| if j >= k { (jobs[j - k].0, jobs[j - k].1) } else { (f1_idx, f2_idx) };
+                // The two previous NTSC frames, from this batch or the end
+                // of the previous one (at the start of the video the frame
+                // itself stands in).
                 let src = |(a, b): (usize, usize)| (film_buf[a].as_slice(), (a != b).then(|| film_buf[b].as_slice()));
-                let prev: PrevFrame = Some([src(job(1)), src(job(2))]);
+                let job = |k: usize| -> (&[u8], Option<&[u8]>) {
+                    if j >= k {
+                        src((jobs[j - k].0, jobs[j - k].1))
+                    } else if last_srcs.len() >= k - j {
+                        let (a, b) = &last_srcs[last_srcs.len() - (k - j)];
+                        (a.as_slice(), b.as_deref())
+                    } else {
+                        src((f1_idx, f2_idx))
+                    }
+                };
+                let prev: PrevFrame = Some([job(1), job(2)]);
                 process_frame_tl(
                     &film_buf[f1_idx], f2, prev, in_w, in_h, out_w, out_h, fnum,
                     opts.comb_1h, values, &fx, effects_active,
@@ -829,6 +845,15 @@ fn roundtrip_telecine(
             }
         }
         drop(write_scope);
+
+        // Sources of the last two NTSC frames, oldest first.
+        let tail: Vec<(Vec<u8>, Option<Vec<u8>>)> = jobs[jobs.len().saturating_sub(2)..]
+            .iter()
+            .map(|&(a, b, _)| (film_buf[a].clone(), (a != b).then(|| film_buf[b].clone())))
+            .collect();
+        last_srcs.extend(tail);
+        let excess = last_srcs.len().saturating_sub(2);
+        last_srcs.drain(..excess);
 
         film_idx += film_buf.len() as u32;
         ntsc_num += results.len() as u32;
