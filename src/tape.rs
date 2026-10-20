@@ -346,6 +346,7 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
         let mut noise = FastNoise::new(stage_seed(cfg.seed, cfg.frame, KEY_NOISE));
         let mut clicks = FastNoise::new(stage_seed(cfg.seed, cfg.frame, KEY_CLICKS));
         let mut white_n = vec![0.0f32; REGION_LEN + 1];
+        let mut beat_scratch = Vec::new();
         let mut line = vec![0.0f32; REGION_LEN];
         let mut rf_channel = cfg.rf.then(|| {
             let target = 100.0 * 10f32.powf(-cfg.snr_db.unwrap_or(45.0) / 20.0);
@@ -393,7 +394,7 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
                     let half = groups_lines.len() / 2;
                     let other = if gi >= half { gi - half } else { gi + half };
                     let o = &recorded[other.min(recorded.len() - 1)];
-                    crosstalk_beats(&mut line, o, l, cfg, field, abs);
+                    crosstalk_beats(&mut line, o, l, cfg, field, abs, &mut beat_scratch);
                 }
                 if cfg.ep_interleave != 0.0 {
                     let dc = 0.5 * cfg.ep_interleave * if field == 0 { 1.0 } else { -1.0 };
@@ -533,16 +534,25 @@ fn rf_line_loss(line: &mut [f32], loss_db: f32, clicks: &mut FastNoise, white: f
 /// plus ½ fH with the EP interleave) with an amplitude of the crosstalk
 /// ratio times that difference.  Where the fields differ the picture gets
 /// low-frequency, patterned noise ("orange peel").
-fn crosstalk_beats(line: &mut [f32], other: &[f32], l: usize, cfg: &TapeFm, field: usize, abs: usize) {
+fn crosstalk_beats(line: &mut [f32], other: &[f32], l: usize, cfg: &TapeFm, field: usize, abs: usize, scratch: &mut Vec<f32>) {
     let r = cfg.luma_crosstalk;
     let offset = if cfg.ep_interleave != 0.0 { INTERLEAVE_HZ } else { 0.0 };
     let dt = 1.0 / crate::constants::SAMPLE_RATE as f32;
     // The beat's phase at the start of the line drifts from line to line.
     let mut phase = std::f32::consts::PI * (0.37 * abs as f32 + field as f32);
-    for (j, v) in line.iter_mut().enumerate() {
-        let diff = *v - other[j * LANES + l];
-        phase += std::f32::consts::TAU * (HZ_PER_IRE * diff + offset) * dt;
-        *v += r * diff * phase.cos();
+    let k = std::f32::consts::TAU * dt;
+    let n = line.len();
+    scratch.resize(2 * n, 0.0);
+    let (diff, ph) = scratch.split_at_mut(n);
+    for j in 0..n {
+        diff[j] = line[j] - other[j * LANES + l];
+    }
+    for j in 0..n {
+        phase += k * (HZ_PER_IRE * diff[j] + offset);
+        ph[j] = phase;
+    }
+    for j in 0..n {
+        line[j] += r * diff[j] * fast_cos(ph[j]);
     }
 }
 
@@ -750,6 +760,17 @@ fn sin_cos_small(w: f32) -> (f32, f32) {
     let s = w * (1.0 - w2 / 6.0 * (1.0 - w2 / 20.0 * (1.0 - w2 / 42.0 * (1.0 - w2 / 72.0))));
     let c = 1.0 - w2 / 2.0 * (1.0 - w2 / 12.0 * (1.0 - w2 / 30.0 * (1.0 - w2 / 56.0 * (1.0 - w2 / 90.0))));
     (s, c)
+}
+
+/// cos with range reduction to ±π and a Taylor series, error about 1e-7.
+#[inline]
+fn fast_cos(x: f32) -> f32 {
+    let t = x * (0.5 / std::f32::consts::PI);
+    let y = (t - t.round()) * std::f32::consts::TAU;
+    // cos(y) = −sin(|y| − π/2) for |y| ≤ π.
+    let w = y.abs() - std::f32::consts::FRAC_PI_2;
+    let w2 = w * w;
+    -w * (1.0 - w2 / 6.0 * (1.0 - w2 / 20.0 * (1.0 - w2 / 42.0 * (1.0 - w2 / 72.0 * (1.0 - w2 / 110.0)))))
 }
 
 /// atan2 with a minimax polynomial, error about 1e-5 rad.

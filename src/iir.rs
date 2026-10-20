@@ -157,7 +157,9 @@ multiversion! {
             s2[l] = b;
         }
         let (b0, b1, b2, a1, a2) = (f.b0, f.b1, f.b2, f.a1, f.a2);
-        let mut step = |chunk: &mut [f32]| {
+        for k in 0..n {
+            let j = if back { n - 1 - k } else { k };
+            let chunk: &mut [f32; L] = (&mut buf[j * L..j * L + L]).try_into().unwrap();
             for l in 0..L {
                 let x = chunk[l];
                 let y = b0 * x + s1[l];
@@ -165,11 +167,6 @@ multiversion! {
                 s2[l] = b2 * x - a2 * y;
                 chunk[l] = y;
             }
-        };
-        if back {
-            buf[..n * L].chunks_exact_mut(L).rev().for_each(&mut step);
-        } else {
-            buf[..n * L].chunks_exact_mut(L).for_each(&mut step);
         }
     }
 }
@@ -303,9 +300,17 @@ impl FastNoise {
 
     /// Fill `out` with unit-variance Gaussian noise.
     pub fn fill(&mut self, out: &mut [f32]) {
+        let t = normal_table();
+        let mut x = self.state;
         for v in out.iter_mut() {
-            *v = self.normal();
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let a = t[(x >> (64 - TABLE_BITS)) as usize];
+            let b = t[((x >> 20) & ((1 << TABLE_BITS) - 1)) as usize];
+            *v = (a + b) * std::f32::consts::FRAC_1_SQRT_2;
         }
+        self.state = x;
     }
 }
 

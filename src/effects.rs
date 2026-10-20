@@ -274,7 +274,7 @@ impl SignalEffects {
     }
 
     /// Settings for the playback chroma path; zero turns a stage off.
-    fn chroma_path_config(&self) -> ChromaPathConfig {
+    fn chroma_path_config(&self, frame: u64) -> ChromaPathConfig {
         ChromaPathConfig {
             noise: self.chroma_noise.unwrap_or(0.0),
             phase_noise_deg: self.chroma_phase_noise.unwrap_or(0.0),
@@ -285,6 +285,7 @@ impl SignalEffects {
             cnr: self.deck_cnr.unwrap_or(0.0).clamp(0.0, 1.0),
             noise_bw: self.chroma_noise_bw.unwrap_or(0.0),
             crosstalk: 0.1 * self.chroma_crosstalk.unwrap_or(0.0).clamp(0.0, 1.0),
+            noise_seed: vhs::stage_seed(self.stage_seed, frame, 0xC401_5E),
         }
     }
 
@@ -455,7 +456,7 @@ impl SignalEffects {
                 apply_vhs_tape_path(s, luma_bw, chroma_bw, sample_rate, w == Wire::Luma);
             });
         }
-        let chroma_cfg = self.chroma_path_config();
+        let chroma_cfg = self.chroma_path_config(frame);
         if chroma_cfg.is_active() {
             let _p = profile::scope("fx chroma path");
             run(wires, rng, &chroma_on, &mut |s, _, rng| apply_chroma_path(s, &chroma_cfg, sample_rate, rng));
@@ -1950,6 +1951,8 @@ pub struct ChromaPathConfig {
     pub noise_bw: f32,
     /// Adjacent-track chroma crosstalk amplitude (fraction).
     pub crosstalk: f32,
+    /// Seed of the noise stream used with `noise_bw`.
+    pub noise_seed: u64,
 }
 
 impl ChromaPathConfig {
@@ -2083,6 +2086,9 @@ fn apply_chroma_path(
     // Noise at the colour-under bandwidth is independent from line to
     // line; the 1H comb correlates it.
     let line_corr = if cfg.noise_bw > 0.0 { 0.0 } else { CHROMA_NOISE_LINE_CORR };
+    // That noise comes from its own fast stream; the original noise from
+    // the frame's random numbers.
+    let mut fast = (cfg.noise_bw > 0.0).then(|| iir::FastNoise::new(cfg.noise_seed));
     let fresh = (1.0 - line_corr * line_corr).sqrt();
 
     let act = ACTIVE_SAMPLES;
@@ -2140,9 +2146,19 @@ fn apply_chroma_path(
             for k0 in (0..n_lines).step_by(lanes) {
                 let block = lanes.min(n_lines - k0);
                 for l in 0..block {
-                    for j in 0..act + 2 * pad {
-                        noise_i[j * lanes + l] = randn(rng);
-                        noise_q[j * lanes + l] = randn(rng);
+                    match fast.as_mut() {
+                        Some(f) => {
+                            for j in 0..act + 2 * pad {
+                                noise_i[j * lanes + l] = f.normal();
+                                noise_q[j * lanes + l] = f.normal();
+                            }
+                        }
+                        None => {
+                            for j in 0..act + 2 * pad {
+                                noise_i[j * lanes + l] = randn(rng);
+                                noise_q[j * lanes + l] = randn(rng);
+                            }
+                        }
                     }
                 }
                 lowpass_zero_phase_lanes(&mut noise_i, &mut noise_q, noise_alpha);
