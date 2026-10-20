@@ -513,6 +513,37 @@ fn process_frame_tl(
     })
 }
 
+/// The composite signal of frame `fnum` as received (encoded, with the
+/// frame's effects), as `analog_frame` makes it, on the calling worker
+/// thread's encoder.
+#[allow(clippy::too_many_arguments)]
+fn received_signal_tl(
+    src: &[u8],
+    in_w: usize,
+    in_h: usize,
+    fnum: u32,
+    values: &ParamValues,
+    fx: &SignalEffects,
+    effects_active: bool,
+) -> Vec<f32> {
+    let mut signal = TL_ENCODER.with(|enc| {
+        let mut enc = enc.borrow_mut();
+        enc.wire = Wire::Composite;
+        enc.encode_frame(src, in_w, in_h, fnum).to_vec()
+    });
+    if effects_active {
+        fx.apply(&mut signal, SAMPLE_RATE, &mut frame_rng(values.seed, fnum as u64), fnum as u64);
+    }
+    signal
+}
+
+/// Decode a received signal with the 3D comb, given the two frames
+/// before it as received, on the calling worker thread's decoder.
+fn decode_3d_tl(signal: &[f32], prev: &[f32], prev2: &[f32], out_w: usize, out_h: usize, values: &ParamValues) -> Vec<u8> {
+    let legacy = values.flag("legacy-burst-phase");
+    TL_DECODER.with(|dec| dec.borrow_mut().decode_frame_3d(signal, prev, prev2, out_w, out_h, legacy).to_vec())
+}
+
 /// Stop both ffmpeg processes after a cancel.
 fn abort_children(reader: &mut std::process::Child, writer: &mut std::process::Child) {
     let _ = reader.kill();
@@ -560,6 +591,10 @@ fn roundtrip(
     let mut frame_pool: Vec<Vec<u8>> = (0..batch_size).map(|_| vec![0u8; frame_bytes]).collect();
     // Last two source frames of the previous batch (for the 3D comb).
     let mut last_frames = [vec![0u8; frame_bytes], vec![0u8; frame_bytes]];
+    let frame_3d = comb_mode(values, opts.comb_1h) == Comb::Frame3d && values.choice("video-out") != "svideo";
+    // Received signals (frame number, signal) of the last two frames of
+    // the previous batch, for the 3D comb.
+    let mut last_signals: Vec<(u32, Vec<f32>)> = Vec::new();
 
     loop {
         if progress.is_cancelled() {
@@ -585,29 +620,57 @@ fn roundtrip(
             break;
         }
 
-        let results: Vec<Vec<u8>> = (0..batch_count)
-            .into_par_iter()
-            .map(|i| {
-                let fnum = frame_num + i as u32;
-                // Source frame `k` frames back, from this batch or the last
-                // two frames of the previous one (the first frames of the
-                // video stand in for missing ones).
-                let back = |k: usize| -> &[u8] {
-                    if i >= k {
-                        &frame_pool[i - k]
-                    } else if frame_num as usize >= k - i {
-                        &last_frames[k - i - 1]
+        let full_frame = |i: usize| -> Vec<u8> {
+            let fnum = frame_num + i as u32;
+            // Source frame `k` frames back, from this batch or the last
+            // two frames of the previous one (the first frames of the
+            // video stand in for missing ones).
+            let back = |k: usize| -> &[u8] {
+                if i >= k {
+                    &frame_pool[i - k]
+                } else if frame_num as usize >= k - i {
+                    &last_frames[k - i - 1]
+                } else {
+                    &frame_pool[0]
+                }
+            };
+            let prev: PrevFrame = Some([(back(1), None), (back(2), None)]);
+            process_frame_tl(
+                &frame_pool[i], None, prev, in_w, in_h, out_w, out_h, fnum,
+                opts.comb_1h, values, &fx, effects_active,
+            )
+        };
+        let results: Vec<Vec<u8>> = if frame_3d {
+            // From frame 2 on, the 3D comb's previous frames are the two
+            // frames before as received, so each frame's signal is made
+            // once and shared.
+            let signals: Vec<Vec<f32>> = (0..batch_count)
+                .into_par_iter()
+                .map(|i| received_signal_tl(&frame_pool[i], in_w, in_h, frame_num + i as u32, values, &fx, effects_active))
+                .collect();
+            let signal = |n: u32| -> &[f32] {
+                match n.checked_sub(frame_num) {
+                    Some(k) => &signals[k as usize],
+                    None => &last_signals.iter().find(|(m, _)| *m == n).expect("signal of the previous batch").1,
+                }
+            };
+            let results = (0..batch_count)
+                .into_par_iter()
+                .map(|i| {
+                    let fnum = frame_num + i as u32;
+                    if fnum >= 2 {
+                        decode_3d_tl(signal(fnum), signal(fnum - 1), signal(fnum - 2), out_w, out_h, values)
                     } else {
-                        &frame_pool[0]
+                        full_frame(i)
                     }
-                };
-                let prev: PrevFrame = Some([(back(1), None), (back(2), None)]);
-                process_frame_tl(
-                    &frame_pool[i], None, prev, in_w, in_h, out_w, out_h, fnum,
-                    opts.comb_1h, values, &fx, effects_active,
-                )
-            })
-            .collect();
+                })
+                .collect();
+            let end = frame_num + batch_count as u32;
+            last_signals = (end.saturating_sub(2)..end).map(|n| (n, signal(n).to_vec())).collect();
+            results
+        } else {
+            (0..batch_count).into_par_iter().map(full_frame).collect()
+        };
         // last_frames[0] = most recent, [1] = the one before.
         if batch_count >= 2 {
             last_frames[1].copy_from_slice(&frame_pool[batch_count - 2]);
