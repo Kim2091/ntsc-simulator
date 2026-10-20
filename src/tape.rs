@@ -76,6 +76,16 @@ pub struct TapeFm {
     pub rf_loss: f32,
     /// Tracking noise bar strength (0-1).
     pub tracking_bars: f32,
+    /// EP carrier interleave left over after playback, IRE: a DC offset
+    /// of ±half this between the two heads' fields.
+    pub ep_interleave: f32,
+    /// Adjacent-track luma crosstalk amplitude (fraction of the
+    /// neighbouring track's carrier).
+    pub luma_crosstalk: f32,
+    /// Black/white inversion strength (0-1).
+    pub bw_inversion: f32,
+    /// Level difference between the two heads, as a fraction.
+    pub head_level_step: f32,
     /// Seed of the per-stage random streams, and the frame number.
     pub seed: u64,
     pub frame: u64,
@@ -111,6 +121,12 @@ const KEY_TOLERANCE: u64 = 0x7A9E_0003;
 const KEY_RF: u64 = 0x7A9E_0004;
 const KEY_TRACKING: u64 = 0x7A9E_0005;
 const KEY_CLICKS: u64 = 0x7A9E_0006;
+const KEY_INVERSION: u64 = 0x7A9E_0007;
+
+/// FM deviation per IRE (1 MHz over the 140 IRE sync-to-white span) and the
+/// EP carrier interleave offset (½ fH).
+const HZ_PER_IRE: f32 = 1.0e6 / 140.0;
+const INTERLEAVE_HZ: f32 = 7867.0;
 
 /// RF loss (dB) of the worst bands at full `rf_loss`, and of the middle of
 /// a tracking noise bar at full strength.
@@ -309,6 +325,14 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
     }
 
     // ── Tape ──
+    // The neighbouring track of each line is the other field: its
+    // recorded luma, for the crosstalk beats.
+    let recorded: Vec<Vec<f32>> = if do_luma && cfg.luma_crosstalk > 0.0 {
+        groups.iter().map(|g| g.luma.clone()).collect()
+    } else {
+        Vec::new()
+    };
+    let mut inversions = FastNoise::new(stage_seed(cfg.seed, cfg.frame, KEY_INVERSION));
     if do_luma {
         let gain = noise_gain(&playback, de);
         let sigma_of = |snr: f32| 100.0 * 10f32.powf(-snr / 20.0) / gain;
@@ -348,6 +372,24 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
                 if loss > 1.0 {
                     rf_line_loss(&mut line, loss, &mut clicks, white, dark);
                 }
+                let field = usize::from(abs >= FIELD_ACTIVE_LINES[1].0);
+                if !recorded.is_empty() {
+                    // Group `gi` of one field and of the other differ by
+                    // half the groups.
+                    let half = groups_lines.len() / 2;
+                    let other = if gi >= half { gi - half } else { gi + half };
+                    let o = &recorded[other.min(recorded.len() - 1)];
+                    crosstalk_beats(&mut line, o, l, cfg, field, abs);
+                }
+                if cfg.ep_interleave != 0.0 {
+                    let dc = 0.5 * cfg.ep_interleave * if field == 0 { 1.0 } else { -1.0 };
+                    for v in line.iter_mut() {
+                        *v += dc;
+                    }
+                }
+                if cfg.bw_inversion > 0.0 {
+                    inversion(&mut line, cfg.bw_inversion, loss, white, dark, &mut inversions);
+                }
                 for d in dropouts.iter().filter(|d| d.line == abs) {
                     render_dropout(&mut line, &prev, d, cfg.doc && !first_of_field, sigma.unwrap_or(1.0), &mut noise, white, dark);
                 }
@@ -366,6 +408,14 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
             de.run_lanes(&mut g.luma);
             nl.playback(&mut g.luma);
             advance_lanes(&mut g.luma, advance);
+            if cfg.head_level_step != 0.0 {
+                for (l, &abs) in g.lines.iter().enumerate() {
+                    let k = 1.0 + 0.5 * cfg.head_level_step * if abs < FIELD_ACTIVE_LINES[1].0 { 1.0 } else { -1.0 };
+                    for j in 0..REGION_LEN {
+                        g.luma[j * LANES + l] *= k;
+                    }
+                }
+            }
             from_ire(&mut g.luma);
         }
         if wire != Wire::Luma && (cfg.rf_loss > 0.0 || cfg.tracking_bars > 0.0) {
@@ -449,6 +499,55 @@ fn rf_line_loss(line: &mut [f32], loss_db: f32, clicks: &mut FastNoise, white: f
                 j += 2;
             }
             j += 1;
+        }
+    }
+}
+
+/// Luma crosstalk from the neighbouring track (lane `l` of `other`, the
+/// other field's recorded luma).  Azimuth recording rejects it only
+/// partly, and the two FM carriers beat: the demodulator puts out a tone
+/// at their frequency difference (7.14 kHz per IRE of level difference,
+/// plus ½ fH with the EP interleave) with an amplitude of the crosstalk
+/// ratio times that difference.  Where the fields differ the picture gets
+/// low-frequency, patterned noise ("orange peel").
+fn crosstalk_beats(line: &mut [f32], other: &[f32], l: usize, cfg: &TapeFm, field: usize, abs: usize) {
+    let r = cfg.luma_crosstalk;
+    let offset = if cfg.ep_interleave != 0.0 { INTERLEAVE_HZ } else { 0.0 };
+    let dt = 1.0 / crate::constants::SAMPLE_RATE as f32;
+    // The beat's phase at the start of the line drifts from line to line.
+    let mut phase = std::f32::consts::PI * (0.37 * abs as f32 + field as f32);
+    for (j, v) in line.iter_mut().enumerate() {
+        let diff = *v - other[j * LANES + l];
+        phase += std::f32::consts::TAU * (HZ_PER_IRE * diff + offset) * dt;
+        *v += r * diff * phase.cos();
+    }
+}
+
+/// Black/white inversion: where the emphasised overshoot of a bright edge
+/// sits on the white clip, the carrier is at its highest frequency and
+/// weakest after the head and tape losses.  If the limiter loses it, the
+/// demodulator drops to black for a moment right after the edge: black
+/// specks with a tail just after strong dark-to-bright edges, more often
+/// with weak RF (worn heads).
+fn inversion(line: &mut [f32], strength: f32, loss_db: f32, white: f32, dark: f32, rng: &mut FastNoise) {
+    let p_base = strength * (0.05 + loss_db / 25.0);
+    let mut j = 0;
+    while j < line.len() {
+        if line[j] < white - 0.5 {
+            j += 1;
+            continue;
+        }
+        let start = j;
+        while j < line.len() && line[j] >= white - 0.5 {
+            j += 1;
+        }
+        let run = (j - start) as f32;
+        if run >= 3.0 && rng.uniform() < (p_base * run / 10.0).min(0.9) {
+            let k = 2 + (rng.uniform() * 7.0) as usize;
+            let end = (start + k).min(line.len());
+            for v in &mut line[start..end] {
+                *v = (-20.0 + 15.0 * rng.normal()).clamp(dark, white);
+            }
         }
     }
 }
@@ -573,6 +672,10 @@ mod tests {
             doc: true,
             rf_loss: 0.0,
             tracking_bars: 0.0,
+            ep_interleave: 0.0,
+            luma_crosstalk: 0.0,
+            bw_inversion: 0.0,
+            head_level_step: 0.0,
             seed: 1,
             frame: 0,
         }

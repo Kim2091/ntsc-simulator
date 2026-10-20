@@ -423,6 +423,53 @@ pub static SPECS: &[ParamSpec] = &[
         kind: num(0.0, 1.0, 0.5),
     },
     ParamSpec {
+        id: "luma-crosstalk",
+        label: "Luma crosstalk",
+        help: "Opt-in, FM tape model. Luma crosstalk from the neighbouring track (0–1; 1 = −20 dB, EP-like): the two \
+               FM carriers beat, giving faint low-frequency patterned noise (\"orange peel\") where the two fields \
+               differ, e.g. on motion.",
+        unit: "",
+        group: Group::Tape,
+        kind: num(0.0, 1.0, 0.5),
+    },
+    ParamSpec {
+        id: "ep-interleave",
+        label: "EP interleave residue",
+        help: "Opt-in, FM tape model. EP decks record one head's carrier ½ fH (1.1 IRE) higher and remove the step on \
+               playback; a mismatch leaves a DC offset between the two fields (IRE, 0–1.1): faint line-by-line \
+               brightness stripes and 30 Hz flicker. It also shifts the luma crosstalk beats.",
+        unit: "IRE",
+        group: Group::Tape,
+        kind: num(0.0, 2.0, 0.5),
+    },
+    ParamSpec {
+        id: "bw-inversion",
+        label: "Black/white inversion",
+        help: "Opt-in, FM tape model. Worn heads lose the weak high carrier of bright, emphasised edges (0–1): black \
+               specks with a short tail right after strong dark-to-bright edges, more often in bands of weak RF.",
+        unit: "",
+        group: Group::Tape,
+        kind: num(0.0, 1.0, 0.3),
+    },
+    ParamSpec {
+        id: "head-level-step",
+        label: "Head level step",
+        help: "Opt-in, FM tape model. Level difference between the two video heads in % (0–5): the two fields differ \
+               slightly in brightness and contrast, a faint line-pair pattern in the frame.",
+        unit: "%",
+        group: Group::Tape,
+        kind: num(0.0, 5.0, 1.0),
+    },
+    ParamSpec {
+        id: "generations",
+        label: "Generations",
+        help: "FM tape model: tape generations (1 = original recording, 2 = a dub of it, …). Each dub is a new tape \
+               with its own noise, dropouts and emphasis clipping, so noise adds up and edges soften further.",
+        unit: "",
+        group: Group::Tape,
+        kind: Kind::Number { min: 1.0, max: 4.0, default: Some(1.0), typical: 2.0, integer: true },
+    },
+    ParamSpec {
         id: "head-smear",
         label: "Head-wear smear",
         help: "Worn-head symmetric luma blur (0.3–1.0) of the original model. Soft horizontal smudging that varies \
@@ -1109,6 +1156,11 @@ impl ParamValues {
             dropout_span: 1,
             rf_loss: None,
             chroma_noise_bw: None,
+            ep_interleave: None,
+            luma_crosstalk: None,
+            bw_inversion: None,
+            head_level_step: None,
+            generations: 1,
             chroma_crosstalk: None,
             tracking_bars: None,
             tape_model: match self.choice("tape-model") {
@@ -1149,6 +1201,11 @@ impl ParamValues {
         fx.rf_loss = s("rf-loss", rng);
         fx.chroma_noise_bw = s("chroma-noise-bw", rng).map(|k| k * 1e3);
         fx.chroma_crosstalk = s("chroma-crosstalk", rng);
+        fx.ep_interleave = s("ep-interleave", rng);
+        fx.luma_crosstalk = s("luma-crosstalk", rng);
+        fx.bw_inversion = s("bw-inversion", rng);
+        fx.head_level_step = s("head-level-step", rng);
+        fx.generations = req("generations").sample(rng).round().max(1.0) as usize;
         fx.tracking_bars = s("tracking-bars", rng);
         fx.dropout_span = req("dropout-span").sample(rng).round().max(1.0) as usize;
         fx.deck_ynr = s("deck-ynr", rng);
@@ -1243,6 +1300,11 @@ impl ParamValues {
         opt("rf_loss", "rf-loss", fx.rf_loss);
         opt("chroma_noise_khz", "chroma-noise-bw", fx.chroma_noise_bw.map(|v| v / 1e3));
         opt("chroma_crosstalk", "chroma-crosstalk", fx.chroma_crosstalk);
+        opt("ep_interleave", "ep-interleave", fx.ep_interleave);
+        opt("luma_crosstalk", "luma-crosstalk", fx.luma_crosstalk);
+        opt("bw_inversion", "bw-inversion", fx.bw_inversion);
+        opt("head_level_step", "head-level-step", fx.head_level_step);
+        opt("generations", "generations", Some(fx.generations as f32));
         opt("tracking_bars", "tracking-bars", fx.tracking_bars);
         opt("dropout_span", "dropout-span", Some(fx.dropout_span as f32));
         opt("deck_ynr", "deck-ynr", fx.deck_ynr);

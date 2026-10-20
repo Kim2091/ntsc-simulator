@@ -200,6 +200,14 @@ pub struct SignalEffects {
     pub rf_loss: Option<f32>,
     /// FM tape model: tracking noise bar strength (0-1).  `None` = off.
     pub tracking_bars: Option<f32>,
+    /// FM tape model: EP interleave residue (IRE), luma crosstalk (0-1),
+    /// black/white inversion (0-1), head level step (%), all `None` = off.
+    pub ep_interleave: Option<f32>,
+    pub luma_crosstalk: Option<f32>,
+    pub bw_inversion: Option<f32>,
+    pub head_level_step: Option<f32>,
+    /// FM tape model: tape generations (dubs), at least 1.
+    pub generations: usize,
     /// Colour-under noise bandwidth in Hz.  `None` = the original noise.
     pub chroma_noise_bw: Option<f32>,
     /// Adjacent-track chroma crosstalk strength (0-1).  `None` = off.
@@ -398,10 +406,22 @@ impl SignalEffects {
                 doc: self.doc != Doc::Off,
                 rf_loss: self.rf_loss.unwrap_or(0.0).clamp(0.0, 1.0),
                 tracking_bars: self.tracking_bars.unwrap_or(0.0).clamp(0.0, 1.0),
+                ep_interleave: self.ep_interleave.unwrap_or(0.0),
+                luma_crosstalk: 0.1 * self.luma_crosstalk.unwrap_or(0.0).clamp(0.0, 1.0),
+                bw_inversion: self.bw_inversion.unwrap_or(0.0).clamp(0.0, 1.0),
+                head_level_step: 0.01 * self.head_level_step.unwrap_or(0.0),
                 seed: self.stage_seed,
                 frame,
             };
-            each(wires, &mut |s, w| tape::apply_tape_fm(s, &cfg, w));
+            // A dub records the playback of the tape before it: each
+            // generation is a new tape with its own noise and dropouts.
+            for generation in 0..self.generations.max(1) {
+                let cfg = TapeFm {
+                    seed: if generation == 0 { cfg.seed } else { vhs::stage_seed(cfg.seed, generation as u64, 0x6E4E) },
+                    ..cfg
+                };
+                each(wires, &mut |s, w| tape::apply_tape_fm(s, &cfg, w));
+            }
         } else if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {
             let _p = profile::scope("fx tape path (luma/colour-under bw)");
             each(wires, &mut |s, w| {
