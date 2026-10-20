@@ -668,8 +668,9 @@ fn apply_attenuation(signal: &mut [f32], strength: f32) {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Per-line horizontal timing instability.
-/// Shifts lines by whole subcarrier cycles (4 samples) so the picture
-/// wobbles horizontally without altering decoded color.
+/// Shifts the burst and picture of each line by whole subcarrier cycles
+/// (4 samples) so the picture jumps sideways without altering decoded
+/// colour.  Sync stays in place; what moves in from outside is blanking.
 fn apply_jitter(signal: &mut [f32], amplitude: f32, rng: &mut impl Rng) {
     let expected = TOTAL_LINES * SAMPLES_PER_LINE;
     if signal.len() < expected {
@@ -681,16 +682,19 @@ fn apply_jitter(signal: &mut [f32], amplitude: f32, rng: &mut impl Rng) {
         if cycles == 0 {
             continue;
         }
-        let shift = (cycles * 4).unsigned_abs() as usize % SAMPLES_PER_LINE;
-        if shift == 0 {
-            continue;
-        }
+        let lo = FRONT_PORCH_SAMPLES + HSYNC_SAMPLES;
+        let shift = (cycles * 4).unsigned_abs() as usize;
         let base = line * SAMPLES_PER_LINE;
-        let row = &mut signal[base..base + SAMPLES_PER_LINE];
-        if cycles > 0 {
-            row.rotate_right(shift);
+        let row = &mut signal[base + lo..base + SAMPLES_PER_LINE];
+        let n = row.len();
+        if shift >= n {
+            row.fill(BLANKING_V);
+        } else if cycles > 0 {
+            row.copy_within(0..n - shift, shift);
+            row[..shift].fill(BLANKING_V);
         } else {
-            row.rotate_left(shift);
+            row.copy_within(shift.., 0);
+            row[n - shift..].fill(BLANKING_V);
         }
     }
 }
@@ -1395,8 +1399,9 @@ pub(crate) fn measure_burst_phase(line: &[f32]) -> f32 {
 // Closed-caption (line 21) data
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Closed-caption lines: line 21 of field 1 and line 284 of field 2.
-const VBI_DATA_LINES: [usize; 2] = [21, 284];
+/// Closed-caption lines: line 21 of field 1 and line 284 of field 2
+/// (lines are counted from 1, buffer rows from 0).
+const VBI_DATA_LINES: [usize; 2] = [20, 283];
 
 /// Write a line-21 closed-caption waveform on lines 21 and 284.
 ///
@@ -2868,11 +2873,12 @@ mod tests {
 
     #[test]
     fn vbi_writes_only_lines_21_and_284() {
+        // Standard lines 21 and 284 are buffer rows 20 and 283.
         let orig = test_signal();
         let mut rng = StdRng::seed_from_u64(3);
         let mut sig = orig.clone();
         apply_vbi_data(&mut sig, 1.0, crate::constants::SAMPLE_RATE, &mut rng);
-        assert_eq!(changed_lines(&orig, &sig), vec![21, 284]);
+        assert_eq!(changed_lines(&orig, &sig), vec![20, 283]);
     }
 
     #[test]
