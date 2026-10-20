@@ -11,7 +11,9 @@ use std::collections::BTreeMap;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::effects::{splitmix64, Doc, GhostConfig, HeadSwitchAfter, SignalEffects, DEFAULT_HEAD_SWITCH_LINES};
+use crate::effects::{
+    splitmix64, Doc, GhostConfig, HeadSwitchAfter, SignalEffects, TapeModel, DEFAULT_HEAD_SWITCH_LINES,
+};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Range parameters
@@ -321,6 +323,18 @@ pub static SPECS: &[ParamSpec] = &[
         kind: Kind::Text,
     },
     // ── Tape ──
+    ParamSpec {
+        id: "tape-model",
+        label: "Tape model",
+        help: "How the VHS tape path is simulated. classic: the original model, a lowpass on luma and colour \
+               (legacy output). fm: the record and playback circuits of the format: the recording deck's \
+               band-filter luma/chroma split (fine luma near the subcarrier is recorded as cross-colour), the \
+               record and playback luma lowpass filters (−10 dB at Luma bandwidth, causal like the analog \
+               circuits) and the colour-under filter. Opt-in; the newer tape stages need it.",
+        unit: "",
+        group: Group::Tape,
+        kind: Kind::Choice { options: &["classic", "fm"], default: "classic" },
+    },
     ParamSpec {
         id: "vhs-luma-bw",
         label: "Luma bandwidth",
@@ -668,11 +682,14 @@ pub static SPECS: &[ParamSpec] = &[
         id: "comb",
         label: "Decoder comb filter",
         help: "Luma/chroma separation in the TV or capture card (composite only). 2sample: simple, rainbow on fine \
-               detail. 1h: line comb, less rainbow but hanging dots on colour edges. 3d: frame comb using the \
-               previous frame where the picture is still (motion-adaptive), the cleanest on static areas.",
+               detail, and soft luma (−3 dB at 1.8 MHz). 1h: line comb, less rainbow but hanging dots on colour \
+               edges. 3d: frame comb using the previous frame where the picture is still (motion-adaptive), the \
+               cleanest on static areas. trap: a chroma trap (notch ± 0.6 MHz around the subcarrier), what \
+               capture chips use for VCR input: luma keeps its detail to about 2.9 MHz, fine detail near the \
+               subcarrier shows as rainbow.",
         unit: "",
         group: Group::Deck,
-        kind: Kind::Choice { options: &["2sample", "1h", "3d"], default: "2sample" },
+        kind: Kind::Choice { options: &["2sample", "1h", "3d", "trap"], default: "2sample" },
     },
     // ── Decoder / output ──
     ParamSpec {
@@ -954,6 +971,10 @@ impl ParamValues {
                 _ => HeadSwitchAfter::Black,
             },
             flagging: None,
+            tape_model: match self.choice("tape-model") {
+                "fm" => TapeModel::Fm,
+                _ => TapeModel::Classic,
+            },
             doc: match self.choice("doc") {
                 "luma" => Doc::Luma,
                 "off" => Doc::Off,

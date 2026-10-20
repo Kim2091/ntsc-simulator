@@ -205,6 +205,43 @@ impl Decoder {
         self.finish(output_width, output_height, legacy_burst_phase)
     }
 
+    /// Decode with a chroma trap, as capture chips do for VCR input (the
+    /// TVP5150 switches to it automatically when the timing is unstable).
+    /// Chroma is the band fsc ± 0.6 MHz (−6 dB), luma is everything else,
+    /// so luma keeps its detail up to about 2.9 MHz; fine luma inside the
+    /// band shows as cross-colour.
+    pub fn decode_frame_trap(
+        &mut self,
+        signal: &[f32],
+        output_width: usize,
+        output_height: usize,
+        legacy_burst_phase: bool,
+    ) -> &[u8] {
+        let p = profile::scope("decode comb");
+        let spl = SAMPLES_PER_LINE;
+        let ypl = spl + RIGHT_PAD;
+        self.prepare_output(output_width, output_height);
+        let r = crate::vhs::REGION_START;
+        let mut group = crate::vhs::LaneGroup::new();
+        for (k, chunk) in self.abs_lines.chunks(crate::iir::LANES).enumerate() {
+            group.load(signal, chunk, false);
+            for (l, &abs) in chunk.iter().enumerate() {
+                let vis = k * crate::iir::LANES + l;
+                let (base, ybase) = (vis * spl, vis * ypl);
+                self.full_lines[base..base + spl].copy_from_slice(&signal[abs * spl..(abs + 1) * spl]);
+                self.y_full[ybase..ybase + r].copy_from_slice(&signal[abs * spl..abs * spl + r]);
+                self.chroma_full[base..base + r].fill(0.0);
+                for n in r..spl {
+                    let at = (n - r) * crate::iir::LANES + l;
+                    self.y_full[ybase + n] = group.luma[at];
+                    self.chroma_full[base + n] = group.chroma[at];
+                }
+            }
+        }
+        drop(p);
+        self.finish(output_width, output_height, legacy_burst_phase)
+    }
+
     /// Decode an S-Video signal pair: luma from the Y wire with no comb
     /// filter, chroma from the C wire, so there is no cross-colour or
     /// cross-luma.

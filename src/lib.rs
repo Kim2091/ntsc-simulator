@@ -26,6 +26,7 @@ pub mod mpeg2;
 pub mod params;
 pub mod pipeline;
 pub mod presets;
+pub mod tape;
 pub mod profile;
 mod simd;
 pub mod vhs;

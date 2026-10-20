@@ -161,6 +161,7 @@ pub enum Comb {
     TwoSample,
     OneLine,
     Frame3d,
+    Trap,
 }
 
 /// The comb in use: `--comb`, or `--comb-1h` for compatibility.
@@ -169,6 +170,7 @@ pub fn comb_mode(values: &ParamValues, comb_1h: bool) -> Comb {
         _ if comb_1h => Comb::OneLine,
         "1h" => Comb::OneLine,
         "3d" => Comb::Frame3d,
+        "trap" => Comb::Trap,
         _ => Comb::TwoSample,
     }
 }
@@ -231,6 +233,7 @@ fn analog_frame(
                 dec.decode_frame_3d(buf, buf_c, &prev2, out_w, out_h, legacy).to_vec()
             }
             (Comb::OneLine, _) => dec.decode_frame(buf, out_w, out_h, true, legacy).to_vec(),
+            (Comb::Trap, _) => dec.decode_frame_trap(buf, out_w, out_h, legacy).to_vec(),
             _ => dec.decode_frame(buf, out_w, out_h, false, legacy).to_vec(),
         }
     }

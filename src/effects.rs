@@ -27,6 +27,7 @@ use crate::filters;
 use crate::iir;
 use crate::profile;
 use crate::simd::multiversion;
+use crate::tape::{self, TapeFm};
 use crate::vhs::{self, DeckLuma};
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -178,6 +179,19 @@ pub struct SignalEffects {
     pub head_switch_after: HeadSwitchAfter,
     /// Top-of-field skew strength (0-1).  `None` = off.
     pub flagging: Option<f32>,
+    /// Which tape model runs the tape path.
+    pub tape_model: TapeModel,
+}
+
+/// How the tape path is simulated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TapeModel {
+    /// The original model: a luma lowpass and a colour-under lowpass after
+    /// a 2-sample comb split.
+    #[default]
+    Classic,
+    /// The VHS record and playback circuits (`tape::apply_tape_fm`).
+    Fm,
 }
 
 /// Default number of active lines per field affected by head switching.
@@ -208,6 +222,7 @@ impl SignalEffects {
             || self.v_jitter.is_some()
             || self.deck_luma().is_active()
             || self.flagging.is_some()
+            || self.tape_model != TapeModel::Classic
     }
 
     /// Settings of the deck's playback luma circuits.
@@ -327,7 +342,14 @@ impl SignalEffects {
             run(wires, rng, &luma_on, &mut |s, _, rng| apply_vbi_data(s, strength, sample_rate, rng));
         }
         // VHS tape-path effects
-        if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {
+        if self.tape_model == TapeModel::Fm {
+            let _p = profile::scope("fx tape path (fm model)");
+            let cfg = TapeFm {
+                luma_bw: self.vhs_luma_bw.unwrap_or(3.0e6),
+                chroma_bw: self.color_under_bw.unwrap_or(400e3),
+            };
+            each(wires, &mut |s, w| tape::apply_tape_fm(s, &cfg, w));
+        } else if self.vhs_luma_bw.is_some() || self.color_under_bw.is_some() {
             let _p = profile::scope("fx tape path (luma/colour-under bw)");
             each(wires, &mut |s, w| {
                 let luma_bw = if luma_on(w) { self.vhs_luma_bw } else { None };

@@ -44,8 +44,10 @@ pub(crate) struct LaneGroup {
     pub lines: Vec<usize>,
     pub luma: Vec<f32>,
     pub chroma: Vec<f32>,
-    i: Vec<f32>,
-    q: Vec<f32>,
+    /// The chroma band demodulated against the sample grid (not the
+    /// burst): `chroma = i·cos + q·(−sin)` at 4×fsc.
+    pub i: Vec<f32>,
+    pub q: Vec<f32>,
 }
 
 impl LaneGroup {
@@ -73,6 +75,10 @@ impl LaneGroup {
         }
         if full_luma {
             self.chroma.fill(0.0);
+            self.i.clear();
+            self.i.resize(n * LANES, 0.0);
+            self.q.clear();
+            self.q.resize(n * LANES, 0.0);
             return;
         }
         self.i.resize(n * LANES, 0.0);
@@ -95,6 +101,17 @@ impl LaneGroup {
                 let c = self.i[at] * COS[k] + self.q[at] * NSIN[k];
                 self.chroma[at] = c;
                 self.luma[at] -= c;
+            }
+        }
+    }
+
+    /// Rebuild `chroma` from `i` and `q`.
+    pub fn remodulate(&mut self) {
+        for j in 0..REGION_LEN {
+            let k = (REGION_START + j) & 3;
+            for l in 0..LANES {
+                let at = j * LANES + l;
+                self.chroma[at] = self.i[at] * COS[k] + self.q[at] * NSIN[k];
             }
         }
     }
