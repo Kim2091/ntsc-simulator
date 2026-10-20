@@ -1386,8 +1386,9 @@ fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng, clock: 
 ///     samples (the heads are never perfectly aligned) and its subcarrier
 ///     no longer matches the line's burst, so colours there are off.  The
 ///     changeover itself is a short switching transient (a spike and
-///     wideband noise lasting a few µs), and parts of the displaced
-///     segment drop out to black or smear to light grey.
+///     wideband noise lasting a few µs).  Parts of the displaced segment
+///     drop out to black, and wide, soft, washed-out light smears lie
+///     across it.
 ///   - **Lines after the switch.**  The head has no proper track here, so
 ///     the signal is mostly a low, noisy level near black, with sparse
 ///     bright streaks of tape noise (some with a random subcarrier phase,
@@ -1459,14 +1460,24 @@ fn apply_head_switch<R: Rng>(
         shift_segment(&mut moved, ACTIVE_START, spl, jump);
         let row = &mut signal[base + ACTIVE_START..base + spl];
         row[x_s..].copy_from_slice(&moved[ACTIVE_START + x_s..]);
-        // Dropouts to black and light smears in the displaced part.
-        let n_marks = 1 + (3.0 * strength * rng.random::<f32>()) as usize;
-        for _ in 0..n_marks {
-            let len = 20 + (rng.random::<f32>() * 140.0) as usize;
+        // Dropouts to black in the displaced part.
+        let n_dark = (2.0 * strength * rng.random::<f32>()).round() as usize;
+        for _ in 0..n_dark {
+            let len = 20 + (rng.random::<f32>() * 120.0) as usize;
             let start = x_s + (rng.random::<f32>() * (act - x_s) as f32) as usize;
-            let level = if rng.random::<bool>() { black } else { black + (55.0 + 25.0 * rng.random::<f32>()) * IRE_V };
             let mix = 0.6 + 0.35 * rng.random::<f32>();
-            blend_segment(row, start, len, 6.0, |_| level, mix);
+            blend_segment(row, start, len, 6.0, |_| black, mix);
+        }
+        // Washed-out light smears: wide, soft-edged and nearly colourless,
+        // mostly in the displaced part.
+        let n_light = 3 + (5.0 * strength * rng.random::<f32>()) as usize;
+        for _ in 0..n_light {
+            let len = 60 + (rng.random::<f32>() * 200.0) as usize;
+            let from = if rng.random::<f32>() < 0.8 { x_s } else { 0 };
+            let start = from + (rng.random::<f32>() * (act - from) as f32) as usize;
+            let level = black + (70.0 + 25.0 * rng.random::<f32>()) * IRE_V;
+            let mix = 0.8 + 0.2 * rng.random::<f32>();
+            blend_segment(row, start, len, 24.0, |_| level, mix);
         }
         // Switching transient: a spike that decays over a few µs, with noise.
         fill_noise(&mut noise, 8.0 * IRE_V * strength, rng);
