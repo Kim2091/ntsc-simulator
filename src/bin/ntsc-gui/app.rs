@@ -647,12 +647,12 @@ impl App {
             PlayKey { values: r.values.clone(), out: (r.out_w, r.out_h), comb_1h: r.comb_1h, every_frame: r.every_frame }
         });
         if running.as_ref() != Some(&key) {
-            let since = *self.play_dirty_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= DEBOUNCE {
+            let waited = self.play_dirty_since.get_or_insert_with(Instant::now).elapsed();
+            if waited >= DEBOUNCE {
                 let next = self.play_shown.as_ref().map_or(self.frame, |(f, _)| f + 1);
                 self.start_playback(ctx, next);
             } else {
-                ctx.request_repaint_after(DEBOUNCE - since.elapsed());
+                ctx.request_repaint_after(DEBOUNCE - waited);
             }
         } else {
             self.play_dirty_since = None;
