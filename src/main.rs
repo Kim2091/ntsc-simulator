@@ -88,7 +88,8 @@ impl Args for EffectArgs {
                 .help_heading("Presets and seed")
                 .help(
                     "Playback-deck profile: deck-basic (typical consumer VCR), deck-svhs-tbc (line + frame TBC, \
-                     recursive noise reduction, S-Video, 3D comb), deck-edit (no sharpening). Combines with --preset; the deck's \
+                     recursive noise reduction, S-Video, 3D comb), deck-edit (edit mode: no sharpening, noise \
+                     canceller or colour noise reducer). Combines with --preset; the deck's \
                      values win where both set the same flag.",
                 ),
         )

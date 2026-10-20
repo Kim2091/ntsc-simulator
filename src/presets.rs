@@ -286,8 +286,9 @@ pub static DECKS: &[BuiltinPreset] = &[
     BuiltinPreset {
         name: "deck-edit",
         group: "Deck",
-        description: "Deck in edit mode: no sharpening or peaking",
-        values: &[("deck-sharpness", "0")],
+        description: "Deck in edit mode (as pro decks for dubbing): no sharpening, noise canceller and colour noise \
+                      reducer off",
+        values: &[("deck-sharpness", "0"), ("deck-nc", "0"), ("deck-cnr", "0")],
     },
 ];
 
