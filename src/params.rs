@@ -396,8 +396,10 @@ pub static SPECS: &[ParamSpec] = &[
     ParamSpec {
         id: "tape-snr",
         label: "Tape S/N",
-        help: "Opt-in, FM tape model. Luma signal-to-noise ratio of the tape noise in dB (decks: 43–45 SP, about \
-               41 LP/EP; worn tapes lower). The noise is added in the emphasised FM domain, so after de-emphasis \
+        help: "Opt-in, FM tape model. Luma signal-to-noise ratio of the tape noise in dB, before the deck's noise \
+               reduction (typical 37–38 SP, 34–36 LP, 30–33 worn EP: deck specs of 43–45 dB SP and about 41 dB EP \
+               are measured with the noise canceller on, which adds about 6–7 dB, nonlinear emphasis 2–3 dB more \
+               on flat areas). The noise is added in the emphasised FM domain, so after de-emphasis \
                it rises with frequency up to the luma lowpass: fine, horizontally streaky grain, about the same \
                in dark and bright areas, a little stronger in whites and beside large edges.",
         unit: "dB",
