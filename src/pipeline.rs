@@ -575,6 +575,205 @@ fn abort_children(reader: &mut std::process::Child, writer: &mut std::process::C
     let _ = writer.wait();
 }
 
+/// The analog roundtrip of a video's frames in order: batches of
+/// consecutive frames run in parallel, the 3D comb sees the frames before
+/// each batch as received, and the deck noise reduction runs on the
+/// decoded frames in order.  The output of a frame depends only on the
+/// settings, its frame number and the frames before it, not on the batch
+/// sizes.  The `roundtrip` command and the GUI's playback both use it.
+pub struct FrameProcessor {
+    values: ParamValues,
+    fx: SignalEffects,
+    effects_active: bool,
+    comb_1h: bool,
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    out_h: usize,
+    frame_3d: bool,
+    /// Sequential stage: runs on the decoded frames in order.
+    dnr: Option<TemporalDnr>,
+    /// Number of the next frame.
+    frame_num: u32,
+    /// How many of the frames just before `frame_num` are known (in
+    /// `last_frames` and `last_signals`), at most 2.
+    known: u32,
+    /// Last two source frames: [0] = most recent, [1] = the one before.
+    last_frames: [Vec<u8>; 2],
+    /// Received signals (frame number, signal) of the last two frames, for
+    /// the 3D comb.
+    last_signals: Vec<(u32, Vec<f32>)>,
+}
+
+impl FrameProcessor {
+    /// A processor whose first frame is `first_frame`, for `in_size`
+    /// source frames decoded at `out_size`.
+    pub fn new(values: &ParamValues, comb_1h: bool, in_size: (usize, usize), out_size: (usize, usize), first_frame: u32) -> Self {
+        Self::with_effects(values, resolve_effects(values), comb_1h, in_size, out_size, first_frame)
+    }
+
+    /// Like `new`, with the effects already resolved from `values`.
+    pub fn with_effects(
+        values: &ParamValues,
+        fx: SignalEffects,
+        comb_1h: bool,
+        (in_w, in_h): (usize, usize),
+        (out_w, out_h): (usize, usize),
+        first_frame: u32,
+    ) -> Self {
+        let frame_bytes = in_w * in_h * 3;
+        Self {
+            values: values.clone(),
+            effects_active: fx.is_active(),
+            dnr: fx.deck_dnr.filter(|s| *s > 0.0).map(TemporalDnr::new),
+            fx,
+            comb_1h,
+            in_w,
+            in_h,
+            out_w,
+            out_h,
+            frame_3d: comb_mode(values, comb_1h) == Comb::Frame3d && values.choice("video-out") != "svideo",
+            frame_num: first_frame,
+            known: 0,
+            last_frames: [vec![0u8; frame_bytes], vec![0u8; frame_bytes]],
+            last_signals: Vec::new(),
+        }
+    }
+
+    /// Number of the next frame.
+    pub fn frame_num(&self) -> u32 {
+        self.frame_num
+    }
+
+    /// `true` when a stage carries state from each frame to the next (the
+    /// deck noise reduction), so frames must not be skipped.
+    pub fn needs_every_frame(&self) -> bool {
+        self.dnr.is_some()
+    }
+
+    /// `true` when the 3D comb reads the two frames before each frame.
+    pub fn uses_previous_frames(&self) -> bool {
+        self.frame_3d
+    }
+
+    /// Continue at frame `frame` without processing the frames before it.
+    /// `before` holds the source frames just before `frame`, oldest first
+    /// (the last two are used, for the 3D comb).  The deck noise reduction
+    /// keeps its state, so callers skip frames only when
+    /// `needs_every_frame` is `false`.
+    pub fn skip_to(&mut self, frame: u32, before: &[Vec<u8>]) {
+        let before = &before[before.len().saturating_sub(2)..];
+        self.frame_num = frame;
+        self.known = before.len() as u32;
+        for (k, src) in before.iter().rev().enumerate() {
+            self.last_frames[k].copy_from_slice(src);
+        }
+        self.last_signals = if self.frame_3d {
+            let first = frame - before.len() as u32;
+            before
+                .par_iter()
+                .enumerate()
+                .map(|(k, src)| {
+                    let n = first + k as u32;
+                    (n, received_signal_tl(src, self.in_w, self.in_h, n, &self.values, &self.fx, self.effects_active))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// Process the next `frames.len()` consecutive source frames in
+    /// parallel; their outputs in order.
+    pub fn process_batch(&mut self, frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let batch_count = frames.len();
+        if batch_count == 0 {
+            return Vec::new();
+        }
+        let (in_w, in_h, out_w, out_h) = (self.in_w, self.in_h, self.out_w, self.out_h);
+        let (values, fx, effects_active) = (&self.values, &self.fx, self.effects_active);
+        let (frame_num, known) = (self.frame_num, self.known);
+        let last_frames = &self.last_frames;
+
+        let full_frame = |i: usize| -> Vec<u8> {
+            let fnum = frame_num + i as u32;
+            // Source frame `k` frames back, from this batch or the last
+            // two frames of the previous one (the first frame stands in
+            // for missing ones).
+            let back = |k: usize| -> &[u8] {
+                if i >= k {
+                    &frames[i - k]
+                } else if known as usize >= k - i {
+                    &last_frames[k - i - 1]
+                } else {
+                    &frames[0]
+                }
+            };
+            let prev: PrevFrame = Some([(back(1), None), (back(2), None)]);
+            process_frame_tl(
+                &frames[i], None, prev, in_w, in_h, out_w, out_h, fnum,
+                self.comb_1h, values, fx, effects_active,
+            )
+        };
+        let mut results: Vec<Vec<u8>> = if self.frame_3d {
+            // Once a frame before is known, the 3D comb's previous frames
+            // are the frames before as received, so each frame's signal is
+            // made once and shared.  This keeps the output independent of
+            // the batch size.
+            let signals: Vec<Vec<f32>> = (0..batch_count)
+                .into_par_iter()
+                .map(|i| received_signal_tl(&frames[i], in_w, in_h, frame_num + i as u32, values, fx, effects_active))
+                .collect();
+            let last_signals = &self.last_signals;
+            let signal = |n: u32| -> &[f32] {
+                match n.checked_sub(frame_num) {
+                    Some(k) => &signals[k as usize],
+                    None => &last_signals.iter().find(|(m, _)| *m == n).expect("signal of the previous batch").1,
+                }
+            };
+            let results = (0..batch_count)
+                .into_par_iter()
+                .map(|i| {
+                    let fnum = frame_num + i as u32;
+                    let before = known + i as u32;
+                    if before >= 1 {
+                        // With only one frame before, it stands in for the
+                        // frame two back as well.
+                        let prev2 = signal(if before >= 2 { fnum - 2 } else { fnum - 1 });
+                        decode_3d_tl(signal(fnum), signal(fnum - 1), prev2, out_w, out_h, values, fx)
+                    } else {
+                        full_frame(i)
+                    }
+                })
+                .collect();
+            let end = frame_num + batch_count as u32;
+            let oldest = end.saturating_sub(2).max(frame_num - known.min(2));
+            self.last_signals = (oldest..end).map(|n| (n, signal(n).to_vec())).collect();
+            results
+        } else {
+            (0..batch_count).into_par_iter().map(full_frame).collect()
+        };
+        // last_frames[0] = most recent, [1] = the one before.
+        if batch_count >= 2 {
+            self.last_frames[1].copy_from_slice(&frames[batch_count - 2]);
+        } else {
+            let (a, b) = self.last_frames.split_at_mut(1);
+            b[0].copy_from_slice(&a[0]);
+        }
+        self.last_frames[0].copy_from_slice(&frames[batch_count - 1]);
+
+        if let Some(dnr) = self.dnr.as_mut() {
+            let _p = profile::scope("deck dnr");
+            for r in results.iter_mut() {
+                dnr.process(r, out_w, out_h);
+            }
+        }
+        self.frame_num += batch_count as u32;
+        self.known = (known + batch_count as u32).min(2);
+        results
+    }
+}
+
 fn roundtrip(
     input: &Path,
     output: &Path,
@@ -586,7 +785,6 @@ fn roundtrip(
     let (out_w, out_h) = (opts.width as usize, opts.height as usize);
     let fx = resolve_effects(values);
     log_sampled(values, &fx, progress);
-    let effects_active = fx.is_active();
 
     let (in_w, in_h, fps, fps_raw, total_frames) = ffprobe_video(input)?;
     progress.log(&format!(
@@ -601,8 +799,7 @@ fn roundtrip(
     let mut raw_copy = open_raw_copy(opts)?;
     let mut reader_buf = std::io::BufReader::new(reader.stdout.take().unwrap());
     let mut writer_buf = std::io::BufWriter::new(writer.stdin.take().unwrap());
-    // Sequential stage: runs on the decoded frames in order.
-    let mut dnr = fx.deck_dnr.filter(|s| *s > 0.0).map(TemporalDnr::new);
+    let mut processor = FrameProcessor::with_effects(values, fx, opts.comb_1h, (in_w, in_h), (out_w, out_h), 0);
 
     let batch_size = init_thread_pool(opts.threads);
     progress.log(&format!("  Batch size: {} (parallel frames)", batch_size));
@@ -612,12 +809,6 @@ fn roundtrip(
     progress.start(total_frames, prefix);
 
     let mut frame_pool: Vec<Vec<u8>> = (0..batch_size).map(|_| vec![0u8; frame_bytes]).collect();
-    // Last two source frames of the previous batch (for the 3D comb).
-    let mut last_frames = [vec![0u8; frame_bytes], vec![0u8; frame_bytes]];
-    let frame_3d = comb_mode(values, opts.comb_1h) == Comb::Frame3d && values.choice("video-out") != "svideo";
-    // Received signals (frame number, signal) of the last two frames of
-    // the previous batch, for the 3D comb.
-    let mut last_signals: Vec<(u32, Vec<f32>)> = Vec::new();
 
     loop {
         if progress.is_cancelled() {
@@ -643,76 +834,7 @@ fn roundtrip(
             break;
         }
 
-        let full_frame = |i: usize| -> Vec<u8> {
-            let fnum = frame_num + i as u32;
-            // Source frame `k` frames back, from this batch or the last
-            // two frames of the previous one (the first frames of the
-            // video stand in for missing ones).
-            let back = |k: usize| -> &[u8] {
-                if i >= k {
-                    &frame_pool[i - k]
-                } else if frame_num as usize >= k - i {
-                    &last_frames[k - i - 1]
-                } else {
-                    &frame_pool[0]
-                }
-            };
-            let prev: PrevFrame = Some([(back(1), None), (back(2), None)]);
-            process_frame_tl(
-                &frame_pool[i], None, prev, in_w, in_h, out_w, out_h, fnum,
-                opts.comb_1h, values, &fx, effects_active,
-            )
-        };
-        let results: Vec<Vec<u8>> = if frame_3d {
-            // From frame 1 on, the 3D comb's previous frames are the frames
-            // before as received, so each frame's signal is made once and
-            // shared.  This keeps the output independent of the batch size.
-            let signals: Vec<Vec<f32>> = (0..batch_count)
-                .into_par_iter()
-                .map(|i| received_signal_tl(&frame_pool[i], in_w, in_h, frame_num + i as u32, values, &fx, effects_active))
-                .collect();
-            let signal = |n: u32| -> &[f32] {
-                match n.checked_sub(frame_num) {
-                    Some(k) => &signals[k as usize],
-                    None => &last_signals.iter().find(|(m, _)| *m == n).expect("signal of the previous batch").1,
-                }
-            };
-            let results = (0..batch_count)
-                .into_par_iter()
-                .map(|i| {
-                    let fnum = frame_num + i as u32;
-                    if fnum >= 1 {
-                        // Frame 1 has only frame 0 before it, which stands in
-                        // for the frame two back as well.
-                        let prev2 = signal(fnum.saturating_sub(2));
-                        decode_3d_tl(signal(fnum), signal(fnum - 1), prev2, out_w, out_h, values, &fx)
-                    } else {
-                        full_frame(i)
-                    }
-                })
-                .collect();
-            let end = frame_num + batch_count as u32;
-            last_signals = (end.saturating_sub(2)..end).map(|n| (n, signal(n).to_vec())).collect();
-            results
-        } else {
-            (0..batch_count).into_par_iter().map(full_frame).collect()
-        };
-        // last_frames[0] = most recent, [1] = the one before.
-        if batch_count >= 2 {
-            last_frames[1].copy_from_slice(&frame_pool[batch_count - 2]);
-        } else {
-            let (a, b) = last_frames.split_at_mut(1);
-            b[0].copy_from_slice(&a[0]);
-        }
-        last_frames[0].copy_from_slice(&frame_pool[batch_count - 1]);
-
-        let mut results = results;
-        if let Some(dnr) = dnr.as_mut() {
-            let _p = profile::scope("deck dnr");
-            for r in results.iter_mut() {
-                dnr.process(r, out_w, out_h);
-            }
-        }
+        let results = processor.process_batch(&frame_pool[..batch_count]);
         let write_scope = profile::scope("write output (ffmpeg)");
         for result in &results {
             writer_buf.write_all(result).context("write failed")?;
@@ -1430,6 +1552,30 @@ fn spawn_ffmpeg_reader_with(
         .context("Failed to spawn ffmpeg reader. Is ffmpeg installed?")
 }
 
+/// Start an ffmpeg process that writes the video's RGB24 frames to its
+/// stdout from frame `first_frame` on, with the decoder choice and colour
+/// conversion of the roundtrip reader.  Frame `n` is the one at `n / fps`
+/// seconds; the seek goes half a frame earlier so that rounded timestamps
+/// still land on it.  Its stderr is discarded.
+pub fn spawn_frame_reader(input: &Path, values: &ParamValues, first_frame: u64, fps: f64) -> Result<std::process::Child> {
+    let colour = input_colour(input, values);
+    let mut cmd = tool_command("ffmpeg");
+    cmd.args(input_decoder_args(input));
+    if first_frame > 0 {
+        let seek = (first_frame as f64 - 0.5) / fps.max(1.0);
+        cmd.args(["-ss", &format!("{:.6}", seek)]);
+    }
+    cmd.arg("-i")
+        .arg(input)
+        .args(["-vf", &colour.filter()])
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-v", "error", "pipe:1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to spawn ffmpeg reader. Is ffmpeg installed?")
+}
+
 fn open_raw_copy(opts: &VideoOptions) -> Result<Option<std::io::BufWriter<std::fs::File>>> {
     opts.raw_copy
         .as_ref()
@@ -1701,5 +1847,28 @@ mod tests {
         v.set_from_str("comb", "3d").unwrap();
         let comb3d = sat(&render_frame(&src, 640, 480, 640, 480, false, &v, &fx, 5));
         assert!(comb3d < 0.25 * composite, "3d comb {} vs 2-sample {}", comb3d, composite);
+    }
+
+    #[test]
+    fn frame_processor_resumes_mid_video_like_a_full_run() {
+        // Moving stripes, so consecutive frames differ.
+        let (w, h) = (160usize, 120usize);
+        let frames: Vec<Vec<u8>> = (0..9)
+            .map(|t| (0..w * h).flat_map(|i| if (i % w + t * 3) / 4 % 2 == 0 { [200u8, 60, 40] } else { [30, 90, 180] }).collect())
+            .collect();
+        for comb in ["2sample", "3d"] {
+            let mut v = crate::presets::builtin("lq").unwrap().to_values();
+            v.seed = Some(3);
+            v.set_from_str("comb", comb).unwrap();
+            let mut full = FrameProcessor::new(&v, false, (w, h), (w, h), 0);
+            let mut expect = full.process_batch(&frames[..4]);
+            expect.extend(full.process_batch(&frames[4..]));
+            // Start at frame 5 with the two frames before it, one frame per batch.
+            let mut resumed = FrameProcessor::new(&v, false, (w, h), (w, h), 0);
+            resumed.skip_to(5, &frames[..5]);
+            for (n, f) in frames.iter().enumerate().skip(5) {
+                assert!(resumed.process_batch(std::slice::from_ref(f))[0] == expect[n], "comb {} frame {}", comb, n);
+            }
+        }
     }
 }

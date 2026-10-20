@@ -5,6 +5,7 @@
 
 mod app;
 mod params_ui;
+mod playback;
 mod process;
 mod viewer;
 mod worker;
@@ -53,10 +54,34 @@ pub struct GuiArgs {
     /// rendered, then exit
     #[arg(long)]
     pub screenshot: Option<PathBuf>,
+    /// Start playing the video once its first frame is loaded
+    #[arg(long, hide = true)]
+    pub play: bool,
+    /// Play for this many seconds, then take the screenshot and exit
+    /// (with --dump: also write each shown frame and the playback figures)
+    #[arg(long, hide = true)]
+    pub play_seconds: Option<f64>,
+    /// Play every frame instead of keeping to real time
+    #[arg(long, hide = true)]
+    pub play_every_frame: bool,
+    /// With --play-seconds: pause at the end and capture the paused
+    /// preview instead of the playing one
+    #[arg(long, hide = true)]
+    pub play_pause: bool,
+    /// Worker threads for preview and playback processing (default: all
+    /// logical cores)
+    #[arg(long, hide = true)]
+    pub threads: Option<usize>,
+    /// Output size WxH instead of the automatic size
+    #[arg(long, hide = true)]
+    pub size: Option<String>,
 }
 
 fn main() -> eframe::Result {
     let args = GuiArgs::parse();
+    if let Some(n) = args.threads {
+        rayon::ThreadPoolBuilder::new().num_threads(n.max(1)).build_global().ok();
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("NTSC Composite Simulator")

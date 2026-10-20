@@ -13,6 +13,7 @@ use ntsc_composite_simulator::pipeline;
 use ntsc_composite_simulator::presets::{self, Preset, BUILTIN};
 
 use crate::params_ui::ParamEditor;
+use crate::playback::{PlayRequest, Playback};
 use crate::process::{JobSettings, ProcessDialog};
 use crate::viewer::{ViewMode, Viewer, Zoom};
 use crate::worker::{grab_frame_async, RenderRequest, Renderer, SourceImage};
@@ -31,7 +32,16 @@ enum PresetChoice {
 enum Source {
     Bars,
     Image(PathBuf),
-    Video { path: PathBuf, duration: f64, fps: f64, time: f64 },
+    Video { path: PathBuf, duration: f64, fps: f64, time: f64, w: usize, h: usize },
+}
+
+/// Settings that playback is running with; a change restarts it.
+#[derive(Clone, PartialEq)]
+struct PlayKey {
+    values: ParamValues,
+    out: (usize, usize),
+    comb_1h: bool,
+    every_frame: bool,
 }
 
 /// Everything that affects the preview; a change triggers a new render.
@@ -87,6 +97,24 @@ pub struct App {
     screenshot_wait: u32,
     screenshot_done: Arc<AtomicBool>,
     screenshot_sent: bool,
+
+    playback: Option<Playback>,
+    play_loop: bool,
+    play_every_frame: bool,
+    /// The last frame shown by playback: (frame number, source pixels).
+    play_shown: Option<(u64, Vec<u8>)>,
+    /// When the playback settings started to differ from the running ones.
+    play_dirty_since: Option<Instant>,
+    /// Figures of the last playback, shown in the status bar after pausing.
+    play_summary: Option<String>,
+    /// The running grab only adds the frames before the paused frame;
+    /// the shown preview stays.
+    grab_quiet: bool,
+    /// Scripted playback (--play / --play-seconds): (seconds, started at).
+    auto_play: Option<(Option<f64>, Option<Instant>)>,
+    /// Scripted playback pauses before the capture (--play-pause).
+    play_pause: bool,
+    auto_paused: Option<Instant>,
 }
 
 fn bars_source() -> SourceImage {
@@ -139,8 +167,23 @@ impl App {
             screenshot_wait: 0,
             screenshot_done: Arc::new(AtomicBool::new(false)),
             screenshot_sent: false,
+            playback: None,
+            play_loop: true,
+            play_every_frame: args.play_every_frame,
+            play_shown: None,
+            play_dirty_since: None,
+            play_summary: None,
+            grab_quiet: false,
+            auto_play: (args.play || args.play_seconds.is_some()).then_some((args.play_seconds, None)),
+            play_pause: args.play_pause,
+            auto_paused: None,
         };
         app.deck = args.deck.as_deref().and_then(presets::deck).map(|d| d.name);
+        if let Some((w, h)) = args.size.as_deref().and_then(|s| s.split_once('x')) {
+            if let (Ok(w), Ok(h)) = (w.parse(), h.parse()) {
+                (app.auto_size, app.out_w, app.out_h) = (false, w, h);
+            }
+        }
         let preset = args.preset.as_deref().unwrap_or("mq");
         match presets::builtin(preset) {
             Some(p) => app.select_preset(PresetChoice::Builtin(p.name)),
@@ -304,16 +347,19 @@ impl App {
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) {
             self.load_preset_file(path);
         } else if pipeline::is_video_path(path) {
+            self.stop_playback();
             let duration = pipeline::video_duration(path).unwrap_or(0.0);
-            let fps = pipeline::ffprobe_video(path).map(|v| v.2).unwrap_or(29.97);
+            let (w, h, fps) = pipeline::ffprobe_video(path).map(|v| (v.0, v.1, v.2)).unwrap_or((0, 0, 29.97));
             let time = (duration * 0.1).min(10.0);
-            self.source = Source::Video { path: path.to_path_buf(), duration, fps, time };
+            self.source = Source::Video { path: path.to_path_buf(), duration, fps, time, w, h };
             self.grab = Some(grab_frame_async(ctx.clone(), path.to_path_buf(), time, self.current_values()));
+            self.grab_quiet = false;
             self.frame = (time * fps).round() as u64;
             self.status = Some((true, format!("Loading frame from {}…", path.display())));
         } else {
             match image::open(path) {
                 Ok(img) => {
+                    self.stop_playback();
                     let rgb = img.to_rgb8();
                     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
                     self.source = Source::Image(path.to_path_buf());
@@ -347,12 +393,22 @@ impl App {
     }
 
     fn update_render(&mut self, ctx: &egui::Context) {
+        if self.playback.is_some() {
+            // Playback shows its own frames; still-preview renders that
+            // were under way are not shown.
+            if let Some(result) = self.renderer.poll() {
+                self.shown_id = self.shown_id.max(result.id);
+            }
+            self.dirty_since = None;
+            return;
+        }
         if let Some(result) = self.renderer.poll() {
             if result.id > self.shown_id && result.error.is_some() {
                 self.shown_id = result.id;
                 self.status = Some((false, format!("Render failed: {}", result.error.unwrap_or_default())));
             } else if result.id > self.shown_id {
                 self.shown_id = result.id;
+                self.play_summary = None;
                 self.last_ms = result.ms;
                 self.sampled = result.sampled;
                 let img = egui::ColorImage::from_rgb([result.w, result.h], &result.rgb);
@@ -408,6 +464,165 @@ impl App {
         self.shown_id + 1 < self.next_id || self.dirty_since.is_some()
     }
 
+    // ── Playback ─────────────────────────────────────────────────────────
+
+    fn play_key(&self) -> PlayKey {
+        PlayKey { values: self.current_values(), out: self.out_size(), comb_1h: self.comb_1h, every_frame: self.play_every_frame }
+    }
+
+    /// Why the current settings cannot be played, if they cannot.
+    fn play_blocker(&self) -> Option<&'static str> {
+        match &self.source {
+            Source::Video { duration, w, .. } if *duration > 0.0 && *w > 0 => {}
+            _ => return Some("Playback needs a video source"),
+        }
+        if self.current_values().choice("format") == "dvd" {
+            return Some("The DVD path encodes the whole clip first; use Process… to see it in motion");
+        }
+        None
+    }
+
+    /// Start playing at frame `first` (from the start when `first` is past
+    /// the end).
+    fn start_playback(&mut self, ctx: &egui::Context, first: u64) {
+        let Source::Video { path, fps, duration, w, h, .. } = &self.source else { return };
+        if self.play_blocker().is_some() {
+            return;
+        }
+        let first = if first as f64 >= (*duration * *fps).floor() { 0 } else { first };
+        let key = self.play_key();
+        let request = PlayRequest {
+            path: path.clone(),
+            first_frame: first,
+            fps: *fps,
+            in_w: *w,
+            in_h: *h,
+            out_w: key.out.0,
+            out_h: key.out.1,
+            comb_1h: key.comb_1h,
+            values: key.values,
+            every_frame: key.every_frame,
+        };
+        self.stop_playback();
+        self.playback = Some(Playback::start(ctx.clone(), request));
+        self.play_dirty_since = None;
+        self.play_summary = None;
+    }
+
+    /// Stop playback without touching the preview.
+    fn stop_playback(&mut self) {
+        if let Some(mut pb) = self.playback.take() {
+            pb.stop(false);
+        }
+    }
+
+    /// Stop playback and keep the last shown frame as the still preview.
+    fn pause(&mut self, ctx: &egui::Context) {
+        let Some(mut pb) = self.playback.take() else { return };
+        pb.stop(false);
+        self.play_summary = Some(format!(
+            "Played {} frames at {:.1} fps, {} dropped",
+            pb.shown,
+            pb.achieved_fps(),
+            pb.dropped
+        ));
+        let Some((frame, src)) = self.play_shown.take() else { return };
+        let values = self.current_values();
+        let Source::Video { path, fps, time, w, h, .. } = &mut self.source else { return };
+        *time = frame as f64 / *fps;
+        let (path, t, w, h) = (path.clone(), *time, *w, *h);
+        self.frame = frame;
+        // The shown frame is the preview of this frame and source; the
+        // frames before it (for the still preview's noise reduction) are
+        // grabbed in the background.
+        self.src = Arc::new(SourceImage { rgb: src, w, h, history: Vec::new() });
+        self.source_gen += 1;
+        self.sent_key = Some(self.render_key());
+        self.dirty_since = None;
+        self.grab = Some(grab_frame_async(ctx.clone(), path, t, values));
+        self.grab_quiet = true;
+    }
+
+    fn toggle_play(&mut self, ctx: &egui::Context) {
+        if self.playback.is_some() {
+            self.pause(ctx);
+        } else {
+            self.start_playback(ctx, self.frame);
+        }
+    }
+
+    fn update_playback(&mut self, ctx: &egui::Context) {
+        if matches!(self.auto_play, Some((_, None))) && self.grab.is_none() && self.shown_id > 0 {
+            if let Some((_, started)) = &mut self.auto_play {
+                *started = Some(Instant::now());
+            }
+            self.start_playback(ctx, self.frame);
+        }
+        if self.playback.is_some() && self.play_blocker().is_some() {
+            self.pause(ctx);
+        }
+        let Some(pb) = &mut self.playback else { return };
+        let poll = pb.poll();
+        let fps = pb.request.fps;
+        let (in_w, in_h, out_w, out_h) = (pb.request.in_w, pb.request.in_h, pb.request.out_w, pb.request.out_h);
+        if let Some(f) = poll.frame {
+            let before = egui::ColorImage::from_rgb([in_w, in_h], &f.src);
+            match &mut self.before_tex {
+                Some(t) => t.set(before, egui::TextureOptions::NEAREST),
+                None => self.before_tex = Some(ctx.load_texture("before", before, egui::TextureOptions::NEAREST)),
+            }
+            let after = egui::ColorImage::from_rgb([out_w, out_h], &f.rgb);
+            match &mut self.after_tex {
+                Some(t) => t.set(after, egui::TextureOptions::NEAREST),
+                None => self.after_tex = Some(ctx.load_texture("after", after, egui::TextureOptions::NEAREST)),
+            }
+            if let (Some(dir), Some((Some(_), _))) = (&self.dump, &self.auto_play) {
+                let _ = std::fs::create_dir_all(dir);
+                let _ = std::fs::write(dir.join(format!("play_{:05}.rgb", f.frame)), &f.rgb);
+            }
+            self.frame = f.frame;
+            if let Source::Video { time, .. } = &mut self.source {
+                *time = f.frame as f64 / fps;
+            }
+            self.after_rgb = Some((f.rgb, out_w, out_h));
+            self.play_shown = Some((f.frame, f.src));
+        }
+        if let Some(e) = poll.error {
+            self.status = Some((false, format!("Playback failed: {}", e)));
+            self.pause(ctx);
+            return;
+        }
+        if poll.ended {
+            if self.play_loop {
+                self.start_playback(ctx, 0);
+            } else {
+                self.pause(ctx);
+            }
+            return;
+        }
+        if let Some(d) = poll.wake_in {
+            ctx.request_repaint_after(d);
+        }
+        // Changed settings restart playback at the next frame, once they
+        // have stayed unchanged for a moment.
+        let key = self.play_key();
+        let running = self.playback.as_ref().map(|pb| {
+            let r = &pb.request;
+            PlayKey { values: r.values.clone(), out: (r.out_w, r.out_h), comb_1h: r.comb_1h, every_frame: r.every_frame }
+        });
+        if running.as_ref() != Some(&key) {
+            let since = *self.play_dirty_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= DEBOUNCE {
+                let next = self.play_shown.as_ref().map_or(self.frame, |(f, _)| f + 1);
+                self.start_playback(ctx, next);
+            } else {
+                ctx.request_repaint_after(DEBOUNCE - since.elapsed());
+            }
+        } else {
+            self.play_dirty_since = None;
+        }
+    }
+
     // ── Actions ──────────────────────────────────────────────────────────
 
     fn cli_command(&self) -> String {
@@ -461,10 +676,11 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Open…").on_hover_text("Open an image, a video (one frame is previewed) or a preset .json. You can also drop files onto the window.").clicked() {
+            if ui.button("Open…").on_hover_text("Open an image, a video (scrub or play it with the controls at the bottom) or a preset .json. You can also drop files onto the window.").clicked() {
                 self.open_dialog(ui.ctx());
             }
             if !matches!(self.source, Source::Bars) && ui.button("Colour bars").on_hover_text("Go back to the built-in test pattern").clicked() {
+                self.stop_playback();
                 self.source = Source::Bars;
                 let ctx = ui.ctx().clone();
                 self.set_source_image(&ctx, bars_source());
@@ -667,27 +883,80 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let values = self.current_values();
-        if let Source::Video { duration, fps, time, path } = &mut self.source {
+        let playing = self.playback.is_some();
+        let blocker = self.play_blocker();
+        let mut toggle = false;
+        let mut seek: Option<u64> = None;
+        let current = self.frame;
+        if let Source::Video { duration, fps, time, path, .. } = &mut self.source {
             if *duration > 0.0 {
                 let mut t = *time;
                 let r = ui.horizontal(|ui| {
+                    let label = if playing { "⏸ Pause" } else { "▶ Play" };
+                    let hover = match blocker {
+                        Some(why) => why.to_string(),
+                        None => "Play the processed video in the preview (Space)".to_string(),
+                    };
+                    if ui.add_enabled(blocker.is_none() || playing, egui::Button::new(label).min_size(Vec2::new(70.0, 0.0)))
+                        .on_hover_text(hover)
+                        .on_disabled_hover_text(blocker.unwrap_or_default())
+                        .clicked()
+                    {
+                        toggle = true;
+                    }
+                    ui.checkbox(&mut self.play_loop, "Loop").on_hover_text("Start again from the beginning at the end of the video");
+                    ui.checkbox(&mut self.play_every_frame, "Every frame").on_hover_text(
+                        "Show every frame, slower than real time if processing cannot keep up. \
+                         Off: keep to the source frame rate and leave out frames that are late.",
+                    );
                     ui.label("Time");
                     ui.spacing_mut().slider_width = (ui.available_width() - 120.0).max(100.0);
-                    ui.add(egui::Slider::new(&mut t, 0.0..=*duration).suffix(" s").fixed_decimals(2))
-                        .on_hover_text("Scrub through the video; the frame is grabbed when you release the slider")
+                    ui.add(egui::Slider::new(&mut t, 0.0..=*duration).suffix(" s").fixed_decimals(2)).on_hover_text(
+                        "Scrub through the video; the frame is grabbed when you release the slider. \
+                         While playing, playback continues from there.",
+                    )
                 })
                 .inner;
                 *time = t;
-                if r.drag_stopped() || (r.changed() && !r.dragged()) {
-                    self.frame = (t * *fps).round() as u64;
-                    self.grab = Some(grab_frame_async(ui.ctx().clone(), path.clone(), t, values.clone()));
+                // The slider rounds the time it shows, so only a move to
+                // another frame counts as a seek.
+                let frame = (t * *fps).round() as u64;
+                if (r.drag_stopped() || (r.changed() && !r.dragged())) && frame != current {
+                    if playing {
+                        seek = Some(frame);
+                    } else {
+                        self.frame = frame;
+                        self.grab = Some(grab_frame_async(ui.ctx().clone(), path.clone(), t, values.clone()));
+                        self.grab_quiet = false;
+                    }
                 }
             }
         }
+        if toggle {
+            self.toggle_play(ui.ctx());
+        }
+        if let Some(frame) = seek {
+            self.start_playback(ui.ctx(), frame);
+        }
         ui.horizontal(|ui| {
-            if self.rendering() || self.grab.is_some() {
+            if let Some(pb) = &self.playback {
+                ui.label(format!(
+                    "Playing frame {} at {:.1} fps (source {:.3}), {} dropped",
+                    self.frame,
+                    pb.achieved_fps(),
+                    pb.request.fps,
+                    pb.dropped
+                ))
+                .on_hover_text("Frames shown per second over the last second, and frames left out to keep to real time");
+                if pb.behind() {
+                    let why = if pb.request.every_frame { "" } else { ": the deck noise reduction needs every frame" };
+                    ui.label(egui::RichText::new(format!("slower than real time{}", why)).weak());
+                }
+            } else if self.rendering() || (self.grab.is_some() && !self.grab_quiet) {
                 ui.spinner();
                 ui.label("Rendering…");
+            } else if let Some(summary) = &self.play_summary {
+                ui.label(summary);
             } else if self.shown_id > 0 {
                 ui.label(format!("Rendered in {:.0} ms", self.last_ms));
             }
@@ -720,6 +989,21 @@ impl App {
         let Some(rx) = &self.grab else { return };
         if let Ok(result) = rx.try_recv() {
             self.grab = None;
+            if std::mem::take(&mut self.grab_quiet) {
+                // Adopt the frames before the paused frame if the grab
+                // found the same frame, without rendering it again.
+                if let Ok(img) = result {
+                    if img.rgb == self.src.rgb && img.w == self.src.w && img.h == self.src.h {
+                        let unchanged = self.sent_key.as_ref() == Some(&self.render_key());
+                        self.src = Arc::new(img);
+                        self.source_gen += 1;
+                        if unchanged {
+                            self.sent_key = Some(self.render_key());
+                        }
+                    }
+                }
+                return;
+            }
             match result {
                 Ok(img) => {
                     self.set_source_image(ctx, img);
@@ -737,7 +1021,37 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        if self.shown_id == 0 || self.rendering() || self.grab.is_some() || self.screenshot_sent {
+        if let Some((Some(seconds), started)) = self.auto_play {
+            // Scripted playback: capture while playing, after `seconds`.
+            if self.screenshot_sent || !started.is_some_and(|t| t.elapsed().as_secs_f64() >= seconds) {
+                return;
+            }
+            if let (Some(dir), Some(pb)) = (&self.dump, &self.playback) {
+                let _ = std::fs::create_dir_all(dir);
+                let stats = format!(
+                    "shown {}\ndropped {}\nachieved_fps {:.2}\nmean_fps {:.2}\nsource_fps {:.3}\nlast_frame {}\nthreads {}\nevery_frame {}\n",
+                    pb.shown,
+                    pb.dropped,
+                    pb.achieved_fps(),
+                    pb.shown as f64 / seconds,
+                    pb.request.fps,
+                    self.frame,
+                    rayon::current_num_threads(),
+                    pb.request.every_frame,
+                );
+                let _ = std::fs::write(dir.join("play_stats.txt"), stats);
+            }
+            if self.play_pause {
+                // Pause, then capture the paused preview two seconds later.
+                if self.playback.is_some() {
+                    self.pause(ctx);
+                    self.auto_paused = Some(Instant::now());
+                }
+                if self.auto_paused.is_none_or(|t| t.elapsed() < Duration::from_secs(2)) || self.rendering() || self.grab.is_some() {
+                    return;
+                }
+            }
+        } else if self.shown_id == 0 || self.rendering() || self.grab.is_some() || self.screenshot_sent {
             return;
         }
         if self.process.autostart && !self.process.has_finished() {
@@ -788,6 +1102,15 @@ impl eframe::App for App {
         if copy {
             self.copy_preview(&ctx);
         }
+        // Space plays and pauses unless a text field has focus.  The key is
+        // consumed so a focused button does not also take it as a click.
+        if !ctx.egui_wants_keyboard_input()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space))
+            && (self.playback.is_some() || self.play_blocker().is_none())
+        {
+            self.toggle_play(&ctx);
+        }
+        self.update_playback(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
