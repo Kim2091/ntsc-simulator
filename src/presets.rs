@@ -77,7 +77,7 @@ pub static BUILTIN: &[BuiltinPreset] = &[
         description: "Worn EP-mode tape: soft, noisy, torn bottom, colour blotches and wobble",
         values: with_extra!(LEGACY_LQ, [
             ("head-switch", "0.8..1.0"),
-            ("head-switch-lines", "7"),
+            ("head-switch-lines", "3"),
             ("top-band", "0.6..0.8"),
             ("vbi-data", "0.6..0.8"),
             ("chroma-noise", "0.025..0.035"),
@@ -95,7 +95,7 @@ pub static BUILTIN: &[BuiltinPreset] = &[
         description: "Typical rental tape",
         values: with_extra!(LEGACY_MQ, [
             ("head-switch", "0.55..0.7"),
-            ("head-switch-lines", "6"),
+            ("head-switch-lines", "3"),
             ("top-band", "0.4..0.55"),
             ("vbi-data", "0.4..0.55"),
             ("chroma-noise", "0.015..0.025"),
@@ -113,7 +113,7 @@ pub static BUILTIN: &[BuiltinPreset] = &[
         description: "Clean SP recording",
         values: with_extra!(LEGACY_HQ, [
             ("head-switch", "0.35..0.45"),
-            ("head-switch-lines", "5"),
+            ("head-switch-lines", "3"),
             ("top-band", "0.2..0.3"),
             ("vbi-data", "0.25..0.35"),
             ("chroma-noise", "0.008..0.015"),

@@ -115,9 +115,10 @@ pub struct SignalEffects {
     /// tail" trailing to the right — the classic worn-tape look.
     /// `None` = no trailing smear.
     pub tape_trail_smear: Option<f32>,
-    /// Head-switching noise strength (0–1).  Tears the last few active
-    /// lines of each field: a time-base jump that displaces them to the
-    /// right, plus a dark, noisy switching line.  `None` = off.
+    /// Head-switching noise strength (0–1).  Tears the last two or three
+    /// active lines of each field: a displaced switch line with a switching
+    /// transient, then lines that have lost the signal (near black with
+    /// bright noise streaks).  `None` = off.
     pub head_switch: Option<f32>,
     /// Number of active lines per field affected by head switching.
     pub head_switch_lines: usize,
@@ -165,7 +166,7 @@ pub struct SignalEffects {
 }
 
 /// Default number of active lines per field affected by head switching.
-pub const DEFAULT_HEAD_SWITCH_LINES: usize = 6;
+pub const DEFAULT_HEAD_SWITCH_LINES: usize = 3;
 
 impl SignalEffects {
     pub fn is_active(&self) -> bool {
@@ -1377,32 +1378,36 @@ fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng, clock: 
 
 /// Simulate VHS head-switching noise at the bottom of each field.
 ///
-/// The head drum swaps heads a few lines before vertical sync.  The two
-/// heads are never perfectly aligned, so the lines read after the switch
-/// have a time-base jump the TV cannot follow at once:
-///   - Each of the last `lines` active lines of the field is shifted to the
-///     right by a fractional number of samples (see `shift_segment`).  The
-///     shift grows toward the bottom as `max_shift·((k+1)/N)^1.5`, with a
-///     little per-line jitter.  The exposed left part is filled with
-///     blanking, which decodes as black.
-///   - The burst moves with the line, but with a small residual timing
-///     error that grows toward the bottom (up to about one sample, i.e.
-///     ~90° of subcarrier phase).  The decoder references hue to the burst,
-///     so this residual shows as colour fringes on the displaced lines.
-///   - The first affected line is the switching line itself: over part of
-///     its width the signal drops toward blanking and carries strong
-///     wideband noise and bright impulses, which decode as a dark line
-///     with coloured speckles.
+/// The head drum swaps heads a few lines before vertical sync, so the last
+/// two or three active lines of each field are read after the switch:
+///   - **Switch line.**  At a random point along the line the signal
+///     changes over to the other head.  Left of it the picture is normal;
+///     right of it the picture is displaced by a time-base jump of tens of
+///     samples (the heads are never perfectly aligned) and its subcarrier
+///     no longer matches the line's burst, so colours there are off.  The
+///     changeover itself is a short switching transient (a spike and
+///     wideband noise lasting a few µs), and parts of the displaced
+///     segment drop out to black or smear to light grey.
+///   - **Lines after the switch.**  The head has no proper track here, so
+///     the signal is mostly a low, noisy level near black, with sparse
+///     bright streaks of tape noise (some with a random subcarrier phase,
+///     so they come out green or purple) and now and then a dimmed,
+///     displaced piece of the picture.
 ///
-/// `max_shift` is about 28 samples (≈ 2 µs) at strength 1 and varies
-/// randomly for every frame and field.  `timing_scale` (< 1 with a line
-/// TBC) scales the displacement and burst error, not the noise.
-fn apply_head_switch(
+/// Over time the switch behaves as on a real tape: the switch point, the
+/// jump and the number of torn lines (`lines` at full strength, a little
+/// fewer at low strength) are a fixed property of the tape (its seed),
+/// with a few samples of flicker every field, freshly drawn noise and
+/// streaks, and now and then a sudden change that holds for a few frames
+/// or seconds (`head_switch_hiccup`).  With zero `coherence` the state is
+/// re-rolled every frame instead.  `timing_scale` (< 1 with a line TBC)
+/// scales the jump, not the noise.  Sync and burst are left alone.
+fn apply_head_switch<R: Rng>(
     signal: &mut [f32],
     strength: f32,
     lines: usize,
     timing_scale: f32,
-    rng: &mut impl Rng,
+    rng: &mut R,
     clock: &TapeClock,
 ) {
     let spl = SAMPLES_PER_LINE;
@@ -1410,77 +1415,144 @@ fn apply_head_switch(
     if strength <= 0.0 || lines == 0 || signal.len() < TOTAL_LINES * spl {
         return;
     }
-
-    let noise_lp = filters::design_lowpass(4.5e6, 15);
-    let mut noise = vec![0.0f32; ACTIVE_SAMPLES];
+    let act = ACTIVE_SAMPLES;
+    let black = BLANKING_V + 7.5 * IRE_V;
+    let noise_lp = filters::design_lowpass(3.0e6, 15);
+    let mut noise = vec![0.0f32; act];
+    let mut moved = vec![0.0f32; spl];
     let mut scratch = Vec::new();
+    // Band-limited noise of standard deviation about `sigma` (in volts).
+    let mut fill_noise = |noise: &mut [f32], sigma: f32, rng: &mut R| {
+        for s in noise.iter_mut() {
+            *s = sigma * 1.6 * randn(rng);
+        }
+        apply_fir_inplace(noise, &noise_lp, &mut scratch);
+    };
 
     for (field, &(first, end)) in FIELD_ACTIVE_LINES.iter().enumerate() {
         let key = KEY_HEAD_SWITCH + 8 * field as u64;
-        let n_lines = lines.min(end - first);
+        // The tape's own switch point, jump size and number of torn
+        // lines, unless a hiccup is under way.
+        let tape = |k: u64| 0.5 + 0.5 * hash_signed(clock.seed, key + k, -7);
+        let (mut at_t, mut jump_t, mut extra) = (tape(0), tape(1), 0.0f32);
+        if let Some(h) = head_switch_hiccup(clock, key + 3, strength) {
+            at_t = (at_t + 0.3 * h[0]).clamp(0.0, 1.0);
+            jump_t = (jump_t + 0.6 * h[1]).clamp(0.0, 1.0);
+            extra = (1.4 * h[2]).round();
+        }
+        let r = rng.random::<f32>();
+        let at_frac = 0.15 + 0.6 * clock.blend(r, || at_t);
+        let r = rng.random::<f32>();
+        let jump_size = 15.0 + 35.0 * clock.blend(r, || jump_t);
+        let r = rng.random::<f32>();
+        let up = if clock.coherence > 0.0 { tape(2) } else { r };
+        let sign = if up < 0.75 { 1.0 } else { -1.0 };
+        let jump = sign * strength * (jump_size + 1.5 * randn(rng)) * timing_scale;
+        let lines_here = lines as f32 * (0.5 + 0.5 * strength) + clock.blend(0.0, || extra);
+        let n_lines = (lines_here.round().max(1.0) as usize).min(end - first);
         let switch_line = end - n_lines;
-        let r = rng.random::<f32>();
-        let max_shift = clock.blend(strength * 28.0 * (0.75 + 0.5 * r), || {
-            strength * 28.0 * (0.75 + 0.5 * clock.unit(key))
-        });
-        // Residual burst timing error at the bottom line, in samples
-        // (one sample = 90° of subcarrier phase).
-        let sign = if rng.random::<bool>() { 1.0 } else { -1.0 };
-        let r = rng.random::<f32>();
-        let burst_error = clock.blend(sign * strength * (0.4 + 0.5 * r), || {
-            strength * 0.9 * clock.along(key + 1, clock.t(1.0))
-        });
 
-        for k in 0..n_lines {
-            let line_base = (switch_line + k) * spl;
-            let base = line_base + ACTIVE_START;
+        // ── Switch line ──
+        let base = switch_line * spl;
+        let x_s = ((at_frac * act as f32 + 3.0 * randn(rng)).max(0.0) as usize).min(act - 1);
+        moved.copy_from_slice(&signal[base..base + spl]);
+        shift_segment(&mut moved, ACTIVE_START, spl, jump);
+        let row = &mut signal[base + ACTIVE_START..base + spl];
+        row[x_s..].copy_from_slice(&moved[ACTIVE_START + x_s..]);
+        // Dropouts to black and light smears in the displaced part.
+        let n_marks = 1 + (3.0 * strength * rng.random::<f32>()) as usize;
+        for _ in 0..n_marks {
+            let len = 20 + (rng.random::<f32>() * 140.0) as usize;
+            let start = x_s + (rng.random::<f32>() * (act - x_s) as f32) as usize;
+            let level = if rng.random::<bool>() { black } else { black + (55.0 + 25.0 * rng.random::<f32>()) * IRE_V };
+            let mix = 0.6 + 0.35 * rng.random::<f32>();
+            blend_segment(row, start, len, 6.0, |_| level, mix);
+        }
+        // Switching transient: a spike that decays over a few µs, with noise.
+        fill_noise(&mut noise, 8.0 * IRE_V * strength, rng);
+        let spike = (40.0 + 30.0 * rng.random::<f32>()) * IRE_V * strength;
+        let t_len = 25 + (rng.random::<f32>() * 35.0) as usize;
+        for j in x_s..(x_s + t_len).min(act) {
+            let t = (j - x_s) as f32 / t_len as f32;
+            row[j] += (spike * (-4.0 * t).exp() + noise[j]) * (1.0 - t);
+        }
 
-            // ── Time-base jump: fractional rightward shift ──
-            let ramp = ((k + 1) as f32 / n_lines as f32).powf(1.5);
-            let shift = ((max_shift * ramp + 0.6 * strength * randn(rng)) * timing_scale).max(0.0);
-            shift_segment(&mut signal[line_base..line_base + spl], ACTIVE_START, spl, shift);
-
-            // ── Burst moves with the line, minus a residual timing error ──
-            let residual = (burst_error * ramp + 0.1 * strength * randn(rng)) * timing_scale;
-            let burst_lo = FRONT_PORCH_SAMPLES + HSYNC_SAMPLES;
-            shift_segment(&mut signal[line_base..line_base + spl], burst_lo, ACTIVE_START, shift - residual);
-            let row = &mut signal[base..base + ACTIVE_SAMPLES];
-
-            // ── Switching line: dark, noisy burst over part of the line ──
-            if k == 0 {
-                let r = rng.random::<f32>();
-                let len_frac = clock.blend(0.3 + 0.4 * r, || 0.3 + 0.4 * clock.unit(key + 2));
-                let len = (len_frac * (0.5 + 0.5 * strength) * ACTIVE_SAMPLES as f32) as usize;
-                let r = rng.random::<f32>();
-                let start_frac = clock.blend(r, || clock.unit(key + 3));
-                let start = (start_frac * (ACTIVE_SAMPLES - len) as f32) as usize;
-                let r = rng.random::<f32>();
-                let depth = clock.blend(0.6 + 0.3 * r, || 0.6 + 0.3 * clock.unit(key + 4));
-                let ramp_len = 12.0f32;
-
-                for s in noise.iter_mut() {
-                    *s = randn(rng);
-                }
-                apply_fir_inplace(&mut noise, &noise_lp, &mut scratch);
-
-                for j in start..start + len {
-                    // Raised-cosine edges so the burst fades in and out.
-                    let d = ((j - start).min(start + len - 1 - j)) as f32;
-                    let env = if d < ramp_len {
-                        0.5 - 0.5 * (std::f32::consts::PI * d / ramp_len).cos()
-                    } else {
-                        1.0
-                    };
-                    let mut v = row[j] + depth * env * (BLANKING_V - row[j]);
-                    v += env * strength * 0.18 * noise[j];
-                    if rng.random::<f32>() < 0.04 * strength {
-                        v += env * (0.25 + 0.25 * rng.random::<f32>());
-                    }
-                    row[j] = v;
-                }
+        // ── Lines after the switch: signal lost ──
+        for k in 1..n_lines {
+            let base = (switch_line + k) * spl;
+            moved.copy_from_slice(&signal[base..base + spl]);
+            let offset = jump * (1.0 + 0.5 * randn(rng)) + 20.0 * randn(rng);
+            shift_segment(&mut moved, ACTIVE_START, spl, offset);
+            fill_noise(&mut noise, 2.5 * IRE_V, rng);
+            let lift = 2.0 * IRE_V * rng.random::<f32>();
+            let row = &mut signal[base + ACTIVE_START..base + spl];
+            for (s, &nz) in row.iter_mut().zip(&noise) {
+                *s = black + lift + nz;
+            }
+            // Now and then a dimmed, displaced piece of the picture.
+            if rng.random::<f32>() < 0.5 * strength {
+                let len = 60 + (rng.random::<f32>() * 200.0) as usize;
+                let start = (rng.random::<f32>() * act as f32) as usize;
+                let dim = 0.5 + 0.4 * rng.random::<f32>();
+                let src = &moved[ACTIVE_START..];
+                blend_segment(row, start, len, 8.0, |j| black + dim * (src[j] - black), 1.0);
+            }
+            // Sparse bright streaks of tape noise, some carrying a
+            // subcarrier at a random phase.
+            let n_streaks = (strength * (2.0 + 4.0 * rng.random::<f32>())).round() as usize;
+            for _ in 0..n_streaks {
+                let len = 8 + (rng.random::<f32>() * 45.0) as usize;
+                let start = (rng.random::<f32>() * act as f32) as usize;
+                let luma = black + (30.0 + 50.0 * rng.random::<f32>()) * IRE_V;
+                let chroma = if rng.random::<f32>() < 0.6 { (8.0 + 17.0 * rng.random::<f32>()) * IRE_V } else { 0.0 };
+                let phase = std::f32::consts::TAU * rng.random::<f32>();
+                let carrier = |j: usize| {
+                    let n = (ACTIVE_START + j) as f32;
+                    luma + chroma * (std::f32::consts::FRAC_PI_2 * n + phase).cos()
+                };
+                let mix = 0.7 + 0.3 * rng.random::<f32>();
+                blend_segment(row, start, len, 4.0, carrier, mix);
             }
         }
     }
+}
+
+/// Blend `row[start..start + len]` (clipped to the row) toward `level(j)`
+/// by `mix`, with raised-cosine edges `ramp` samples long.
+fn blend_segment(row: &mut [f32], start: usize, len: usize, ramp: f32, level: impl Fn(usize) -> f32, mix: f32) {
+    let end = (start + len).min(row.len());
+    for j in start.min(end)..end {
+        let d = (j - start).min(end - 1 - j) as f32;
+        let env = if d < ramp { 0.5 - 0.5 * (std::f32::consts::PI * d / ramp).cos() } else { 1.0 };
+        row[j] += env * mix * (level(j) - row[j]);
+    }
+}
+
+/// Frames per slot in which a head-switch hiccup may start.
+const HICCUP_SLOT: u64 = 16;
+
+/// A sudden change of the head-switch state ("tracking hiccup"): `None`
+/// most of the time, or three offsets in [−1, 1] while one is under way.
+///
+/// Hiccups start on average every 6 s / `strength` (at 30 fps).  Most last
+/// 2–8 frames and snap back; some hold for 1–3 s.  It is a pure function
+/// of the tape seed, `key` and the frame number.
+fn head_switch_hiccup(clock: &TapeClock, key: u64, strength: f32) -> Option<[f32; 3]> {
+    let unit = |k: u64, slot: i64| 0.5 + 0.5 * hash_signed(clock.seed, key + k, slot);
+    let p_slot = (strength as f64 * HICCUP_SLOT as f64 / 180.0).min(0.9) as f32;
+    let slot = (clock.frame / HICCUP_SLOT) as i64;
+    // The longest hiccup spans 6 slots; the latest one under way wins.
+    for s in (slot - 6..=slot).rev().filter(|&s| s >= 0) {
+        if unit(0, s) >= p_slot {
+            continue;
+        }
+        let start = s as u64 * HICCUP_SLOT + (unit(1, s) * HICCUP_SLOT as f32) as u64;
+        let len = if unit(2, s) < 0.7 { 2 + (unit(3, s) * 7.0) as u64 } else { 30 + (unit(3, s) * 60.0) as u64 };
+        if (start..start + len).contains(&clock.frame) {
+            return Some([hash_signed(clock.seed, key + 4, s), hash_signed(clock.seed, key + 5, s), hash_signed(clock.seed, key + 6, s)]);
+        }
+    }
+    None
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2396,7 +2468,7 @@ mod tests {
     #[test]
     fn head_switch_touches_only_last_lines_of_each_field() {
         let orig = test_signal();
-        let n = 6;
+        let n = DEFAULT_HEAD_SWITCH_LINES;
         let mut rng = StdRng::seed_from_u64(2);
         let mut sig = orig.clone();
         apply_head_switch(&mut sig, 1.0, n, 1.0, &mut rng, &TapeClock::off());
@@ -2408,6 +2480,18 @@ mod tests {
             let base = l * SAMPLES_PER_LINE;
             assert_eq!(sig[base..base + sync_end], orig[base..base + sync_end]);
         }
+    }
+
+    #[test]
+    fn head_switch_hiccups_are_rare_and_hold() {
+        let state = |f: u64| head_switch_hiccup(&TapeClock { seed: 5, frame: f, coherence: 1.0 }, KEY_HEAD_SWITCH, 1.0);
+        let frames: Vec<Option<[f32; 3]>> = (0..9000).map(state).collect();
+        let busy = frames.iter().filter(|h| h.is_some()).count() as f32 / frames.len() as f32;
+        assert!((0.03..0.4).contains(&busy), "in a hiccup {:.0}% of the time", busy * 100.0);
+        // A hiccup holds one value; changes are few compared with frames.
+        let changes = frames.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(changes > 4 && changes < 200, "{} changes", changes);
+        assert_eq!(state(1234), state(1234));
     }
 
     #[test]

@@ -194,7 +194,7 @@ ntsc-composite-simulator roundtrip input.mp4 -o output.mkv \
 # Head-switching tear at the bottom, blue/purple bands and caption dashes at the top
 ntsc-composite-simulator image photo.png -o vhs.png \
   --vhs-luma-bw 3.0 --color-under-bw 400 \
-  --head-switch 0.7 --head-switch-lines 6 --top-band 0.5 --vbi-data 0.5
+  --head-switch 0.7 --head-switch-lines 3 --top-band 0.5 --vbi-data 0.5
 ```
 
 #### Presets
@@ -227,7 +227,7 @@ There are two families:
 | `--head-smear` | 0.2..0.3 | 0.15..0.2 | 0.1..0.15 | yes |
 | `--tape-trail` | 0.75..0.9 | 0.6..0.75 | 0.5..0.7 | yes |
 | `--head-switch` | 0.8..1.0 | 0.55..0.7 | 0.35..0.45 | no |
-| `--head-switch-lines` | 7 | 6 | 5 | no |
+| `--head-switch-lines` | 3 | 3 | 3 | no |
 | `--top-band` | 0.6..0.8 | 0.4..0.55 | 0.2..0.3 | no |
 | `--vbi-data` | 0.6..0.8 | 0.4..0.55 | 0.25..0.35 | no |
 | `--chroma-noise` | 0.025..0.035 | 0.015..0.025 | 0.008..0.015 | no |
@@ -378,8 +378,8 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 | `--tape-dropout-len` | roundtrip, image, colorbars | Average dropout length in µs (default: 15.0) |
 | `--head-smear` | roundtrip, image, colorbars | Worn-head symmetric luma blur (0.3–1.0); varies in bands across the frame |
 | `--tape-trail` | roundtrip, image, colorbars | Causal rightward luma smear (0.3–1.0); the classic worn-tape trailing effect |
-| `--head-switch` | roundtrip, image, colorbars | Head-switching noise at the bottom of each field (0–1): rightward tear, black left edge, dark speckled switching line |
-| `--head-switch-lines` | roundtrip, image, colorbars | Active lines per field torn by head switching (default: 6, i.e. 12 rows at 480) |
+| `--head-switch` | roundtrip, image, colorbars | Head-switching noise at the bottom of each field (0–1): a displaced switch line with a switching transient, then near-black lines with bright noise streaks; stable over a tape with per-field flicker and occasional sudden jumps |
+| `--head-switch-lines` | roundtrip, image, colorbars | Active lines per field torn by head switching at full strength (default: 3, i.e. 6 rows at 480; fewer at low strength) |
 | `--top-band` | roundtrip, image, colorbars | Faint blue/purple chroma bands on the first lines of each field (0–1) |
 | `--vbi-data` | roundtrip, image, colorbars | Closed-caption data on lines 21/284, visible as short light dashes near the top (0–1) |
 | `--chroma-noise` | roundtrip, image, colorbars | Colour-under chroma noise, std dev of I/Q noise (subtle 0.01–0.03, heavy 0.06); horizontal colour blotches |
@@ -515,6 +515,7 @@ The VHS simulation models both the recording and playback signal paths:
 
 Newest first.
 
+- **Head switching rework**: matches a real capture. Only the last 2–3 field lines tear (`--head-switch-lines` default and lq/mq/hq values now 3): a switch line that jumps sideways part-way along with a short switching transient, then near-black lines with sparse white, green and purple noise streaks and the odd displaced piece of picture. No more mid-band dark stripe or black wedge on the left. Over a video the switch is a fixed property of the tape with per-field flicker and occasional sudden jumps that hold for a few frames or seconds, instead of sliding and shrinking. Legacy presets are unchanged.
 - **3D comb independent of `--threads`**: frame 1 now uses frame 0 as received for both earlier frames, and telecine runs carry the previous batch's frames across batch boundaries, so `--comb 3d` output is the same at any thread count (frame 1 of `--comb 3d` roundtrips changes; nothing else does).
 - **Faster processing, same output**: S-Video runs each tape effect and the encoder's band-limiting once instead of per wire, the 3D comb makes each frame's signal once instead of three times, and the colour-under noise, line shifts, deck noise reduction, decoder resize and DVD mastering are vectorised. On one thread at 640x480: `--preset lq` 16.8 -> 28.5 fps, `legacy-lq` 22 -> 40 fps, `lq --deck deck-svhs-tbc` 11.2 -> 25 fps, `lq --comb 3d` 6 -> 25 fps. Output is bit-identical to before.
 - **Portable builds**: release builds no longer use `target-cpu=native`, so a binary built on a new CPU runs on older ones (no illegal-instruction crashes); hot loops pick AVX2 or SSE2 at run time. Tape-path, ringing and other FIR filters are vectorised; output is unchanged bit for bit.

@@ -464,7 +464,7 @@ pub static SPECS: &[ParamSpec] = &[
     ParamSpec {
         id: "head-switch",
         label: "Head switching",
-        help: "Head-switching noise (0–1). The bottom lines tear to the right with a dark, speckled switching line.",
+        help: "Head-switching noise (0–1). The last lines of each field tear: a displaced switch line, then near-black lines with bright noise streaks. Stable over a tape, flickering, with occasional sudden jumps.",
         unit: "",
         group: Group::Timing,
         kind: num(0.0, 1.0, 0.6),
@@ -472,10 +472,10 @@ pub static SPECS: &[ParamSpec] = &[
     ParamSpec {
         id: "head-switch-lines",
         label: "Head-switch lines",
-        help: "Active lines per field torn by head switching (default 6, i.e. 12 rows at 480).",
+        help: "Active lines per field torn by head switching at full strength (default 3, i.e. 6 rows at 480).",
         unit: "lines",
         group: Group::Timing,
-        kind: Kind::Number { min: 1.0, max: 20.0, default: None, typical: 6.0, integer: true },
+        kind: Kind::Number { min: 1.0, max: 20.0, default: None, typical: 3.0, integer: true },
     },
     ParamSpec {
         id: "top-band",
