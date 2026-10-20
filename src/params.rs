@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::effects::{splitmix64, Doc, GhostConfig, SignalEffects, DEFAULT_HEAD_SWITCH_LINES};
+use crate::effects::{splitmix64, Doc, GhostConfig, HeadSwitchAfter, SignalEffects, DEFAULT_HEAD_SWITCH_LINES};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Range parameters
@@ -491,6 +491,39 @@ pub static SPECS: &[ParamSpec] = &[
         kind: Kind::Number { min: 1.0, max: 20.0, default: None, typical: 3.0, integer: true },
     },
     ParamSpec {
+        id: "head-switch-point",
+        label: "Head-switch point",
+        help: "Opt-in. Where the heads switch, in lines before vertical sync (the format allows 6.5 ± 1.5). Sets \
+               how many lines at the bottom are torn, about 2·point − 7 rows of a 480-line capture (5-7 rows at \
+               6.5, 2-10 over the format's range), independent of the head-switching strength. Replaces \
+               Head-switch lines.",
+        unit: "H",
+        group: Group::Timing,
+        kind: num(4.0, 9.0, 6.5),
+    },
+    ParamSpec {
+        id: "head-switch-after",
+        label: "After the switch",
+        help: "What the lines after the head switch show. black: signal lost, near black with light streaks (as \
+               on many worn tapes). picture: the picture, shifted sideways by the switch's time-base jump with a \
+               small level step (the common case on healthy tapes). A line TBC straightens the shifted lines but \
+               not the switching noise.",
+        unit: "",
+        group: Group::Timing,
+        kind: Kind::Choice { options: &["black", "picture"], default: "black" },
+    },
+    ParamSpec {
+        id: "flagging",
+        label: "Top skew (flagging)",
+        help: "Opt-in. Top-of-field skew (0–1): the head switch's time-base step carried into the next field by a \
+               slow horizontal PLL in the TV or capture card, so the top lines bend sideways and straighten out \
+               over about 30 lines, the two fields in opposite directions. 1 = about 1 µs (12 px at 640 wide) at the \
+               top line. A line TBC removes it.",
+        unit: "",
+        group: Group::Timing,
+        kind: num(0.0, 1.0, 0.5),
+    },
+    ParamSpec {
         id: "top-band",
         label: "Top colour band",
         help: "Faint blue/purple bands on the first lines of each field (0–1), as the deck's chroma loop settles.",
@@ -915,6 +948,12 @@ impl ParamValues {
             deck_dnr: None,
             stage_seed: 0,
             deck_nc: None,
+            head_switch_point: None,
+            head_switch_after: match self.choice("head-switch-after") {
+                "picture" => HeadSwitchAfter::Picture,
+                _ => HeadSwitchAfter::Black,
+            },
+            flagging: None,
             doc: match self.choice("doc") {
                 "luma" => Doc::Luma,
                 "off" => Doc::Off,
@@ -941,6 +980,8 @@ impl ParamValues {
         // Stages with their own random streams (drawn after everything
         // above, so older parameter sets keep their exact values).
         fx.deck_nc = s("deck-nc", rng);
+        fx.head_switch_point = s("head-switch-point", rng);
+        fx.flagging = s("flagging", rng);
         fx.stage_seed = match self.seed {
             Some(seed) => mix_seed(seed, 0x57A6E),
             None => rng.random(),
@@ -1021,6 +1062,8 @@ impl ParamValues {
         opt("deck_sharpness", "deck-sharpness", fx.deck_sharpness);
         opt("deck_dnr", "deck-dnr", fx.deck_dnr);
         opt("deck_nc", "deck-nc", fx.deck_nc);
+        opt("head_switch_point", "head-switch-point", fx.head_switch_point);
+        opt("flagging", "flagging", fx.flagging);
         parts
     }
 

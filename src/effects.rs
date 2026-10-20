@@ -171,6 +171,13 @@ pub struct SignalEffects {
     pub deck_nc: Option<f32>,
     /// What the dropout compensator does with long dropouts.
     pub doc: Doc,
+    /// Head-switch point in lines before vertical sync; `None` = use
+    /// `head_switch_lines`.
+    pub head_switch_point: Option<f32>,
+    /// What the lines after the head switch show.
+    pub head_switch_after: HeadSwitchAfter,
+    /// Top-of-field skew strength (0-1).  `None` = off.
+    pub flagging: Option<f32>,
 }
 
 /// Default number of active lines per field affected by head switching.
@@ -200,6 +207,7 @@ impl SignalEffects {
             || self.wobble.is_some()
             || self.v_jitter.is_some()
             || self.deck_luma().is_active()
+            || self.flagging.is_some()
     }
 
     /// Settings of the deck's playback luma circuits.
@@ -372,9 +380,18 @@ impl SignalEffects {
         }
         if let Some(strength) = self.head_switch {
             let _p = profile::scope("fx head switch");
-            run(wires, rng, &all, &mut |s, _, rng| {
-                apply_head_switch(s, strength, self.head_switch_lines, 1.0 - 0.75 * tbc, rng, &clock)
-            });
+            let hs = HeadSwitch {
+                strength,
+                lines: self.head_switch_lines,
+                point: self.head_switch_point,
+                after: self.head_switch_after,
+                tbc,
+            };
+            run(wires, rng, &all, &mut |s, _, rng| apply_head_switch(s, &hs, rng, &clock));
+        }
+        if let Some(strength) = self.flagging {
+            let _p = profile::scope("fx flagging");
+            each(wires, &mut |s, _| apply_flagging(s, strength, tbc, &clock));
         }
         // The deck's playback luma circuits act on everything the tape and
         // the heads produced.
@@ -1512,27 +1529,35 @@ fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng, clock: 
 ///     so they come out green or purple) and now and then a dimmed,
 ///     displaced piece of the picture.
 ///
+/// With `HeadSwitch::after` set to `Picture`, the lines after the switch
+/// keep the picture, displaced by the jump, with a small level step and a
+/// little extra noise: the new head reads valid picture from the start of
+/// its own track, which is the common case on real tapes.
+///
+/// How many lines are torn: with `HeadSwitch::point` set, from the switch
+/// point (in lines before vertical sync; the format allows 6.5 ± 1.5).  In
+/// a 480-line capture that leaves `point − 3` lines of field 1 and
+/// `point − 4` of field 2 after the switch, the fraction setting where
+/// along the switch line it happens: about 5-7 rows in all at 6.5.
+/// Without it, `lines` at full strength (a little fewer at low strength).
+///
 /// Over time the switch behaves as on a real tape: the switch point, the
-/// jump and the number of torn lines (`lines` at full strength, a little
-/// fewer at low strength) are a fixed property of the tape (its seed),
-/// with a few samples of flicker every field, freshly drawn noise and
-/// streaks, and now and then a sudden change that holds for a few frames
-/// or seconds (`head_switch_hiccup`).  With zero `coherence` the state is
-/// re-rolled every frame instead.  `timing_scale` (< 1 with a line TBC)
-/// scales the jump, not the noise.  Sync and burst are left alone.
-fn apply_head_switch<R: Rng>(
-    signal: &mut [f32],
-    strength: f32,
-    lines: usize,
-    timing_scale: f32,
-    rng: &mut R,
-    clock: &TapeClock,
-) {
+/// jump and the number of torn lines are a fixed property of the tape (its
+/// seed), with a few samples of flicker every field, freshly drawn noise
+/// and streaks, and now and then a sudden change that holds for a few
+/// frames or seconds (`head_switch_hiccup`).  With zero `coherence` the
+/// state is re-rolled every frame instead.  A line TBC (`tbc`) re-times
+/// every line from its own sync: it removes the displacement of the lines
+/// after the switch, but not that of the switch line itself (two timings
+/// in one line) nor the noise.  Sync and burst are left alone.
+fn apply_head_switch<R: Rng>(signal: &mut [f32], hs: &HeadSwitch, rng: &mut R, clock: &TapeClock) {
     let spl = SAMPLES_PER_LINE;
-    let strength = strength.clamp(0.0, 1.0);
+    let strength = hs.strength.clamp(0.0, 1.0);
+    let lines = hs.lines;
     if strength <= 0.0 || lines == 0 || signal.len() < TOTAL_LINES * spl {
         return;
     }
+    let retime = 1.0 - hs.tbc.clamp(0.0, 1.0);
     let act = ACTIVE_SAMPLES;
     let black = BLANKING_V + 7.5 * IRE_V;
     let noise_lp = filters::design_lowpass(3.0e6, 15);
@@ -1559,15 +1584,29 @@ fn apply_head_switch<R: Rng>(
             extra = (1.4 * h[2]).round();
         }
         let r = rng.random::<f32>();
-        let at_frac = 0.15 + 0.6 * clock.blend(r, || at_t);
+        let mut at_frac = 0.15 + 0.6 * clock.blend(r, || at_t);
         let r = rng.random::<f32>();
         let jump_size = 15.0 + 35.0 * clock.blend(r, || jump_t);
         let r = rng.random::<f32>();
         let up = if clock.coherence > 0.0 { tape(2) } else { r };
         let sign = if up < 0.75 { 1.0 } else { -1.0 };
-        let jump = sign * strength * (jump_size + 1.5 * randn(rng)) * timing_scale;
-        let lines_here = lines as f32 * (0.5 + 0.5 * strength) + clock.blend(0.0, || extra);
-        let n_lines = (lines_here.round().max(1.0) as usize).min(end - first);
+        let jump = sign * strength * (jump_size + 1.5 * randn(rng));
+        let n_lines = match hs.point {
+            Some(point) => {
+                // Field lines after the switch in a 480-line capture.
+                let after = point - if field == 0 { 3.0 } else { 4.0 } + clock.blend(0.0, || extra);
+                if after <= 0.0 {
+                    continue;
+                }
+                let n = after.ceil();
+                at_frac = n - after;
+                (n as usize).min(end - first)
+            }
+            None => {
+                let lines_here = lines as f32 * (0.5 + 0.5 * strength) + clock.blend(0.0, || extra);
+                (lines_here.round().max(1.0) as usize).min(end - first)
+            }
+        };
         let switch_line = end - n_lines;
 
         // ── Switch line ──
@@ -1605,11 +1644,28 @@ fn apply_head_switch<R: Rng>(
             row[j] += (spike * (-4.0 * t).exp() + noise[j]) * (1.0 - t);
         }
 
+        // ── Lines after the switch: displaced picture ──
+        if hs.after == HeadSwitchAfter::Picture {
+            // The other head's level differs a little (per tape).
+            let step = 2.0 * IRE_V * hash_signed(clock.seed, key + 5, -9);
+            for k in 1..n_lines {
+                let base = (switch_line + k) * spl;
+                moved.copy_from_slice(&signal[base..base + spl]);
+                shift_segment(&mut moved, ACTIVE_START, spl, retime * (jump + 1.5 * randn(rng)));
+                fill_noise(&mut noise, 1.5 * IRE_V, rng);
+                let row = &mut signal[base + ACTIVE_START..base + spl];
+                for ((s, &m), &nz) in row.iter_mut().zip(&moved[ACTIVE_START..]).zip(&noise) {
+                    *s = m + step + nz;
+                }
+            }
+            continue;
+        }
+
         // ── Lines after the switch: signal lost ──
         for k in 1..n_lines {
             let base = (switch_line + k) * spl;
             moved.copy_from_slice(&signal[base..base + spl]);
-            let offset = jump * (1.0 + 0.5 * randn(rng)) + 20.0 * randn(rng);
+            let offset = retime * (jump * (1.0 + 0.5 * randn(rng)) + 20.0 * randn(rng));
             shift_segment(&mut moved, ACTIVE_START, spl, offset);
             fill_noise(&mut noise, 2.5 * IRE_V, rng);
             let lift = 2.0 * IRE_V * rng.random::<f32>();
@@ -1641,6 +1697,64 @@ fn apply_head_switch<R: Rng>(
                 let mix = 0.7 + 0.3 * rng.random::<f32>();
                 blend_segment(row, start, len, 4.0, carrier, mix);
             }
+        }
+    }
+}
+
+/// What the lines after the head switch show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeadSwitchAfter {
+    /// Signal lost: near black with light streaks.
+    #[default]
+    Black,
+    /// The picture, displaced by the switch's time-base jump.
+    Picture,
+}
+
+/// Head-switching settings.
+#[derive(Clone, Copy, Debug)]
+pub struct HeadSwitch {
+    pub strength: f32,
+    /// Torn lines per field at full strength, when `point` is not set.
+    pub lines: usize,
+    /// Switch point in lines before vertical sync.
+    pub point: Option<f32>,
+    pub after: HeadSwitchAfter,
+    /// Line TBC strength (0-1).
+    pub tbc: f32,
+}
+
+/// Lines over which the time-base error left by the head switch dies away
+/// at the top of a field.
+const FLAG_DECAY_LINES: f32 = 10.0;
+
+/// Top-of-field skew ("flagging"): the two heads' timing differs, so each
+/// head switch is a time-base step, and a TV or capture card whose
+/// horizontal PLL is slow has not fully caught up by the top of the next
+/// field.  The top lines are displaced and straighten out over ~30 lines.
+/// The switch goes from one head to the other and back, so the two fields
+/// bend in opposite directions.  At the first active line the offset is
+/// `strength` × 0.7-1.3 µs (fixed per tape); a line TBC removes it.
+fn apply_flagging(signal: &mut [f32], strength: f32, tbc: f32, clock: &TapeClock) {
+    let spl = SAMPLES_PER_LINE;
+    let amount = strength.clamp(0.0, 1.0) * (1.0 - tbc.clamp(0.0, 1.0));
+    if amount <= 0.0 || signal.len() < TOTAL_LINES * spl {
+        return;
+    }
+    let burst_lo = FRONT_PORCH_SAMPLES + HSYNC_SAMPLES;
+    let tape = |k: u64| 0.5 + 0.5 * hash_signed(clock.seed, KEY_HEAD_SWITCH + k, -11);
+    let sign = if tape(0) < 0.5 { 1.0 } else { -1.0 };
+    let us = 0.7 + 0.6 * tape(1);
+    for (field, &(first, end)) in FIELD_ACTIVE_LINES.iter().enumerate() {
+        let field_sign = if field == 0 { -sign } else { sign };
+        let skew = field_sign * amount * us * 1e-6 * crate::constants::SAMPLE_RATE as f32;
+        for k in 0..(4.0 * FLAG_DECAY_LINES) as usize {
+            let line = first + k;
+            if line >= end {
+                break;
+            }
+            let d = skew * (-(k as f32) / FLAG_DECAY_LINES).exp();
+            shift_segment(&mut signal[line * spl..(line + 1) * spl], burst_lo, spl, d);
         }
     }
 }
@@ -2519,12 +2633,28 @@ mod tests {
         assert!(run(Some(1.0)) < 0.2 * run(None));
     }
 
+    fn hs(strength: f32, lines: usize) -> HeadSwitch {
+        HeadSwitch { strength, lines, point: None, after: HeadSwitchAfter::Black, tbc: 0.0 }
+    }
+
+    #[test]
+    fn head_switch_point_sets_the_torn_lines() {
+        let orig = test_signal();
+        for (point, n1, n2) in [(6.5f32, 4usize, 3usize), (5.0, 2, 1), (8.0, 5, 4)] {
+            let mut sig = orig.clone();
+            let cfg = HeadSwitch { point: Some(point), after: HeadSwitchAfter::Picture, ..hs(0.5, 3) };
+            apply_head_switch(&mut sig, &cfg, &mut StdRng::seed_from_u64(2), &TapeClock::off());
+            let expected: Vec<usize> = (260 - n1..260).chain(523 - n2..523).collect();
+            assert_eq!(changed_lines(&orig, &sig), expected, "point {point}");
+        }
+    }
+
     #[test]
     fn zero_strength_is_noop() {
         let orig = test_signal();
         let mut rng = StdRng::seed_from_u64(1);
         let mut sig = orig.clone();
-        apply_head_switch(&mut sig, 0.0, DEFAULT_HEAD_SWITCH_LINES, 1.0, &mut rng, &TapeClock::off());
+        apply_head_switch(&mut sig, &hs(0.0, DEFAULT_HEAD_SWITCH_LINES), &mut rng, &TapeClock::off());
         apply_top_band(&mut sig, 0.0, &mut rng, &TapeClock::off());
         apply_vbi_data(&mut sig, 0.0, crate::constants::SAMPLE_RATE, &mut rng);
         let off = ChromaPathConfig::default();
@@ -2580,7 +2710,7 @@ mod tests {
         let n = DEFAULT_HEAD_SWITCH_LINES;
         let mut rng = StdRng::seed_from_u64(2);
         let mut sig = orig.clone();
-        apply_head_switch(&mut sig, 1.0, n, 1.0, &mut rng, &TapeClock::off());
+        apply_head_switch(&mut sig, &hs(1.0, n), &mut rng, &TapeClock::off());
         let expected: Vec<usize> = (260 - n..260).chain(523 - n..523).collect();
         assert_eq!(changed_lines(&orig, &sig), expected);
         // Front porch and sync stay untouched on the affected lines.
