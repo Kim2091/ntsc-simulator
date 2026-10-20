@@ -12,6 +12,7 @@ use ntsc_composite_simulator::params::{Group, ParamValues};
 use ntsc_composite_simulator::pipeline;
 use ntsc_composite_simulator::presets::{self, Preset, BUILTIN};
 
+use crate::dialog::FileDialogTask;
 use crate::params_ui::ParamEditor;
 use crate::playback::{PlayRequest, Playback};
 use crate::process::{JobSettings, ProcessDialog};
@@ -33,6 +34,16 @@ enum Source {
     Bars,
     Image(PathBuf),
     Video { path: PathBuf, duration: f64, fps: f64, time: f64, w: usize, h: usize },
+}
+
+/// What the open file dialog's choice is for.
+enum DialogFor {
+    Open,
+    LoadPreset,
+    /// With the preset name to use if the file has none.
+    SavePreset(String),
+    /// With the frame to save.
+    SavePng(Vec<u8>, usize, usize),
 }
 
 /// Settings that playback is running with; a change restarts it.
@@ -117,6 +128,8 @@ pub struct App {
     auto_paused: Option<Instant>,
     /// Panic once the preview has rendered (--crash-test ui).
     crash_test_ui: bool,
+    /// The open file dialog and what its choice is for.
+    dialog: Option<(DialogFor, FileDialogTask)>,
 }
 
 fn bars_source() -> SourceImage {
@@ -180,6 +193,7 @@ impl App {
             play_pause: args.play_pause,
             auto_paused: None,
             crash_test_ui: args.crash_test.as_deref() == Some("ui"),
+            dialog: None,
         };
         app.deck = args.deck.as_deref().and_then(presets::deck).map(|d| d.name);
         if let Some((w, h)) = args.size.as_deref().and_then(|s| s.split_once('x')) {
@@ -286,21 +300,22 @@ impl App {
         }
     }
 
-    fn save_preset_dialog(&mut self) {
+    fn save_preset_dialog(&mut self, ctx: &egui::Context) {
         let default_name = match &self.preset {
             PresetChoice::None => "custom".to_string(),
             c => format!("{}-custom", self.preset_label(c)),
         };
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Preset (JSON)", &["json"])
-            .set_file_name(format!("{}.json", default_name))
-            .save_file()
-        else {
-            return;
-        };
+        let file_name = format!("{}.json", default_name);
+        let task = FileDialogTask::spawn(ctx, move || {
+            rfd::FileDialog::new().add_filter("Preset (JSON)", &["json"]).set_file_name(file_name).save_file()
+        });
+        self.dialog = Some((DialogFor::SavePreset(default_name), task));
+    }
+
+    fn save_preset(&mut self, path: &Path, default_name: String) {
         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or(default_name);
         let preset = Preset { name: name.clone(), values: self.current_values() };
-        match presets::save_preset_file(&path, &preset) {
+        match presets::save_preset_file(path, &preset) {
             Ok(()) => {
                 self.custom_presets.push(preset);
                 let i = self.custom_presets.len() - 1;
@@ -335,14 +350,32 @@ impl App {
     }
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
-        let mut exts: Vec<&str> = pipeline::IMAGE_EXTENSIONS.to_vec();
-        exts.extend_from_slice(pipeline::VIDEO_EXTENSIONS);
-        if let Some(p) = rfd::FileDialog::new()
-            .add_filter("Images and videos", &exts)
-            .add_filter("Presets (JSON)", &["json"])
-            .pick_file()
-        {
-            self.open_path(ctx, &p);
+        let task = FileDialogTask::spawn(ctx, || {
+            let mut exts: Vec<&str> = pipeline::IMAGE_EXTENSIONS.to_vec();
+            exts.extend_from_slice(pipeline::VIDEO_EXTENSIONS);
+            rfd::FileDialog::new()
+                .add_filter("Images and videos", &exts)
+                .add_filter("Presets (JSON)", &["json"])
+                .pick_file()
+        });
+        self.dialog = Some((DialogFor::Open, task));
+    }
+
+    fn load_preset_dialog(&mut self, ctx: &egui::Context) {
+        let task = FileDialogTask::spawn(ctx, || rfd::FileDialog::new().add_filter("Preset (JSON)", &["json"]).pick_file());
+        self.dialog = Some((DialogFor::LoadPreset, task));
+    }
+
+    /// Act on a file dialog that has closed.
+    fn poll_dialog(&mut self, ctx: &egui::Context) {
+        let Some(choice) = self.dialog.as_ref().and_then(|(_, task)| task.poll()) else { return };
+        let Some((what, _)) = self.dialog.take() else { return };
+        let Some(path) = choice else { return };
+        match what {
+            DialogFor::Open => self.open_path(ctx, &path),
+            DialogFor::LoadPreset => self.load_preset_file(&path),
+            DialogFor::SavePreset(default_name) => self.save_preset(&path, default_name),
+            DialogFor::SavePng(rgb, w, h) => self.save_png(&path, rgb, w, h),
         }
     }
 
@@ -654,14 +687,19 @@ impl App {
         args.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
     }
 
-    fn save_preview_png(&mut self) {
-        let Some((rgb, w, h)) = &self.after_rgb else { return };
-        let Some(path) = rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name("preview.png").save_file() else {
-            return;
-        };
-        let r = image::RgbImage::from_raw(*w as u32, *h as u32, rgb.clone())
+    /// Ask where to save the processed preview; the frame shown now is saved.
+    fn save_preview_png(&mut self, ctx: &egui::Context) {
+        let Some((rgb, w, h)) = self.after_rgb.clone() else { return };
+        let task = FileDialogTask::spawn(ctx, || {
+            rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name("preview.png").save_file()
+        });
+        self.dialog = Some((DialogFor::SavePng(rgb, w, h), task));
+    }
+
+    fn save_png(&mut self, path: &Path, rgb: Vec<u8>, w: usize, h: usize) {
+        let r = image::RgbImage::from_raw(w as u32, h as u32, rgb)
             .ok_or_else(|| "bad image".to_string())
-            .and_then(|img| img.save(&path).map_err(|e| e.to_string()));
+            .and_then(|img| img.save(path).map_err(|e| e.to_string()));
         self.status = Some(match r {
             Ok(()) => (true, format!("Saved {}", path.display())),
             Err(e) => (false, format!("Cannot save {}: {}", path.display(), e)),
@@ -679,7 +717,11 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Open…").on_hover_text("Open an image, a video (scrub or play it with the controls at the bottom) or a preset .json. You can also drop files onto the window.").clicked() {
+            let no_dialog = self.dialog.is_none();
+            if ui.add_enabled(no_dialog, egui::Button::new("Open…"))
+                .on_hover_text("Open an image, a video (scrub or play it with the controls at the bottom) or a preset .json. You can also drop files onto the window.")
+                .clicked()
+            {
                 self.open_dialog(ui.ctx());
             }
             if !matches!(self.source, Source::Bars) && ui.button("Colour bars").on_hover_text("Go back to the built-in test pattern").clicked() {
@@ -712,8 +754,8 @@ impl App {
                         Source::Bars => {}
                     }
                 }
-                if ui.add_enabled(self.after_rgb.is_some(), egui::Button::new("Save PNG…")).on_hover_text("Save the processed preview").clicked() {
-                    self.save_preview_png();
+                if ui.add_enabled(self.after_rgb.is_some() && no_dialog, egui::Button::new("Save PNG…")).on_hover_text("Save the processed preview").clicked() {
+                    self.save_preview_png(ui.ctx());
                 }
                 if ui.add_enabled(self.after_rgb.is_some(), egui::Button::new("Copy frame"))
                     .on_hover_text("Copy the processed preview frame to the clipboard (Ctrl+C)")
@@ -809,13 +851,15 @@ impl App {
             {
                 self.editor = self.base.clone();
             }
-            if ui.button("Load…").on_hover_text("Load a preset .json").clicked() {
-                if let Some(p) = rfd::FileDialog::new().add_filter("Preset (JSON)", &["json"]).pick_file() {
-                    self.load_preset_file(&p);
-                }
+            let no_dialog = self.dialog.is_none();
+            if ui.add_enabled(no_dialog, egui::Button::new("Load…")).on_hover_text("Load a preset .json").clicked() {
+                self.load_preset_dialog(ui.ctx());
             }
-            if ui.button("Save…").on_hover_text("Save the current settings as a preset .json (usable with --preset-file)").clicked() {
-                self.save_preset_dialog();
+            if ui.add_enabled(no_dialog, egui::Button::new("Save…"))
+                .on_hover_text("Save the current settings as a preset .json (usable with --preset-file)")
+                .clicked()
+            {
+                self.save_preset_dialog(ui.ctx());
             }
         });
         if let PresetChoice::Builtin(name) = self.preset {
@@ -1101,6 +1145,7 @@ impl eframe::App for App {
             panic!("crash test on the UI thread");
         }
         self.handle_drops(&ctx);
+        self.poll_dialog(&ctx);
         self.poll_grab(&ctx);
 
         // Ctrl+C copies the frame unless a text field has focus.

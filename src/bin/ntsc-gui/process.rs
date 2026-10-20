@@ -11,6 +11,8 @@ use eframe::egui;
 use ntsc_composite_simulator::params::ParamValues;
 use ntsc_composite_simulator::pipeline::{self, Progress, VideoOptions, CANCELLED};
 
+use crate::dialog::FileDialogTask;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
     Image,
@@ -78,6 +80,15 @@ pub struct ProcessDialog {
     x264_preset: String,
     job: Option<Job>,
     message: Option<(bool, String)>,
+    /// The open file dialog and the field its choice goes to.
+    dialog: Option<(Target, FileDialogTask)>,
+}
+
+/// The field a file dialog fills in.
+#[derive(Clone, Copy)]
+enum Target {
+    Input,
+    Output,
 }
 
 impl Default for ProcessDialog {
@@ -94,6 +105,7 @@ impl Default for ProcessDialog {
             x264_preset: "fast".into(),
             job: None,
             message: None,
+            dialog: None,
         }
     }
 }
@@ -142,6 +154,14 @@ impl ProcessDialog {
     }
 
     pub fn show(&mut self, ctx: &egui::Context, settings: impl FnOnce() -> JobSettings) {
+        if let Some(choice) = self.dialog.as_ref().and_then(|(_, task)| task.poll()) {
+            if let (Some((target, _)), Some(p)) = (self.dialog.take(), choice) {
+                match target {
+                    Target::Input => self.set_input(&p),
+                    Target::Output => self.output = p.display().to_string(),
+                }
+            }
+        }
         if !self.open {
             return;
         }
@@ -172,17 +192,18 @@ impl ProcessDialog {
                                     self.output = suggest_output(&p, self.kind).display().to_string();
                                 }
                             }
-                            if ui.button("File…").clicked() {
-                                let mut exts: Vec<&str> = pipeline::IMAGE_EXTENSIONS.to_vec();
-                                exts.extend_from_slice(pipeline::VIDEO_EXTENSIONS);
-                                if let Some(p) = rfd::FileDialog::new().add_filter("Images and videos", &exts).pick_file() {
-                                    self.set_input(&p);
-                                }
+                            let no_dialog = self.dialog.is_none();
+                            if ui.add_enabled(no_dialog, egui::Button::new("File…")).clicked() {
+                                let task = FileDialogTask::spawn(ui.ctx(), || {
+                                    let mut exts: Vec<&str> = pipeline::IMAGE_EXTENSIONS.to_vec();
+                                    exts.extend_from_slice(pipeline::VIDEO_EXTENSIONS);
+                                    rfd::FileDialog::new().add_filter("Images and videos", &exts).pick_file()
+                                });
+                                self.dialog = Some((Target::Input, task));
                             }
-                            if ui.button("Folder…").clicked() {
-                                if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                                    self.set_input(&p);
-                                }
+                            if ui.add_enabled(no_dialog, egui::Button::new("Folder…")).clicked() {
+                                let task = FileDialogTask::spawn(ui.ctx(), || rfd::FileDialog::new().pick_folder());
+                                self.dialog = Some((Target::Input, task));
                             }
                         });
                         ui.end_row();
@@ -190,18 +211,17 @@ impl ProcessDialog {
                         ui.label("Output");
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(&mut self.output).desired_width(400.0).hint_text("file, or folder for batch input"));
-                            if ui.button("Browse…").clicked() {
-                                let input = PathBuf::from(&self.input);
-                                let picked = if input.is_dir() {
-                                    rfd::FileDialog::new().pick_folder()
-                                } else {
-                                    rfd::FileDialog::new().set_file_name(
-                                        Path::new(&self.output).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-                                    ).save_file()
-                                };
-                                if let Some(p) = picked {
-                                    self.output = p.display().to_string();
-                                }
+                            if ui.add_enabled(self.dialog.is_none(), egui::Button::new("Browse…")).clicked() {
+                                let folder = PathBuf::from(&self.input).is_dir();
+                                let name = Path::new(&self.output).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                                let task = FileDialogTask::spawn(ui.ctx(), move || {
+                                    if folder {
+                                        rfd::FileDialog::new().pick_folder()
+                                    } else {
+                                        rfd::FileDialog::new().set_file_name(name).save_file()
+                                    }
+                                });
+                                self.dialog = Some((Target::Output, task));
                             }
                         });
                         ui.end_row();

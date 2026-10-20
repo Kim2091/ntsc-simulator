@@ -5,6 +5,7 @@
 
 mod app;
 mod crash;
+mod dialog;
 mod params_ui;
 mod playback;
 mod process;
