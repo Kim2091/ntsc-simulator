@@ -5,6 +5,7 @@ use realfft::RealFftPlanner;
 use crate::constants::*;
 use crate::filters::{self, FilterKernel, FilterScratch};
 use crate::profile;
+use crate::simd::multiversion;
 
 const RIGHT_PAD: usize = NUM_TAPS;
 
@@ -383,56 +384,97 @@ impl Decoder {
             };
 
             let inv_comp_scale = 1.0 / COMPOSITE_SCALE;
-
+            let x_tab: Vec<(usize, usize, f32)> = (0..output_width)
+                .map(|dx| {
+                    let sx = dx as f32 * x_scale;
+                    let sx0 = (sx as usize).min(ACTIVE_SAMPLES - 1);
+                    let sx1 = (sx0 + 1).min(ACTIVE_SAMPLES - 1);
+                    (sx0, sx1, sx - sx0 as f32)
+                })
+                .collect();
             for dy in 0..output_height {
                 let sy = dy as f32 * y_scale;
                 let sy0 = (sy as usize).min(VISIBLE_LINES - 1);
                 let sy1 = (sy0 + 1).min(VISIBLE_LINES - 1);
                 let yt = sy - sy0 as f32;
-                let yt_inv = 1.0 - yt;
-
-                for dx in 0..output_width {
-                    let sx = dx as f32 * x_scale;
-                    let sx0 = (sx as usize).min(ACTIVE_SAMPLES - 1);
-                    let sx1 = (sx0 + 1).min(ACTIVE_SAMPLES - 1);
-                    let xt = sx - sx0 as f32;
-                    let xt_inv = 1.0 - xt;
-
-                    let w00 = xt_inv * yt_inv;
-                    let w01 = xt * yt_inv;
-                    let w10 = xt_inv * yt;
-                    let w11 = xt * yt;
-
-                    let y = self.y_full[sy0 * ypl + ACTIVE_START + sx0] * w00
-                        + self.y_full[sy0 * ypl + ACTIVE_START + sx1] * w01
-                        + self.y_full[sy1 * ypl + ACTIVE_START + sx0] * w10
-                        + self.y_full[sy1 * ypl + ACTIVE_START + sx1] * w11;
-
-                    let i = (self.i_raw[sy0 * iq_padded_len + ACTIVE_START + sx0] * w00
-                        + self.i_raw[sy0 * iq_padded_len + ACTIVE_START + sx1] * w01
-                        + self.i_raw[sy1 * iq_padded_len + ACTIVE_START + sx0] * w10
-                        + self.i_raw[sy1 * iq_padded_len + ACTIVE_START + sx1] * w11)
-                        * inv_comp_scale;
-
-                    let q = (self.q_raw[sy0 * iq_padded_len + ACTIVE_START + sx0] * w00
-                        + self.q_raw[sy0 * iq_padded_len + ACTIVE_START + sx1] * w01
-                        + self.q_raw[sy1 * iq_padded_len + ACTIVE_START + sx0] * w10
-                        + self.q_raw[sy1 * iq_padded_len + ACTIVE_START + sx1] * w11)
-                        * inv_comp_scale;
-
-                    let r = (YIQ_TO_RGB[0][0] * y + YIQ_TO_RGB[0][1] * i + YIQ_TO_RGB[0][2] * q).clamp(0.0, 1.0);
-                    let g = (YIQ_TO_RGB[1][0] * y + YIQ_TO_RGB[1][1] * i + YIQ_TO_RGB[1][2] * q).clamp(0.0, 1.0);
-                    let b = (YIQ_TO_RGB[2][0] * y + YIQ_TO_RGB[2][1] * i + YIQ_TO_RGB[2][2] * q).clamp(0.0, 1.0);
-
-                    let idx = (dy * output_width + dx) * 3;
-                    self.output[idx] = (r * 255.0 + 0.5) as u8;
-                    self.output[idx + 1] = (g * 255.0 + 0.5) as u8;
-                    self.output[idx + 2] = (b * 255.0 + 0.5) as u8;
-                }
+                let out = &mut self.output[dy * output_width * 3..(dy + 1) * output_width * 3];
+                resize_row_to_rgb(
+                    row_pair(&self.y_full, ypl, sy0, sy1),
+                    row_pair(&self.i_raw, iq_padded_len, sy0, sy1),
+                    row_pair(&self.q_raw, iq_padded_len, sy0, sy1),
+                    &x_tab,
+                    yt,
+                    inv_comp_scale,
+                    out,
+                );
             }
         }
 
         &self.output
+    }
+}
+
+/// Output pixels gathered and converted together by `resize_row_to_rgb`.
+const RESIZE_CHUNK: usize = 64;
+
+type RowPair<'a> = (&'a [f32], &'a [f32]);
+
+/// Rows `a` and `b` of a plane with rows of `len`, from the active region.
+fn row_pair(p: &[f32], len: usize, a: usize, b: usize) -> RowPair<'_> {
+    (&p[a * len + ACTIVE_START..(a + 1) * len], &p[b * len + ACTIVE_START..(b + 1) * len])
+}
+
+multiversion! {
+    /// One output row of the bilinear resize with fused YIQ to RGB.  Each
+    /// `(row above, row below)` pair starts at the active region; `x_tab`
+    /// holds each output pixel's two source columns and weight.  The
+    /// source samples are gathered into arrays first so the arithmetic
+    /// vectorises.
+    fn resize_row_to_rgb(y: RowPair, i: RowPair, q: RowPair, x_tab: &[(usize, usize, f32)], yt: f32, inv_comp_scale: f32, out: &mut [u8]) {
+        const C: usize = RESIZE_CHUNK;
+        let yt_inv = 1.0 - yt;
+        let gather = |(r0, r1): RowPair, tab: &[(usize, usize, f32)], g: &mut [[f32; C]; 4]| {
+            for (k, &(x0, x1, _)) in tab.iter().enumerate() {
+                g[0][k] = r0[x0];
+                g[1][k] = r0[x1];
+                g[2][k] = r1[x0];
+                g[3][k] = r1[x1];
+            }
+        };
+        for (c, tab) in x_tab.chunks(C).enumerate() {
+            let (mut gy, mut gi, mut gq) = ([[0.0f32; C]; 4], [[0.0f32; C]; 4], [[0.0f32; C]; 4]);
+            gather(y, tab, &mut gy);
+            gather(i, tab, &mut gi);
+            gather(q, tab, &mut gq);
+            let mut xt = [0.0f32; C];
+            for (k, &(_, _, t)) in tab.iter().enumerate() {
+                xt[k] = t;
+            }
+            let mut rgb = [[0u8; C]; 3];
+            for k in 0..C {
+                let xt_inv = 1.0 - xt[k];
+                let w00 = xt_inv * yt_inv;
+                let w01 = xt[k] * yt_inv;
+                let w10 = xt_inv * yt;
+                let w11 = xt[k] * yt;
+                let y = gy[0][k] * w00 + gy[1][k] * w01 + gy[2][k] * w10 + gy[3][k] * w11;
+                let i = (gi[0][k] * w00 + gi[1][k] * w01 + gi[2][k] * w10 + gi[3][k] * w11) * inv_comp_scale;
+                let q = (gq[0][k] * w00 + gq[1][k] * w01 + gq[2][k] * w10 + gq[3][k] * w11) * inv_comp_scale;
+
+                let r = (YIQ_TO_RGB[0][0] * y + YIQ_TO_RGB[0][1] * i + YIQ_TO_RGB[0][2] * q).clamp(0.0, 1.0);
+                let g = (YIQ_TO_RGB[1][0] * y + YIQ_TO_RGB[1][1] * i + YIQ_TO_RGB[1][2] * q).clamp(0.0, 1.0);
+                let b = (YIQ_TO_RGB[2][0] * y + YIQ_TO_RGB[2][1] * i + YIQ_TO_RGB[2][2] * q).clamp(0.0, 1.0);
+                rgb[0][k] = (r * 255.0 + 0.5) as u8;
+                rgb[1][k] = (g * 255.0 + 0.5) as u8;
+                rgb[2][k] = (b * 255.0 + 0.5) as u8;
+            }
+            let dst = &mut out[c * C * 3..(c * C + tab.len()) * 3];
+            for (k, px) in dst.chunks_exact_mut(3).enumerate() {
+                px[0] = rgb[0][k];
+                px[1] = rgb[1][k];
+                px[2] = rgb[2][k];
+            }
+        }
     }
 }
 
