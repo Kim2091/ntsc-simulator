@@ -239,13 +239,13 @@ There are two families:
 | Flag | `lq` (worn EP) | `mq` (rental, LP-like) | `hq` (SP) |
 |---|---|---|---|
 | `--tape-model` | fm | fm | fm |
-| `--vhs-luma-bw` | 2.8 | 2.9 | 3 |
+| `--vhs-luma-bw` | 2.5 | 2.9 | 3 |
 | `--color-under-bw` | 400..450 | 400..450 | 400 |
 | `--nl-emphasis` | 1 | 0.5..1 | 0..0.5 |
 | `--tape-snr` | 30..33 | 34..36 | 37..38 |
 | `--dropouts` | 40..100 | 15..30 | 5..15 |
 | `--dropout-span` | 2..4 | 1..2 | 1 |
-| `--edge-ringing` (source) | 0.3..0.4 | 0.25..0.35 | 0.2..0.3 |
+| `--edge-ringing` (source) | 0.15..0.25 | 0.25..0.35 | 0.2..0.3 |
 | `--rf-loss` | 0.6..0.9 | 0.3..0.5 | 0.1..0.2 |
 | `--tracking-bars` | 0..0.3 | – | – |
 | `--luma-crosstalk` | 0.4..0.7 | 0.1..0.3 | – |
@@ -272,7 +272,7 @@ There are two families:
 | `--doc` | luma | luma | luma |
 | `--comb` | trap | trap | trap |
 
-Measured with `examples/vhs_measure.rs` (60 IRE p-p multiburst, flat 50 IRE field, unweighted luma S/N through the decoder): `hq` −3 dB at 2.2 MHz and −10 dB at 2.7 MHz on S-Video (2.0 / 2.5 MHz composite), S/N 45 dB; `mq` 2.0 / 2.7 MHz, 42 dB; `lq` 37 dB. The tape channel alone (no deck noise canceller or sharpening) is −3 dB at 2.25 MHz and −10 dB at 3.0 MHz for `hq`, the 240 TVL of SP decks; deck S/N specs (43–45 dB SP, about 41 dB EP) are measured with the deck's noise canceller on.
+Measured with `examples/vhs_measure.rs` (60 IRE p-p multiburst, flat 50 IRE field, unweighted luma S/N through the decoder): `hq` −3 dB at 2.2 MHz and −10 dB at 2.7 MHz on S-Video (2.0 / 2.5 MHz composite), S/N 45 dB; `mq` 2.2 / 2.8 MHz, 42 dB; `lq` 1.1–2.0 / 1.8–2.6 MHz (worn, varies with the tape's bands and dubbing), 37 dB. The tape channel alone (no deck noise canceller or sharpening) is −3 dB at 2.25 MHz and −10 dB at 3.0 MHz for `hq`, the 240 TVL of SP decks; deck S/N specs (43–45 dB SP, about 41 dB EP) are measured with the deck's noise canceller on.
 
 | Flag | `legacy-lq` | `legacy-mq` | `legacy-hq` |
 |---|---|---|---|
@@ -596,6 +596,7 @@ Items 1, 4–7 and 12 are the classic model, kept unchanged for the `legacy-*` p
 
 Newest first.
 
+- **`lq` softer than `mq`/`hq`**: a worn EP tape now uses a 2.5 MHz luma bandwidth (below the 2.8 MHz of a new EP recording) and less source enhancement (0.15–0.25), so its resolution lands below `mq` and `hq` on composite and S-Video for every seed.
 - **Research-based VHS model** (opt-in; legacy presets byte-identical, locked by `tests/output_lock.rs`): the FM tape model (`--tape-model fm|rf`) with emphasis, white/dark clips (`--white-clip`, `--dark-clip`), nonlinear emphasis (`--nl-emphasis`), FM noise (`--tape-snr`), dropouts per minute (`--dropouts`, `--dropout-span`), head-contact loss and tracking bars (`--rf-loss`, `--tracking-bars`), luma crosstalk, EP interleave, black/white inversion, head level step and dubs (`--luma-crosstalk`, `--ep-interleave`, `--bw-inversion`, `--head-level-step`, `--generations`); deck noise canceller, line and chroma noise reducers (`--deck-nc`, `--deck-ynr`, `--deck-cnr`), the picture control as a short peaker after them, a luma-only dropout compensator (`--doc`); head switching from the switch point with picture or black after it and top-of-field skew (`--head-switch-point`, `--head-switch-after`, `--flagging`); colour-under noise bandwidth and adjacent-track chroma crosstalk (`--chroma-noise-bw`, `--chroma-crosstalk`); the trap decoder comb and capture peaking (`--comb trap`, `--capture-peaking`); `--reception-before-tape`. `lq`/`mq`/`hq` and the deck profiles use them (EP / LP-like / SP); measured `hq` reaches −3 dB at 2.2 MHz and 45 dB S/N, close to SP decks. Fixes: caption data now on lines 21/284, `--jitter` no longer wraps picture into the sync, `--edge-ringing` relabelled as source enhancement, `--tape-dropout-rate` help corrected. lq/mq/hq run about as fast as before.
 - **Head switching rework**: matches a real capture. Only the last 2–3 field lines tear (`--head-switch-lines` default and lq/mq/hq values now 3): a switch line that jumps sideways part-way along with a short switching transient and wide, washed-out light smears, then near-black lines with sparse white, green and purple noise streaks and the odd displaced piece of picture. No more mid-band dark stripe or black wedge on the left. Over a video the switch is a fixed property of the tape with per-field flicker and occasional sudden jumps that hold for a few frames or seconds, instead of sliding and shrinking. Legacy presets are unchanged.
 - **3D comb independent of `--threads`**: frame 1 now uses frame 0 as received for both earlier frames, and telecine runs carry the previous batch's frames across batch boundaries, so `--comb 3d` output is the same at any thread count (frame 1 of `--comb 3d` roundtrips changes; nothing else does).

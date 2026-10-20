@@ -3,7 +3,7 @@
 //! cargo run --release --example vhs_measure -- PRESET [key=value ...]
 //!
 //! PRESET is a built-in preset name or `none`; `deck=NAME` adds a deck
-//! profile.  Prints the response at each test frequency, the -3 dB and
+//! profile, `seed=N` picks the seed (default 42).  Prints the response at each test frequency, the -3 dB and
 //! -10 dB points, and the S/N of a flat 50 IRE field (unweighted, picture
 //! luma, row means removed), for a composite and an S-Video connection.
 
@@ -117,9 +117,12 @@ fn main() {
     let preset = args.first().map(String::as_str).unwrap_or("none");
     let mut v = ParamValues::default();
     let mut deck = None;
+    let mut seed = 42;
     for a in &args[1.min(args.len())..] {
         let (k, val) = a.split_once('=').expect("key=value");
-        if k == "deck" {
+        if k == "seed" {
+            seed = val.parse().expect("seed");
+        } else if k == "deck" {
             deck = Some(val.to_string());
         } else {
             v.set_from_str(k, val).unwrap();
@@ -131,7 +134,7 @@ fn main() {
     if preset != "none" {
         v.fill_from(&presets::builtin(preset).expect("preset name").to_values());
     }
-    v.seed = Some(42);
+    v.seed = Some(seed);
     let explicit_out = v.is_set("video-out");
     measure(&v, &format!("{preset} {}", if explicit_out { v.choice("video-out") } else { "composite" }));
     if !explicit_out {
