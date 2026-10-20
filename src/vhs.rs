@@ -47,9 +47,11 @@ pub(crate) const REGION_LEN: usize = SAMPLES_PER_LINE - REGION_START;
 pub(crate) const CHROMA_BAND_HZ: f64 = 0.6e6;
 
 /// Zero-phase lowpass that, applied to demodulated I/Q, selects the
-/// chroma band of composite video (fsc ± `CHROMA_BAND_HZ`).
-fn chroma_band_filter() -> [Biquad; 1] {
-    [Biquad::lowpass(CHROMA_BAND_HZ, std::f64::consts::FRAC_1_SQRT_2)]
+/// chroma band of composite video (fsc ± `CHROMA_BAND_HZ`): a 4th-order
+/// Butterworth run forwards and backwards, so luma 1 MHz from the
+/// subcarrier loses under 0.1 dB.
+fn chroma_band_filter() -> [Biquad; 2] {
+    [Biquad::lowpass(CHROMA_BAND_HZ, 0.5412), Biquad::lowpass(CHROMA_BAND_HZ, 1.3066)]
 }
 
 const COS: [f32; 4] = [1.0, 0.0, -1.0, 0.0];

@@ -2071,8 +2071,6 @@ fn apply_chroma_path(
 
     let cos_lut: [f32; 4] = [1.0, 0.0, -1.0, 0.0];
     let nsin_lut: [f32; 4] = [0.0, -1.0, 0.0, 1.0];
-    let bb_lp = filters::design_lowpass(1.3e6, 31);
-    let mut scratch = Vec::new();
 
     // Noise filter and the gain that restores unit variance after it.
     let noise_cutoff = if cfg.noise_bw > 0.0 { cfg.noise_bw as f64 } else { CHROMA_NOISE_CUTOFF_HZ };
@@ -2111,16 +2109,21 @@ fn apply_chroma_path(
         let mut orig_i = vec![0.0f32; n_lines * act];
         let mut orig_q = vec![0.0f32; n_lines * act];
         let mut burst = vec![(1.0f32, 0.0f32); n_lines];
+        // The chroma band (fsc ± 0.6 MHz), demodulated: luma detail
+        // outside it does not reach the chroma stages.
+        let mut group = vhs::LaneGroup::new();
         for k in 0..n_lines {
             let base = (first + k) * spl;
-            for j in 0..act {
-                let n = ACTIVE_START + j;
-                let chroma = (signal[base + n] - signal[base + n - 2]) * 0.5;
-                tmp_i[j] = 2.0 * chroma * cos_lut[n & 3];
-                tmp_q[j] = 2.0 * chroma * nsin_lut[n & 3];
+            let l = k % iir::LANES;
+            if l == 0 {
+                let lines: Vec<usize> = (first + k..(first + k + iir::LANES).min(end)).collect();
+                group.load(signal, &lines, false);
             }
-            apply_fir_inplace(&mut tmp_i, &bb_lp, &mut scratch);
-            apply_fir_inplace(&mut tmp_q, &bb_lp, &mut scratch);
+            let off = ACTIVE_START - vhs::REGION_START;
+            for j in 0..act {
+                tmp_i[j] = group.i[(off + j) * iir::LANES + l];
+                tmp_q[j] = group.q[(off + j) * iir::LANES + l];
+            }
             let phi = measure_burst_phase(&signal[base..base + spl]);
             let (c, s) = (phi.cos(), phi.sin());
             burst[k] = (c, s);
