@@ -818,7 +818,8 @@ pub static SPECS: &[ParamSpec] = &[
         id: "deck-dnr",
         label: "Deck noise reduction",
         help: "Deck recursive noise reduction (0–1): averages each frame with the previous output where the picture \
-               is still, which cleans noise but leaves smeared ghost trails behind moving objects. Needs \
+               is still, which cleans luma and colour noise; moving edges and lines pass, faint moving detail can \
+               leave a short soft trail. Needs \
                consecutive frames: no effect on single images; the GUI's video preview renders the previous 8 \
                frames so it shows.",
         unit: "",

@@ -205,6 +205,10 @@ fn preset_outputs_are_locked() {
             "lq+deck-svhs-tbc/video".into(),
             roundtrip(&dir, &input, "lqtbc", &["--preset", "lq", "--deck", "deck-svhs-tbc"]),
         );
+        got.insert(
+            "lq+deck-svhs-tbc+composite/video".into(),
+            roundtrip(&dir, &input, "lqtbc3d", &["--preset", "lq", "--deck", "deck-svhs-tbc", "--video-out", "composite"]),
+        );
         let _ = std::fs::remove_dir_all(&dir);
     } else {
         eprintln!("ffmpeg not found; video locks skipped");
