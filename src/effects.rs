@@ -285,7 +285,7 @@ impl SignalEffects {
             cnr: self.deck_cnr.unwrap_or(0.0).clamp(0.0, 1.0),
             noise_bw: self.chroma_noise_bw.unwrap_or(0.0),
             crosstalk: 0.1 * self.chroma_crosstalk.unwrap_or(0.0).clamp(0.0, 1.0),
-            noise_seed: vhs::stage_seed(self.stage_seed, frame, 0xC401_5E),
+            noise_seed: vhs::stage_seed(self.stage_seed, frame, 0x00C4_015E),
         }
     }
 

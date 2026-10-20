@@ -195,7 +195,26 @@ ntsc-composite-simulator roundtrip input.mp4 -o output.mkv \
 ntsc-composite-simulator image photo.png -o vhs.png \
   --vhs-luma-bw 3.0 --color-under-bw 400 \
   --head-switch 0.7 --head-switch-lines 3 --top-band 0.5 --vbi-data 0.5
+
+# The research-based FM tape model: emphasis and clipping, FM noise at 37 dB before the
+# deck's noise canceller, counted dropouts per minute, head-contact bands, captured
+# through a chroma trap as capture chips do for VCR input
+ntsc-composite-simulator roundtrip input.mp4 -o output.mkv \
+  --tape-model fm --vhs-luma-bw 3 --tape-snr 37 --dropouts 20 --rf-loss 0.3 \
+  --doc luma --deck-nc 4 --deck-sharpness 0.4 --comb trap
 ```
+
+#### The FM tape model
+
+`--tape-model fm` replaces the original tape path (a lowpass on luma and colour) with the circuits of the VHS format, from the format standard and service literature:
+
+- **Record**: the recording deck's luma/chroma split (a band filter of ± 0.6 MHz around the subcarrier; luma detail inside it is recorded as cross-colour), the colour-under filter, the record luma lowpass, optional nonlinear emphasis (`--nl-emphasis`), the main pre-emphasis (1.3 µs, ×5 shelf, each tape's record and playback networks within the format's ± 0.05 µs / ± 0.3 tolerance) and the white and dark clips (`--white-clip` 160 %, `--dark-clip` 40 % of the sync-to-white span). Large sharp edges overshoot the clips, so after de-emphasis they come out softened with a causal trail (a slow rise into white, a light trail after bright objects) while small edges come back intact; this replaces `--tape-trail`.
+- **Tape**: FM noise in the emphasised domain (`--tape-snr`; after de-emphasis it rises with frequency, fine streaky grain about equal in dark and bright areas), dropouts counted per minute (`--dropouts`, lengths mostly 1–2 µs, none under 0.5 µs, white or black streaks with de-emphasis tails, spanning several fields on EP with `--dropout-span`), head-contact RF loss in drifting bands (`--rf-loss`, more noise and sparkles, slightly softer detail, weaker colour; replaces `--head-smear`), tracking noise bars (`--tracking-bars`), luma crosstalk beats (`--luma-crosstalk`), the EP interleave residue (`--ep-interleave`), black/white inversion after bright edges (`--bw-inversion`), a level step between the heads (`--head-level-step`) and dubs (`--generations`).
+- **Playback**: the demodulator's lowpass (record + playback −3 dB at 0.66 × and −10 dB at 1.0 × `--vhs-luma-bw`), de-emphasis and nonlinear de-emphasis; dropout compensation per `--doc`.
+
+`--tape-model rf` goes one step further and simulates the FM carrier itself (modulated at 3.4–4.4 MHz at 8 × fsc, record highpass and head/tape lowpass, RF noise, limiter and demodulator), so noise, sparkles, dropout streaks and crosstalk beats come out of the channel; it costs about four times as much per frame.
+
+Every new stage is opt-in and draws its random numbers from its own stream, so turning one on never changes the others.
 
 #### Presets
 
@@ -214,29 +233,56 @@ ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --preset legacy-mq
 
 There are two families:
 
-- `lq`, `mq`, `hq`: the full VHS look (tape path, head switching, top bands, caption line, colour-under noise and blur, chroma delay, wobble, and temporal coherence for video).
-- `legacy-lq`, `legacy-mq`, `legacy-hq`: exactly the original tape-path settings (the first seven rows below) and nothing else. With the same `--seed` they give byte-identical output to passing those seven flags by hand.
+- `lq`, `mq`, `hq`: the full VHS look, built on the FM tape model and a typical consumer playback deck and capture card. `hq` is a clean SP recording, `mq` a typical rental tape with LP-like wear, `lq` a worn EP tape (some files are second-generation dubs).
+- `legacy-lq`, `legacy-mq`, `legacy-hq`: exactly the original tape-path settings and nothing else. With the same `--seed` they give byte-identical output to earlier versions and to passing those seven flags by hand.
 
-| Flag | `lq` | `mq` | `hq` | in `legacy-*` |
-|---|---|---|---|---|
-| `--vhs-luma-bw` | 1.6 | 3 | 3 | yes |
-| `--color-under-bw` | 400..450 | 400..450 | 300..400 | yes |
-| `--edge-ringing` | 0.3..0.4 | 0.25..0.35 | 0.2..0.3 | yes |
-| `--luma-noise` | 0.025..0.035 | 0.02..0.03 | 0.015..0.025 | yes |
-| `--tape-dropout-rate` | 1 | 0..1 | 0 | yes |
-| `--head-smear` | 0.2..0.3 | 0.15..0.2 | 0.1..0.15 | yes |
-| `--tape-trail` | 0.75..0.9 | 0.6..0.75 | 0.5..0.7 | yes |
-| `--head-switch` | 0.8..1.0 | 0.55..0.7 | 0.35..0.45 | no |
-| `--head-switch-lines` | 3 | 3 | 3 | no |
-| `--top-band` | 0.6..0.8 | 0.4..0.55 | 0.2..0.3 | no |
-| `--vbi-data` | 0.6..0.8 | 0.4..0.55 | 0.25..0.35 | no |
-| `--chroma-noise` | 0.025..0.035 | 0.015..0.025 | 0.008..0.015 | no |
-| `--chroma-phase-noise` | 0 | 0 | 0 | no |
-| `--chroma-vblur` | 0.6..0.8 | 0.5..0.7 | 0.5 | no |
-| `--chroma-delay` | 2..3 | 1.5..2.5 | 1..2 | no |
-| `--chroma-delay-v` | 1 | 0..1 | 0 | no |
-| `--wobble` | 1..1.5 | 0.5..1 | 0.3..0.6 | no |
-| `--temporal-coherence` | 1 | 1 | 1 | no |
+| Flag | `lq` (worn EP) | `mq` (rental, LP-like) | `hq` (SP) |
+|---|---|---|---|
+| `--tape-model` | fm | fm | fm |
+| `--vhs-luma-bw` | 2.8 | 2.9 | 3 |
+| `--color-under-bw` | 400..450 | 400..450 | 400 |
+| `--nl-emphasis` | 1 | 0.5..1 | 0..0.5 |
+| `--tape-snr` | 30..33 | 34..36 | 37..38 |
+| `--dropouts` | 40..100 | 15..30 | 5..15 |
+| `--dropout-span` | 2..4 | 1..2 | 1 |
+| `--edge-ringing` (source) | 0.3..0.4 | 0.25..0.35 | 0.2..0.3 |
+| `--rf-loss` | 0.6..0.9 | 0.3..0.5 | 0.1..0.2 |
+| `--tracking-bars` | 0..0.3 | – | – |
+| `--luma-crosstalk` | 0.4..0.7 | 0.1..0.3 | – |
+| `--ep-interleave` | 0.2..0.8 | – | – |
+| `--bw-inversion` | 0.3..0.6 | 0.1..0.2 | – |
+| `--head-level-step` | 1..3 | 0.5..2 | 0..1 |
+| `--generations` | 1..2 | 1 | 1 |
+| `--head-switch` | 0.8..1.0 | 0.55..0.7 | 0.35..0.45 |
+| `--head-switch-point` | 5.5..7.5 | 6..7 | 6..7 |
+| `--flagging` | 0.4..0.6 | 0.25..0.4 | 0.15..0.25 |
+| `--top-band` | 0.6..0.8 | 0.4..0.55 | 0.2..0.3 |
+| `--vbi-data` | 0.6..0.8 | 0.4..0.55 | 0.25..0.35 |
+| `--chroma-noise` | 0.025..0.035 | 0.015..0.025 | 0.008..0.015 |
+| `--chroma-noise-bw` | 450 | 450 | 450 |
+| `--chroma-crosstalk` | 0.6..0.9 | 0.3..0.5 | 0.15..0.3 |
+| `--chroma-phase-noise` | 0 | 0 | 0 |
+| `--chroma-vblur` | 1 | 1 | 1 |
+| `--chroma-delay` | 2..3 | 1.5..2.5 | 1..2 |
+| `--chroma-delay-v` | 1 | 0..1 | 0 |
+| `--wobble` | 1..1.5 | 0.5..1 | 0.3..0.6 |
+| `--temporal-coherence` | 1 | 1 | 1 |
+| `--deck-nc` | 3..5 | 3..5 | 3..5 |
+| `--deck-sharpness` | 0.3..0.5 | 0.3..0.5 | 0.3..0.5 |
+| `--doc` | luma | luma | luma |
+| `--comb` | trap | trap | trap |
+
+Measured with `examples/vhs_measure.rs` (60 IRE p-p multiburst, flat 50 IRE field, unweighted luma S/N through the decoder): `hq` −3 dB at 2.2 MHz and −10 dB at 2.7 MHz on S-Video (2.0 / 2.5 MHz composite), S/N 45 dB; `mq` 2.0 / 2.7 MHz, 42 dB; `lq` 37 dB. The tape channel alone (no deck noise canceller or sharpening) is −3 dB at 2.25 MHz and −10 dB at 3.0 MHz for `hq`, the 240 TVL of SP decks; deck S/N specs (43–45 dB SP, about 41 dB EP) are measured with the deck's noise canceller on.
+
+| Flag | `legacy-lq` | `legacy-mq` | `legacy-hq` |
+|---|---|---|---|
+| `--vhs-luma-bw` | 1.6 | 3 | 3 |
+| `--color-under-bw` | 400..450 | 400..450 | 300..400 |
+| `--edge-ringing` | 0.3..0.4 | 0.25..0.35 | 0.2..0.3 |
+| `--luma-noise` | 0.025..0.035 | 0.02..0.03 | 0.015..0.025 |
+| `--tape-dropout-rate` | 1 | 0..1 | 0 |
+| `--head-smear` | 0.2..0.3 | 0.15..0.2 | 0.1..0.15 |
+| `--tape-trail` | 0.75..0.9 | 0.6..0.75 | 0.5..0.7 |
 
 DVD presets select the DVD path (`--format dvd`); see [DVD-Video path](#dvd-video-path):
 
@@ -276,15 +322,19 @@ ntsc-composite-simulator roundtrip input.mp4 -o output.mkv --preset lq --deck de
 
 | Profile | Settings |
 |---|---|
-| `deck-basic` | nothing extra: composite output, no TBC, no noise reduction (the default behaviour) |
-| `deck-svhs-tbc` | `--line-tbc 0.9 --frame-tbc 1 --deck-dnr 0.5 --comb 3d --video-out svideo` |
-| `deck-edit` | `--deck-sharpness 0 --edge-ringing 0` (edit mode, no enhancement) |
+| `deck-basic` | typical consumer VCR: `--deck-nc 4 --deck-sharpness 0.4 --doc luma`, composite output, no TBC |
+| `deck-svhs-tbc` | `--line-tbc 0.9 --frame-tbc 1 --deck-dnr 0.5 --comb 3d --video-out svideo --deck-nc 5 --deck-ynr 1 --deck-cnr 1 --deck-sharpness 0.2 --doc luma` |
+| `deck-edit` | `--deck-sharpness 0` (edit mode, no sharpening) |
 
-- **Line TBC** (`--line-tbc`): re-times every line, removing most jitter and wobble and much of the head-switching displacement (the switching noise line stays).
+- **Line TBC** (`--line-tbc`): re-times every line from its own sync, removing most jitter and wobble, the top-of-field skew and the displacement of the lines after the head switch (the switch line itself and the switching noise stay).
 - **Frame TBC** (`--frame-tbc`): holds the picture vertically, removing `--v-jitter` (vertical bounce, a new tape effect: whole fields jump by whole lines).
 - **Deck noise reduction** (`--deck-dnr`): recursive, motion-adaptive temporal filter on the output frames; cleans noise in still areas and leaves smeared ghost trails behind motion. It needs consecutive frames, so it runs as a sequential stage after the parallel encode/decode and does nothing on single images (the GUI renders the previous 8 frames of a video so it shows in the preview).
-- **Deck sharpness** (`--deck-sharpness -1..1`): the deck's picture control; negative softens, 0 is edit mode (no enhancement), positive adds peaking. `--edge-ringing` still works as before.
-- **Decoder comb** (`--comb 2sample|1h|3d`): the TV or capture card's luma/chroma separation for composite signals. `3d` is a motion-adaptive frame comb that uses the previous frame in still areas (clean luma and chroma there) and falls back to the 2-sample comb where the picture moves. `--comb-1h` still selects the line comb.
+- **Noise canceller** (`--deck-nc`, IRE): the luma coring nearly every VCR has: detail under the threshold (typical 4–10) above 1 MHz is removed with the noise; flat areas look clean and slightly waxy, fine texture goes.
+- **Line and chroma noise reducers** (`--deck-ynr`, `--deck-cnr`): HQ decks' recursive 1H reducers; small line-to-line differences are averaged, strong vertical changes pass; non-recursive near the head switch.
+- **Deck sharpness** (`--deck-sharpness -1..1`): the deck's picture control, after the noise canceller: a short symmetric peaker around 2.4 MHz (up to +6 dB, 1.5 IRE coring); negative softens, 0 is edit mode. `--edge-ringing` is enhancement already on the tape (source chain).
+- **Dropout compensator** (`--doc composite|luma|off`): `luma` copies the luma of the line above and mutes the colour, as real decks do; `composite` (the original) copies the whole line, whose colour decodes in the complementary hue.
+- **Decoder comb** (`--comb 2sample|1h|3d|trap`): the TV or capture card's luma/chroma separation for composite signals. `trap` is a chroma trap (± 0.6 MHz), what capture chips use for VCR input: luma keeps its detail to about 2.9 MHz (the 2-sample comb is −3 dB at 1.8 MHz). `3d` is a motion-adaptive frame comb that uses the previous frame in still areas (clean luma and chroma there) and falls back to the 2-sample comb where the picture moves. `--comb-1h` still selects the line comb.
+- **Capture peaking** (`--capture-peaking`, `--capture-peaking-mhz`): the capture chip's luma peaking (TVP5150 off by default, SAA7113 a small boost at 4.1 MHz).
 
 ### DVD-Video path
 
@@ -352,6 +402,7 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 |---|---|---|
 | `--noise` | roundtrip, image, colorbars | Snow amplitude (0.05 = subtle, 0.2 = heavy) |
 | `--attenuation` | roundtrip, image, colorbars | Signal attenuation 0–1 (0 = none, 1 = flat at blanking) |
+| `--reception-before-tape` | roundtrip, image, colorbars | Apply snow, ghosts and attenuation before the tape path (an off-air recording) instead of after it |
 | `--jitter` | roundtrip, image, colorbars | Horizontal jitter std dev in subcarrier cycles |
 
 ### Ghosting (multipath)
@@ -370,21 +421,40 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 
 | Flag | Commands | Description |
 |---|---|---|
-| `--vhs-luma-bw` | roundtrip, image, colorbars | Luma bandwidth in MHz (SP ≈ 3.0, EP/SLP ≈ 1.6) |
+| `--tape-model` | roundtrip, image, colorbars | `classic` (default, the original tape path), `fm` (the VHS record and playback circuits) or `rf` (fm with the FM carrier simulated) |
+| `--vhs-luma-bw` | roundtrip, image, colorbars | Luma bandwidth in MHz. Classic model: a lowpass cutoff. FM model: the −10 dB point of record + playback (SP 3.0, LP/EP 2.8–2.9) |
 | `--color-under-bw` | roundtrip, image, colorbars | Color-under chroma bandwidth in kHz (typical 300–500) |
-| `--edge-ringing` | roundtrip, image, colorbars | Playback peaking / ringing gain (0.5–3.0) |
-| `--luma-noise` | roundtrip, image, colorbars | Luminance-dependent tape noise amplitude (0.02–0.10) |
-| `--tape-dropout-rate` | roundtrip, image, colorbars | Average dropouts per frame (2–20) |
+| `--white-clip`, `--dark-clip` | roundtrip, image, colorbars | FM model: emphasis clips in % of the sync-to-white span (defaults 160 and 40) |
+| `--nl-emphasis` | roundtrip, image, colorbars | FM model: nonlinear emphasis strength (0–1) |
+| `--tape-snr` | roundtrip, image, colorbars | FM model: tape noise S/N in dB before the deck's noise reduction (37–38 SP, 34–36 LP, 30–33 worn EP) |
+| `--rf-loss` | roundtrip, image, colorbars | FM model: head-contact RF loss in drifting bands (0–1) |
+| `--tracking-bars` | roundtrip, image, colorbars | FM model: tracking noise bar (0–1) |
+| `--luma-crosstalk` | roundtrip, image, colorbars | FM model: adjacent-track luma crosstalk beats (0–1; 1 = −20 dB) |
+| `--ep-interleave` | roundtrip, image, colorbars | FM model: EP carrier-interleave residue, field-alternating DC in IRE (0–1.1) |
+| `--bw-inversion` | roundtrip, image, colorbars | FM model: black/white inversion after bright edges (0–1) |
+| `--head-level-step` | roundtrip, image, colorbars | FM model: level difference between the heads in % (0–5) |
+| `--generations` | roundtrip, image, colorbars | FM model: tape generations (1 = original, 2+ = dubs) |
+| `--edge-ringing` | roundtrip, image, colorbars | Source enhancement already on the tape (0.5–3.0); with the FM model it is recorded through the tape path |
+| `--luma-noise` | roundtrip, image, colorbars | Classic model: luminance-dependent tape noise amplitude (0.02–0.10) |
+| `--tape-dropout-rate` | roundtrip, image, colorbars | Classic dropouts, average per frame (real tapes: well under 0.1) |
+| `--dropouts` | roundtrip, image, colorbars | FM model: dropouts per minute as counted by the industry (≥ 15 µs, ≥ 16 dB; typical 5–30) |
+| `--dropout-span` | roundtrip, image, colorbars | FM model: most consecutive fields one defect hits (1 SP … 4 EP) |
+| `--doc` | roundtrip, image, colorbars | Dropout compensator: `composite` (default), `luma`, `off` |
 | `--tape-dropout-len` | roundtrip, image, colorbars | Average dropout length in µs (default: 15.0) |
 | `--head-smear` | roundtrip, image, colorbars | Worn-head symmetric luma blur (0.3–1.0); varies in bands across the frame |
 | `--tape-trail` | roundtrip, image, colorbars | Causal rightward luma smear (0.3–1.0); the classic worn-tape trailing effect |
 | `--head-switch` | roundtrip, image, colorbars | Head-switching noise at the bottom of each field (0–1): a displaced switch line with a switching transient, then near-black lines with bright noise streaks; stable over a tape with per-field flicker and occasional sudden jumps |
 | `--head-switch-lines` | roundtrip, image, colorbars | Active lines per field torn by head switching at full strength (default: 3, i.e. 6 rows at 480; fewer at low strength) |
+| `--head-switch-point` | roundtrip, image, colorbars | Switch point in lines before vertical sync (6.5 ± 1.5): sets the torn lines (about 5–7 rows at 6.5) regardless of strength |
+| `--head-switch-after` | roundtrip, image, colorbars | Lines after the switch: `black` (signal lost, default) or `picture` (displaced picture) |
+| `--flagging` | roundtrip, image, colorbars | Top-of-field skew from the head switch and a slow PLL (0–1) |
 | `--top-band` | roundtrip, image, colorbars | Faint blue/purple chroma bands on the first lines of each field (0–1) |
 | `--vbi-data` | roundtrip, image, colorbars | Closed-caption data on lines 21/284, visible as short light dashes near the top (0–1) |
 | `--chroma-noise` | roundtrip, image, colorbars | Colour-under chroma noise, std dev of I/Q noise (subtle 0.01–0.03, heavy 0.06); horizontal colour blotches |
 | `--chroma-phase-noise` | roundtrip, image, colorbars | Per-line chroma phase (hue) jitter, std dev in degrees (subtle 1–3) |
-| `--chroma-vblur` | roundtrip, image, colorbars | Playback 1H chroma comb (0–1): chroma mixed with the previous line of the field, softening colour vertically |
+| `--chroma-noise-bw` | roundtrip, image, colorbars | Colour-under noise bandwidth in kHz (about 450); blotches about 1 µs long |
+| `--chroma-crosstalk` | roundtrip, image, colorbars | Adjacent-track colour crosstalk (0–1; 1 = −20 dB), cancelled by the 1H comb except at vertical colour changes |
+| `--chroma-vblur` | roundtrip, image, colorbars | Playback 1H chroma comb (0–1): chroma mixed with the previous line of the field, softening colour vertically (real decks: 1) |
 | `--chroma-delay` | roundtrip, image, colorbars | Horizontal chroma delay relative to luma in output pixels at 640 wide (typical 1–4, positive = right) |
 | `--chroma-delay-v` | roundtrip, image, colorbars | Vertical chroma delay in field lines (typical 0–1; 1 field line = 2 output rows) |
 | `--wobble` | roundtrip, image, colorbars | Correlated time-base wobble: peak horizontal displacement in output pixels (typical 0.5–3); smooth across lines, burst moves with the line so hue is kept |
@@ -424,8 +494,13 @@ All numeric flags below accept either a single value (e.g. `0.05`) or a `min..ma
 | `--frame-tbc` | roundtrip, image, colorbars | Frame TBC / frame synchroniser strength (0–1) |
 | `--v-jitter` | roundtrip, image, colorbars | Vertical bounce, std dev in output rows |
 | `--deck-dnr` | roundtrip | Recursive temporal noise reduction (0–1); no effect on single images |
-| `--deck-sharpness` | roundtrip, image, colorbars | Deck sharpness control (−1 soft … 0 edit … 1 sharp) |
-| `--comb` | roundtrip, image, colorbars | Decoder comb: `2sample` (default), `1h`, `3d` |
+| `--deck-nc` | roundtrip, image, colorbars | Noise canceller threshold in IRE (4–10 typical) |
+| `--deck-ynr` | roundtrip, image, colorbars | Recursive line noise reducer (0–1) |
+| `--deck-cnr` | roundtrip, image, colorbars | Recursive chroma noise reducer (0–1) |
+| `--deck-sharpness` | roundtrip, image, colorbars | Deck picture control (−1 soft … 0 edit … 1 sharp), after the noise canceller |
+| `--comb` | roundtrip, image, colorbars | Decoder comb: `2sample` (default), `1h`, `3d`, `trap` |
+| `--capture-peaking` | roundtrip, image, colorbars | Capture-chip luma peaking gain (0–2) |
+| `--capture-peaking-mhz` | roundtrip, image, colorbars | Its centre frequency in MHz (default 2.6) |
 
 Run `ntsc-composite-simulator <command> -h` for full details.
 
@@ -501,6 +576,12 @@ The VHS simulation models both the recording and playback signal paths:
 11. **Head switching** — the last few active lines of each field get a time-base jump: they are shifted right by a fractional, growing number of samples, exposing black on the left, and the burst moves with them apart from a small residual error that shows as colour fringes; the switching line itself drops toward black over part of its width and carries wideband noise and bright speckles
 12. **Tape trailing** — causal one-pole IIR on luma only, applied as the final processing step so everything on the tape (noise, dropouts, detail) gets the characteristic rightward decay tail of worn playback electronics
 
+Items 1, 4–7 and 12 are the classic model, kept unchanged for the `legacy-*` presets. The FM tape model (`--tape-model fm`, see [The FM tape model](#the-fm-tape-model)) replaces them: luma through emphasis, clips and de-emphasis with FM noise and research-based dropouts, the deck's noise canceller and picture control after the noise, and a band-filter luma/chroma split.
+
+### Testing
+
+`cargo test --profile fasttest` runs the suite with optimisation but without the slow LTO link. `tests/output_lock.rs` renders fixed pictures and short videos with fixed seeds: `tests/locks/legacy.txt` locks the legacy presets, effects off and the DVD path (these must never change), `tests/locks/presets.txt` locks `lq`/`mq`/`hq` and the deck profiles and is rewritten deliberately with `NTSC_UPDATE_LOCKS=presets`. `cargo run --release --example vhs_measure -- <preset> [flag=value ...]` prints the luma frequency response and S/N of a setting.
+
 ### Signal Specifications
 
 | Parameter | Value |
@@ -515,6 +596,7 @@ The VHS simulation models both the recording and playback signal paths:
 
 Newest first.
 
+- **Research-based VHS model** (opt-in; legacy presets byte-identical, locked by `tests/output_lock.rs`): the FM tape model (`--tape-model fm|rf`) with emphasis, white/dark clips (`--white-clip`, `--dark-clip`), nonlinear emphasis (`--nl-emphasis`), FM noise (`--tape-snr`), dropouts per minute (`--dropouts`, `--dropout-span`), head-contact loss and tracking bars (`--rf-loss`, `--tracking-bars`), luma crosstalk, EP interleave, black/white inversion, head level step and dubs (`--luma-crosstalk`, `--ep-interleave`, `--bw-inversion`, `--head-level-step`, `--generations`); deck noise canceller, line and chroma noise reducers (`--deck-nc`, `--deck-ynr`, `--deck-cnr`), the picture control as a short peaker after them, a luma-only dropout compensator (`--doc`); head switching from the switch point with picture or black after it and top-of-field skew (`--head-switch-point`, `--head-switch-after`, `--flagging`); colour-under noise bandwidth and adjacent-track chroma crosstalk (`--chroma-noise-bw`, `--chroma-crosstalk`); the trap decoder comb and capture peaking (`--comb trap`, `--capture-peaking`); `--reception-before-tape`. `lq`/`mq`/`hq` and the deck profiles use them (EP / LP-like / SP); measured `hq` reaches −3 dB at 2.2 MHz and 45 dB S/N, close to SP decks. Fixes: caption data now on lines 21/284, `--jitter` no longer wraps picture into the sync, `--edge-ringing` relabelled as source enhancement, `--tape-dropout-rate` help corrected. lq/mq/hq run about as fast as before.
 - **Head switching rework**: matches a real capture. Only the last 2–3 field lines tear (`--head-switch-lines` default and lq/mq/hq values now 3): a switch line that jumps sideways part-way along with a short switching transient and wide, washed-out light smears, then near-black lines with sparse white, green and purple noise streaks and the odd displaced piece of picture. No more mid-band dark stripe or black wedge on the left. Over a video the switch is a fixed property of the tape with per-field flicker and occasional sudden jumps that hold for a few frames or seconds, instead of sliding and shrinking. Legacy presets are unchanged.
 - **3D comb independent of `--threads`**: frame 1 now uses frame 0 as received for both earlier frames, and telecine runs carry the previous batch's frames across batch boundaries, so `--comb 3d` output is the same at any thread count (frame 1 of `--comb 3d` roundtrips changes; nothing else does).
 - **Faster processing, same output**: S-Video runs each tape effect and the encoder's band-limiting once instead of per wire, the 3D comb makes each frame's signal once instead of three times, and the colour-under noise, line shifts, deck noise reduction, decoder resize and DVD mastering are vectorised. On one thread at 640x480: `--preset lq` 16.8 -> 28.5 fps, `legacy-lq` 22 -> 40 fps, `lq --deck deck-svhs-tbc` 11.2 -> 25 fps, `lq --comb 3d` 6 -> 25 fps. Output is bit-identical to before.
@@ -533,5 +615,6 @@ Newest first.
 
 ## Comb Filter Modes
 
-- **2-sample delay** (default): Cancels chroma from luma using a horizontal delay. Can produce rainbow cross-color on sharp edges.
+- **2-sample delay** (default): Cancels chroma from luma using a horizontal delay. Can produce rainbow cross-color on sharp edges, and softens luma (−3 dB at 1.8 MHz).
+- **Chroma trap** (`--comb trap`): a notch of ± 0.6 MHz around the subcarrier, as capture chips use for VCR input; luma keeps its detail to about 2.9 MHz.
 - **1H line-delay** (`--comb-1h`): Uses the adjacent line from the same field. Reduces rainbow artifacts but introduces hanging-dot patterns on horizontal color transitions as well as some line doubling.
