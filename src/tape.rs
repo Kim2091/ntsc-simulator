@@ -40,7 +40,7 @@ use rand::Rng;
 use rand_distr::{Distribution, LogNormal};
 
 use crate::constants::{BLANKING_V, SAMPLES_PER_LINE, TOTAL_LINES};
-use crate::effects::{hash_signed, mute_segment, FIELD_ACTIVE_LINES, IRE_V};
+use crate::effects::{drift, hash_signed, mute_segment, FIELD_ACTIVE_LINES, IRE_V};
 use crate::encoder::Wire;
 use crate::iir::{self, Biquad, FastNoise, LANES};
 use crate::vhs::{active_line_groups, stage_rng, stage_seed, LaneGroup, PRE_ROLL, REGION_LEN};
@@ -72,6 +72,10 @@ pub struct TapeFm {
     pub dropout_span: usize,
     /// Whether the playback deck has a dropout compensator.
     pub doc: bool,
+    /// Head-to-tape RF level variation (0-1): bands of lower RF level.
+    pub rf_loss: f32,
+    /// Tracking noise bar strength (0-1).
+    pub tracking_bars: f32,
     /// Seed of the per-stage random streams, and the frame number.
     pub seed: u64,
     pub frame: u64,
@@ -104,6 +108,57 @@ const FM_NOISE_SHAPE: f32 = 0.85;
 const KEY_NOISE: u64 = 0x7A9E_0001;
 const KEY_DROPOUTS: u64 = 0x7A9E_0002;
 const KEY_TOLERANCE: u64 = 0x7A9E_0003;
+const KEY_RF: u64 = 0x7A9E_0004;
+const KEY_TRACKING: u64 = 0x7A9E_0005;
+const KEY_CLICKS: u64 = 0x7A9E_0006;
+
+/// RF loss (dB) of the worst bands at full `rf_loss`, and of the middle of
+/// a tracking noise bar at full strength.
+const RF_BAND_DB: f32 = 14.0;
+const TRACKING_BAR_DB: f32 = 26.0;
+
+/// RF loss of one line of this frame, in dB: smooth bands of poor head
+/// contact (tension, oxide wear, a partly clogged head) that drift slowly
+/// down the picture, plus a tracking noise bar.  The same in both fields
+/// at the same line of the field; it depends only on the tape seed and
+/// the frame, not the picture.
+fn rf_loss_db(cfg: &TapeFm, line: usize) -> f32 {
+    if cfg.rf_loss <= 0.0 && cfg.tracking_bars <= 0.0 {
+        return 0.0;
+    }
+    let (first, end) = *FIELD_ACTIVE_LINES.iter().find(|(a, b)| (*a..*b).contains(&line)).unwrap_or(&FIELD_ACTIVE_LINES[0]);
+    let pos = line.saturating_sub(first) as f64;
+    let t = cfg.frame as f64 / 40.0;
+    let mut loss = 0.0;
+    if cfg.rf_loss > 0.0 {
+        let a = drift(cfg.seed, KEY_RF, pos / 37.0 + t);
+        let b = drift(cfg.seed, KEY_RF + 1, pos / 13.0 - 0.7 * t);
+        let env = ((a + 0.6 * b) / 1.6).max(0.0);
+        loss += RF_BAND_DB * cfg.rf_loss * env;
+    }
+    if cfg.tracking_bars > 0.0 {
+        // One bar per tape, rolling slowly.
+        let n = (end - first) as f64;
+        let centre = n * (0.15 + 0.7 * (0.5 + 0.5 * drift(cfg.seed, KEY_TRACKING, cfg.frame as f64 / 600.0) as f64));
+        let half = 5.0 + 7.0 * (0.5 + 0.5 * hash_signed(cfg.seed, KEY_TRACKING, -1) as f64);
+        let d = (pos - centre).abs() / half;
+        if d < 1.0 {
+            let w = (0.5 + 0.5 * (std::f64::consts::PI * d).cos()) as f32;
+            loss += TRACKING_BAR_DB * cfg.tracking_bars * w;
+        }
+    }
+    loss
+}
+
+/// Chroma level left by an RF loss (the deck's ACC makes up most of it) and
+/// the loss from which the colour killer mutes the colour.
+fn chroma_gain(loss_db: f32) -> f32 {
+    if loss_db >= 20.0 {
+        0.0
+    } else {
+        10f32.powf(-0.3 * loss_db / 20.0)
+    }
+}
 
 /// Samples a dropout compensator takes to switch over (≈ 0.3 µs): the start
 /// of every compensated dropout still shows as a short streak.
@@ -255,8 +310,13 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
 
     // ── Tape ──
     if do_luma {
-        let sigma = cfg.snr_db.map(|snr| 100.0 * 10f32.powf(-snr / 20.0) / noise_gain(&playback, de));
+        let gain = noise_gain(&playback, de);
+        let sigma_of = |snr: f32| 100.0 * 10f32.powf(-snr / 20.0) / gain;
+        let sigma = cfg.snr_db.map(sigma_of);
+        // Noise reference for RF loss without --tape-snr: a good tape.
+        let base = sigma.unwrap_or(sigma_of(45.0));
         let mut noise = FastNoise::new(stage_seed(cfg.seed, cfg.frame, KEY_NOISE));
+        let mut clicks = FastNoise::new(stage_seed(cfg.seed, cfg.frame, KEY_CLICKS));
         let mut white_n = vec![0.0f32; REGION_LEN + 1];
         let mut line = vec![0.0f32; REGION_LEN];
         let mut prev = vec![0.0f32; REGION_LEN];
@@ -269,14 +329,24 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
                 for j in 0..REGION_LEN {
                     line[j] = g.luma[j * LANES + l];
                 }
-                if let Some(sigma) = sigma {
+                let loss = rf_loss_db(cfg, abs);
+                let m = 10f32.powf(loss / 20.0);
+                let s_line = match sigma {
+                    Some(s) => s * m,
+                    None if loss > 0.0 => base * (m - 1.0),
+                    None => 0.0,
+                };
+                if s_line > 0.0 {
                     noise.fill(&mut white_n);
                     for j in 0..REGION_LEN {
                         // Higher carrier (brighter, or an emphasised
                         // overshoot): more head loss, lower CNR.
                         let level = 0.85 + 0.3 * (line[j] / 100.0).clamp(-0.4, 1.84);
-                        line[j] += sigma * level * (white_n[j + 1] - FM_NOISE_SHAPE * white_n[j]);
+                        line[j] += s_line * level * (white_n[j + 1] - FM_NOISE_SHAPE * white_n[j]);
                     }
+                }
+                if loss > 1.0 {
+                    rf_line_loss(&mut line, loss, &mut clicks, white, dark);
                 }
                 for d in dropouts.iter().filter(|d| d.line == abs) {
                     render_dropout(&mut line, &prev, d, cfg.doc && !first_of_field, sigma.unwrap_or(1.0), &mut noise, white, dark);
@@ -297,6 +367,16 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
             nl.playback(&mut g.luma);
             advance_lanes(&mut g.luma, advance);
             from_ire(&mut g.luma);
+        }
+        if wire != Wire::Luma && (cfg.rf_loss > 0.0 || cfg.tracking_bars > 0.0) {
+            for (l, &abs) in g.lines.iter().enumerate() {
+                let k = chroma_gain(rf_loss_db(cfg, abs));
+                if k < 1.0 {
+                    for j in 0..REGION_LEN {
+                        g.chroma[j * LANES + l] *= k;
+                    }
+                }
+            }
         }
         // Decks mute the colour over a dropout.
         if wire != Wire::Luma {
@@ -343,6 +423,33 @@ fn render_dropout(line: &mut [f32], prev: &[f32], d: &Dropout, doc: bool, sigma:
     // The compensator repeats the line above (it may itself be a repeat).
     if doc {
         line[raw_end..d.x1].copy_from_slice(&prev[raw_end..d.x1]);
+    }
+}
+
+/// What a low RF level does to a line in the emphasised domain, besides
+/// more noise: the spacing loss takes the upper FM sideband first, so fine
+/// detail softens a little (a one-pole lowpass falling from 6 MHz to about
+/// 2.4 MHz at 12 dB, no lower than 2 MHz), and below about 6 dB the FM
+/// demodulator starts to
+/// click: short white (and some black) sparkles whose de-emphasis tail
+/// trails to the right.
+fn rf_line_loss(line: &mut [f32], loss_db: f32, clicks: &mut FastNoise, white: f32, dark: f32) {
+    let soft = Biquad::lowpass1((6.0e6 * 10f64.powf(-loss_db as f64 / 30.0)).max(2.0e6));
+    soft.run(line);
+    if loss_db > 6.0 {
+        let rate = (1.0e-4 * 10f32.powf((loss_db - 6.0) / 8.0)).min(0.02);
+        let mut j = 0;
+        while j + 2 < line.len() {
+            if clicks.uniform() < rate {
+                let up = clicks.uniform() < 0.7;
+                let a = 80.0 + 100.0 * clicks.uniform();
+                for v in &mut line[j..j + 2] {
+                    *v = (*v + if up { a } else { -a }).clamp(dark, white);
+                }
+                j += 2;
+            }
+            j += 1;
+        }
     }
 }
 
@@ -464,6 +571,8 @@ mod tests {
             dropouts_per_min: None,
             dropout_span: 1,
             doc: true,
+            rf_loss: 0.0,
+            tracking_bars: 0.0,
             seed: 1,
             frame: 0,
         }

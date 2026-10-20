@@ -73,7 +73,8 @@ fn crossing(fs: &[f64], db: &[f64], level: f64) -> Option<f64> {
 }
 
 fn measure(v: &ParamValues, label: &str) {
-    let amp = 20.0;
+    // A standard multiburst: 60 IRE peak to peak around 50 IRE.
+    let amp = 30.0;
     let px = sweep(amp);
     let fs = freqs();
     let mut resp = vec![0.0; fs.len()];

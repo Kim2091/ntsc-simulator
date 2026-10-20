@@ -403,9 +403,30 @@ pub static SPECS: &[ParamSpec] = &[
         kind: num(25.0, 55.0, 43.0),
     },
     ParamSpec {
+        id: "rf-loss",
+        label: "Head contact loss",
+        help: "Opt-in, FM tape model. Head-to-tape RF level variation (0–1), the physical cause of worn-tape \
+               bands: soft horizontal bands that drift slowly down the picture where the head reads a weaker \
+               signal. In them the grain gets stronger, the demodulator throws white and black sparkles with \
+               tails, fine detail softens a little and colour weakens. Replaces Head-wear smear.",
+        unit: "",
+        group: Group::Tape,
+        kind: num(0.0, 1.0, 0.4),
+    },
+    ParamSpec {
+        id: "tracking-bars",
+        label: "Tracking noise bar",
+        help: "Opt-in, FM tape model. A tracking noise bar (0–1): a horizontal band of heavy noise, sparkles and \
+               lost colour, 10–25 rows high, rolling slowly, as when the tracking is slightly off (worse on EP).",
+        unit: "",
+        group: Group::Tape,
+        kind: num(0.0, 1.0, 0.5),
+    },
+    ParamSpec {
         id: "head-smear",
         label: "Head-wear smear",
-        help: "Worn-head symmetric luma blur (0.3–1.0). Soft horizontal smudging that varies in bands down the frame.",
+        help: "Worn-head symmetric luma blur (0.3–1.0) of the original model. Soft horizontal smudging that varies \
+               in bands down the frame; no deck circuit blurs like this. Head contact loss is the physical model.",
         unit: "",
         group: Group::Tape,
         kind: num(0.0, 1.0, 0.2),
@@ -413,7 +434,9 @@ pub static SPECS: &[ParamSpec] = &[
     ParamSpec {
         id: "tape-trail",
         label: "Tape trail",
-        help: "Causal rightward luma smear (0.3–1.0). Edges and noise leave a comet tail to the right, the classic worn-tape look.",
+        help: "Causal rightward luma smear (0.3–1.0) of the original model: a lowpass on all luma, noise included. \
+               In the FM tape model the trails come from the emphasis clipping and de-emphasis instead, only \
+               after strong edges and sparkles.",
         unit: "",
         group: Group::Tape,
         kind: num(0.0, 1.0, 0.6),
@@ -1062,6 +1085,8 @@ impl ParamValues {
             tape_snr: None,
             dropouts: None,
             dropout_span: 1,
+            rf_loss: None,
+            tracking_bars: None,
             tape_model: match self.choice("tape-model") {
                 "fm" => TapeModel::Fm,
                 _ => TapeModel::Classic,
@@ -1097,6 +1122,8 @@ impl ParamValues {
         fx.nl_emphasis = s("nl-emphasis", rng);
         fx.tape_snr = s("tape-snr", rng);
         fx.dropouts = s("dropouts", rng);
+        fx.rf_loss = s("rf-loss", rng);
+        fx.tracking_bars = s("tracking-bars", rng);
         fx.dropout_span = req("dropout-span").sample(rng).round().max(1.0) as usize;
         fx.deck_ynr = s("deck-ynr", rng);
         fx.deck_cnr = s("deck-cnr", rng);
@@ -1187,6 +1214,8 @@ impl ParamValues {
         opt("nl_emphasis", "nl-emphasis", fx.nl_emphasis);
         opt("tape_snr", "tape-snr", fx.tape_snr);
         opt("dropouts", "dropouts", fx.dropouts);
+        opt("rf_loss", "rf-loss", fx.rf_loss);
+        opt("tracking_bars", "tracking-bars", fx.tracking_bars);
         opt("dropout_span", "dropout-span", Some(fx.dropout_span as f32));
         opt("deck_ynr", "deck-ynr", fx.deck_ynr);
         opt("deck_cnr", "deck-cnr", fx.deck_cnr);

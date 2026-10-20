@@ -196,6 +196,10 @@ pub struct SignalEffects {
     pub dropouts: Option<f32>,
     /// FM tape model: most consecutive fields one tape defect hits.
     pub dropout_span: usize,
+    /// FM tape model: head-to-tape RF level variation (0-1).  `None` = off.
+    pub rf_loss: Option<f32>,
+    /// FM tape model: tracking noise bar strength (0-1).  `None` = off.
+    pub tracking_bars: Option<f32>,
 }
 
 /// How the tape path is simulated.
@@ -386,6 +390,8 @@ impl SignalEffects {
                 dropouts_per_min: self.dropouts,
                 dropout_span: self.dropout_span,
                 doc: self.doc != Doc::Off,
+                rf_loss: self.rf_loss.unwrap_or(0.0).clamp(0.0, 1.0),
+                tracking_bars: self.tracking_bars.unwrap_or(0.0).clamp(0.0, 1.0),
                 seed: self.stage_seed,
                 frame,
             };
