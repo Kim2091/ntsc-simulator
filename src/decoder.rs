@@ -163,6 +163,14 @@ impl Decoder {
     /// ±4 samples; the blend is fully 3D below about 1 IRE and fully
     /// 2-sample comb above 3 IRE (conservative, so frame-to-frame chroma
     /// noise does not leak into luma as dots).
+    ///
+    /// With `luma_motion`, motion is also detected against the previous
+    /// frame itself, from the luma part of the difference: a 4-sample
+    /// average (one subcarrier cycle) cancels the chroma, whose phase
+    /// inverts between the two frames.  The frame two back alone misses
+    /// whatever is only in the previous frame, such as a thin line that
+    /// has moved on, which the comb would otherwise copy into this frame.
+    #[allow(clippy::too_many_arguments)]
     pub fn decode_frame_3d(
         &mut self,
         signal: &[f32],
@@ -171,6 +179,7 @@ impl Decoder {
         output_width: usize,
         output_height: usize,
         legacy_burst_phase: bool,
+        luma_motion: bool,
     ) -> &[u8] {
         let p = profile::scope("decode comb");
         let spl = SAMPLES_PER_LINE;
@@ -179,6 +188,7 @@ impl Decoder {
         let ire = BLANKING_V / 40.0;
         let (lo, hi) = (1.0 * ire, 3.0 * ire);
         let mut diff = vec![0.0f32; spl];
+        let mut diff1 = vec![0.0f32; spl];
         for vis in 0..VISIBLE_LINES {
             let abs = self.abs_lines[vis];
             let s = abs * spl;
@@ -191,10 +201,20 @@ impl Decoder {
             for n in 0..spl {
                 diff[n] = (cur[n] - old2[n]).abs();
             }
+            if luma_motion {
+                for n in 0..spl {
+                    let a = n.saturating_sub(2).min(spl - 4);
+                    let d: f32 = (a..a + 4).map(|k| cur[k] - old[k]).sum();
+                    diff1[n] = (0.25 * d).abs();
+                }
+            }
             for n in 0..spl {
                 let a = n.saturating_sub(4);
                 let b = (n + 5).min(spl);
-                let m = diff[a..b].iter().sum::<f32>() / (b - a) as f32;
+                let mut m = diff[a..b].iter().sum::<f32>() / (b - a) as f32;
+                if luma_motion {
+                    m = m.max(diff1[a..b].iter().sum::<f32>() / (b - a) as f32);
+                }
                 let still = ((hi - m) / (hi - lo)).clamp(0.0, 1.0);
                 let (y2, c2) = if n >= 2 {
                     ((cur[n] + cur[n - 2]) * 0.5, (cur[n] - cur[n - 2]) * 0.5)

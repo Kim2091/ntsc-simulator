@@ -11,7 +11,8 @@ hq/frame3 f54e8d1b1e361f3c
 hq/synthetic 467bf749580511de
 hq/synthetic-640 59586ea0211236f6
 hq/video 441dddae75aaeb82
-lq+deck-svhs-tbc/video 2c6459ff19c45053
+lq+deck-svhs-tbc+composite/video d0ef6bfe3a12629e
+lq+deck-svhs-tbc/video 9c76aa81a8a5ae4d
 lq+svideo/bars d0151346898bfec2
 lq+svideo/frame1 aceb42cc16a7f3b4
 lq+svideo/frame2 4d51a45710f5b570

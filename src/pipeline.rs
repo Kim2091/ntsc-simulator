@@ -18,7 +18,7 @@ use crate::constants::SAMPLE_RATE;
 use crate::deck::TemporalDnr;
 use crate::decoder::Decoder;
 use crate::dvd::{self, DvdConfig, DvdOutput};
-use crate::effects::SignalEffects;
+use crate::effects::{SignalEffects, TapeModel};
 use crate::encoder::{Encoder, Wire};
 use crate::params::{frame_rng, ParamValues};
 use crate::profile;
@@ -231,7 +231,7 @@ fn analog_frame(
                     fx.apply(buf_c, SAMPLE_RATE, &mut frame_rng(values.seed, n1 as u64), n1 as u64);
                     fx.apply(&mut prev2, SAMPLE_RATE, &mut frame_rng(values.seed, n2 as u64), n2 as u64);
                 }
-                dec.decode_frame_3d(buf, buf_c, &prev2, out_w, out_h, legacy).to_vec()
+                dec.decode_frame_3d(buf, buf_c, &prev2, out_w, out_h, legacy, comb_luma_motion(fx)).to_vec()
             }
             (Comb::OneLine, _) => dec.decode_frame(buf, out_w, out_h, true, legacy).to_vec(),
             (Comb::Trap, _) => dec.decode_frame_trap(buf, out_w, out_h, legacy).to_vec(),
@@ -557,8 +557,14 @@ fn decode_3d_tl(
     TL_DECODER.with(|dec| {
         let mut dec = dec.borrow_mut();
         set_capture_peaking(&mut dec, fx);
-        dec.decode_frame_3d(signal, prev, prev2, out_w, out_h, legacy).to_vec()
+        dec.decode_frame_3d(signal, prev, prev2, out_w, out_h, legacy, comb_luma_motion(fx)).to_vec()
     })
+}
+
+/// Whether the 3D comb also detects motion against the previous frame.  The
+/// classic tape model keeps the original detector, whose output is locked.
+fn comb_luma_motion(fx: &SignalEffects) -> bool {
+    fx.tape_model != TapeModel::Classic
 }
 
 /// The capture chip's luma peaking, from the effects.
