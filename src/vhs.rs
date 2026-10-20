@@ -132,13 +132,22 @@ pub(crate) fn active_line_groups() -> Vec<Vec<usize>> {
 pub struct DeckLuma {
     /// Noise canceller limiter threshold in IRE.
     pub nc_ire: f32,
+    /// Picture control, −1 (soft) … 0 (edit) … 1 (sharp).
+    pub sharpness: f32,
 }
 
 impl DeckLuma {
     pub fn is_active(&self) -> bool {
-        self.nc_ire > 0.0
+        self.nc_ire > 0.0 || self.sharpness != 0.0
     }
 }
+
+/// Tap spacing of the picture control's aperture, in samples (210 ns): the
+/// boost peaks at 1/(2·spacing) ≈ 2.4 MHz.
+const APERTURE_TAP: usize = 3;
+
+/// Detail smaller than this (IRE) is not boosted by the picture control.
+const APERTURE_CORING_IRE: f32 = 1.5;
 
 /// Highpass corner of the noise canceller.
 const NC_HPF_HZ: f64 = 1.0e6;
@@ -152,6 +161,13 @@ const NC_HPF_HZ: f64 = 1.0e6;
 /// amount.  Flat areas come out clean and slightly "waxy": texture below
 /// the threshold goes with the noise.  The highpass runs forwards and
 /// backwards, like decks that delay-match the cancelled signal.
+///
+/// **Picture control** (sharpness), after the noise canceller as on real
+/// decks: a linear-phase aperture, the centre sample minus the mean of
+/// the samples 210 ns either side, added back.  It peaks around 2.4 MHz,
+/// up to +6 dB at full sharpness, and gives one thin halo on each side of
+/// an edge.  Detail under 1.5 IRE is not boosted (coring), so flat noise
+/// is not lifted.  Negative values subtract the detail instead (softer).
 pub fn apply_deck_luma(signal: &mut [f32], cfg: &DeckLuma, full_luma: bool) {
     if !cfg.is_active() || signal.len() < TOTAL_LINES * SAMPLES_PER_LINE {
         return;
@@ -171,6 +187,23 @@ pub fn apply_deck_luma(signal: &mut [f32], cfg: &DeckLuma, full_luma: bool) {
                 *y -= h.clamp(-t, t);
             }
         }
+        if cfg.sharpness != 0.0 {
+            aperture(&mut g.luma, &mut hp, cfg.sharpness.clamp(-1.0, 1.0));
+        }
         g.store(signal);
+    }
+}
+
+/// The picture control's aperture on a lane buffer; `tmp` is scratch.
+fn aperture(luma: &mut [f32], tmp: &mut Vec<f32>, s: f32) {
+    let (d, core) = (APERTURE_TAP * LANES, APERTURE_CORING_IRE * IRE_V);
+    let n = luma.len();
+    tmp.clear();
+    tmp.extend_from_slice(luma);
+    let g = 0.5 * s;
+    for i in d..n - d {
+        let detail = tmp[i] - 0.5 * (tmp[i - d] + tmp[i + d]);
+        let boost = if s > 0.0 { detail.signum() * (detail.abs() - core).max(0.0) } else { detail };
+        luma[i] = tmp[i] + g * boost;
     }
 }

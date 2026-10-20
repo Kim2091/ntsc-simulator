@@ -87,8 +87,8 @@ impl Args for EffectArgs {
                 .value_parser(PossibleValuesParser::new(presets::DECKS.iter().map(|d| d.name)))
                 .help_heading("Presets and seed")
                 .help(
-                    "Playback-deck profile: deck-basic, deck-svhs-tbc (line + frame TBC, recursive noise \
-                     reduction, S-Video, 3D comb), deck-edit (no sharpening). Combines with --preset; the deck's \
+                    "Playback-deck profile: deck-basic (typical consumer VCR), deck-svhs-tbc (line + frame TBC, \
+                     recursive noise reduction, S-Video, 3D comb), deck-edit (no sharpening). Combines with --preset; the deck's \
                      values win where both set the same flag.",
                 ),
         )

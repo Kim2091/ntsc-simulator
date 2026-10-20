@@ -339,8 +339,10 @@ pub static SPECS: &[ParamSpec] = &[
     },
     ParamSpec {
         id: "edge-ringing",
-        label: "Edge ringing",
-        help: "Playback peaking / sharpening gain (0.5–3.0). Adds bright and dark halos beside sharp edges.",
+        label: "Source enhancement",
+        help: "Edge enhancement that is already on the tape (0.5–3.0): ringing and halos from the source chain \
+               (broadcast filters, telecine aperture correction, duplicator enhancers). Adds bright and dark halos \
+               beside sharp edges. The deck's own sharpening is Deck sharpness.",
         unit: "",
         group: Group::Tape,
         kind: num(0.0, 3.0, 0.3),
@@ -430,7 +432,10 @@ pub static SPECS: &[ParamSpec] = &[
     ParamSpec {
         id: "doc",
         label: "Dropout compensator",
-        help: "What the deck does with long dropouts. composite: copies the whole line above, colour included                (the original behaviour; the copied colour comes out in the complementary hue). luma: copies the                luma of the line above and mutes the colour, as real decks do, so patches are colourless. off: no                compensator, every dropout is a white or black streak.",
+        help: "What the deck does with long dropouts. composite: copies the whole line above, colour included \
+               (the original behaviour; the copied colour comes out in the complementary hue). luma: copies the \
+               luma of the line above and mutes the colour, as real decks do, so patches are colourless. off: no \
+               compensator, every dropout is a white or black streak.",
         unit: "",
         group: Group::NoiseDropouts,
         kind: Kind::Choice { options: &["composite", "luma", "off"], default: "composite" },
@@ -607,7 +612,10 @@ pub static SPECS: &[ParamSpec] = &[
     ParamSpec {
         id: "deck-nc",
         label: "Noise canceller",
-        help: "Opt-in. The deck's luma noise canceller (coring): high-frequency detail smaller than this many IRE                (typical 4–10) is removed together with the noise. Flat areas look clean and slightly waxy, fine                low-contrast texture (skin, fabric, grass) disappears, strong edges keep their noise. Nearly every                VCR from the mid-80s has one.",
+        help: "Opt-in. The deck's luma noise canceller (coring): high-frequency detail smaller than this many IRE \
+               (typical 4–10) is removed together with the noise. Flat areas look clean and slightly waxy, fine \
+               low-contrast texture (skin, fabric, grass) disappears, strong edges keep their noise. Nearly every \
+               VCR from the mid-80s has one.",
         unit: "IRE",
         group: Group::Deck,
         kind: num(0.0, 15.0, 7.0),
@@ -615,8 +623,10 @@ pub static SPECS: &[ParamSpec] = &[
     ParamSpec {
         id: "deck-sharpness",
         label: "Deck sharpness",
-        help: "Deck picture / sharpness control (−1 to 1): negative softens, 0 is the edit setting (no enhancement), \
-               positive sharpens with peaking. Complements Edge ringing.",
+        help: "Deck picture / sharpness control (−1 to 1), applied after the noise canceller: positive adds a \
+               short symmetric peaker around 2.4 MHz (up to +6 dB) with one thin halo on each side of an edge and \
+               slightly lifted grain; 0 is the edit setting (no enhancement); negative softens. Detail under \
+               1.5 IRE is not boosted.",
         unit: "",
         group: Group::Deck,
         kind: num(-1.0, 1.0, 0.0),

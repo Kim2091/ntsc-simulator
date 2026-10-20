@@ -219,8 +219,9 @@ pub static DECKS: &[BuiltinPreset] = &[
     BuiltinPreset {
         name: "deck-basic",
         group: "Deck",
-        description: "Ordinary VCR: composite output, no TBC or noise reduction (the behaviour without a deck profile)",
-        values: &[],
+        description: "Ordinary consumer VCR: composite output, noise canceller, colour-killing dropout compensator, \
+                      mild sharpening, no TBC",
+        values: &[("deck-nc", "6"), ("deck-sharpness", "0.3"), ("doc", "luma")],
     },
     BuiltinPreset {
         name: "deck-svhs-tbc",
@@ -232,13 +233,16 @@ pub static DECKS: &[BuiltinPreset] = &[
             ("deck-dnr", "0.5"),
             ("comb", "3d"),
             ("video-out", "svideo"),
+            ("deck-nc", "5"),
+            ("deck-sharpness", "0.2"),
+            ("doc", "luma"),
         ],
     },
     BuiltinPreset {
         name: "deck-edit",
         group: "Deck",
         description: "Deck in edit mode: no sharpening or peaking",
-        values: &[("deck-sharpness", "0"), ("edge-ringing", "0")],
+        values: &[("deck-sharpness", "0")],
     },
 ];
 

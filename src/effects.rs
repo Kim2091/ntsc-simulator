@@ -199,13 +199,12 @@ impl SignalEffects {
             || self.chroma_delay_v.is_some()
             || self.wobble.is_some()
             || self.v_jitter.is_some()
-            || self.deck_sharpness.is_some()
             || self.deck_luma().is_active()
     }
 
     /// Settings of the deck's playback luma circuits.
     fn deck_luma(&self) -> DeckLuma {
-        DeckLuma { nc_ire: self.deck_nc.unwrap_or(0.0).max(0.0) }
+        DeckLuma { nc_ire: self.deck_nc.unwrap_or(0.0).max(0.0), sharpness: self.deck_sharpness.unwrap_or(0.0) }
     }
 
     /// Settings for the playback chroma path; zero turns a stage off.
@@ -338,14 +337,6 @@ impl SignalEffects {
             each(wires, &mut |s, w| {
                 if luma_on(w) {
                     apply_edge_ringing(s, gain, sample_rate, w == Wire::Luma);
-                }
-            });
-        }
-        if let Some(sharpness) = self.deck_sharpness {
-            let _p = profile::scope("fx deck sharpness");
-            each(wires, &mut |s, w| {
-                if luma_on(w) {
-                    apply_deck_sharpness(s, sharpness, w == Wire::Luma);
                 }
             });
         }
@@ -2109,42 +2100,6 @@ fn apply_v_jitter(signal: &mut [f32], amp_rows: f32, rng: &mut impl Rng, clock: 
             } else {
                 dst.fill(BLANKING_V);
             }
-        }
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Deck sharpness control
-// ────────────────────────────────────────────────────────────────────────────
-
-/// The playback deck's picture / sharpness control, on luma only.
-/// Positive values add peaking around 2 MHz (crisper edges with some
-/// overshoot); negative values blend towards a 2 MHz lowpass (softer
-/// picture, less visible noise); 0 is the "edit" setting with no
-/// enhancement.
-fn apply_deck_sharpness(signal: &mut [f32], sharpness: f32, full_luma: bool) {
-    let spl = SAMPLES_PER_LINE;
-    let s = sharpness.clamp(-1.0, 1.0);
-    if s == 0.0 || signal.len() < TOTAL_LINES * spl {
-        return;
-    }
-    let lp = filters::design_lowpass(2.0e6, 41);
-    let mut luma = vec![0.0f32; spl];
-    let mut chroma = vec![0.0f32; spl];
-    let mut active = vec![0.0f32; ACTIVE_SAMPLES];
-    let mut scratch = Vec::new();
-    for line in 0..TOTAL_LINES {
-        let base = line * spl;
-        comb_split(&signal[base..base + spl], &mut luma, &mut chroma, full_luma);
-        active.copy_from_slice(&luma[ACTIVE_START..ACTIVE_START + ACTIVE_SAMPLES]);
-        apply_fir_inplace(&mut active, &lp, &mut scratch);
-        for j in 0..ACTIVE_SAMPLES {
-            let y = luma[ACTIVE_START + j];
-            let detail = y - active[j];
-            luma[ACTIVE_START + j] = if s > 0.0 { y + 1.5 * s * detail } else { y - (-s) * detail };
-        }
-        for n in 0..spl {
-            signal[base + n] = luma[n] + chroma[n];
         }
     }
 }
