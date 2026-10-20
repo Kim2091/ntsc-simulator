@@ -200,6 +200,10 @@ pub struct SignalEffects {
     pub rf_loss: Option<f32>,
     /// FM tape model: tracking noise bar strength (0-1).  `None` = off.
     pub tracking_bars: Option<f32>,
+    /// Colour-under noise bandwidth in Hz.  `None` = the original noise.
+    pub chroma_noise_bw: Option<f32>,
+    /// Adjacent-track chroma crosstalk strength (0-1).  `None` = off.
+    pub chroma_crosstalk: Option<f32>,
 }
 
 /// How the tape path is simulated.
@@ -263,6 +267,8 @@ impl SignalEffects {
             delay_samples: self.chroma_delay.unwrap_or(0.0) * ACTIVE_SAMPLES as f32 / 640.0,
             delay_lines: self.chroma_delay_v.map_or(0, |v| v.round().max(0.0) as usize),
             cnr: self.deck_cnr.unwrap_or(0.0).clamp(0.0, 1.0),
+            noise_bw: self.chroma_noise_bw.unwrap_or(0.0),
+            crosstalk: 0.1 * self.chroma_crosstalk.unwrap_or(0.0).clamp(0.0, 1.0),
         }
     }
 
@@ -1887,6 +1893,11 @@ pub struct ChromaPathConfig {
     pub delay_lines: usize,
     /// Deck chroma noise reducer (recursive line comb) strength, 0-1.
     pub cnr: f32,
+    /// Bandwidth of the colour-under noise in Hz; 0 = the original 150 kHz
+    /// noise with built-in line correlation.
+    pub noise_bw: f32,
+    /// Adjacent-track chroma crosstalk amplitude (fraction).
+    pub crosstalk: f32,
 }
 
 impl ChromaPathConfig {
@@ -1897,6 +1908,7 @@ impl ChromaPathConfig {
             || self.delay_samples != 0.0
             || self.delay_lines > 0
             || self.cnr > 0.0
+            || self.crosstalk > 0.0
     }
 }
 
@@ -2008,15 +2020,17 @@ fn apply_chroma_path(
     let mut scratch = Vec::new();
 
     // Noise filter and the gain that restores unit variance after it.
-    let noise_alpha =
-        1.0 - (-2.0 * std::f64::consts::PI * CHROMA_NOISE_CUTOFF_HZ / sample_rate).exp() as f32;
+    let noise_cutoff = if cfg.noise_bw > 0.0 { cfg.noise_bw as f64 } else { CHROMA_NOISE_CUTOFF_HZ };
+    let noise_alpha = 1.0 - (-2.0 * std::f64::consts::PI * noise_cutoff / sample_rate).exp() as f32;
     let noise_gain = {
         let mut h = vec![0.0f32; 4096];
         h[2048] = 1.0;
         lowpass_zero_phase(&mut h, noise_alpha);
         1.0 / h.iter().map(|v| v * v).sum::<f32>().sqrt()
     };
-    let line_corr = CHROMA_NOISE_LINE_CORR;
+    // Noise at the colour-under bandwidth is independent from line to
+    // line; the 1H comb correlates it.
+    let line_corr = if cfg.noise_bw > 0.0 { 0.0 } else { CHROMA_NOISE_LINE_CORR };
     let fresh = (1.0 - line_corr * line_corr).sqrt();
 
     let act = ACTIVE_SAMPLES;
@@ -2032,10 +2046,10 @@ fn apply_chroma_path(
     let mut tmp_i = vec![0.0f32; act];
     let mut tmp_q = vec![0.0f32; act];
 
+    // ── Demodulate every line of both fields into its burst frame ──
+    let mut demodulated = Vec::with_capacity(2);
     for &(first, end) in &FIELD_ACTIVE_LINES {
         let n_lines = end - first;
-
-        // ── Demodulate every line of the field into its burst frame ──
         let mut orig_i = vec![0.0f32; n_lines * act];
         let mut orig_q = vec![0.0f32; n_lines * act];
         let mut burst = vec![(1.0f32, 0.0f32); n_lines];
@@ -2059,6 +2073,12 @@ fn apply_chroma_path(
                 orig_q[row + j] = -s * tmp_i[j] + c * tmp_q[j];
             }
         }
+        demodulated.push((orig_i, orig_q, burst));
+    }
+
+    for (field, &(first, end)) in FIELD_ACTIVE_LINES.iter().enumerate() {
+        let n_lines = end - first;
+        let (orig_i, orig_q, burst) = &demodulated[field];
         let mut new_i = orig_i.clone();
         let mut new_q = orig_q.clone();
 
@@ -2088,6 +2108,24 @@ fn apply_chroma_path(
                         new_i[k * act + j] += amp * ni;
                         new_q[k * act + j] += amp * nq;
                     }
+                }
+            }
+        }
+
+        // ── 1b. Adjacent-track crosstalk ──
+        // The colour-under carrier gets almost no azimuth rejection, so the
+        // neighbouring track (the other field) leaks in.  The heads' phase
+        // rotation makes the leak alternate in sign from line to line; the
+        // 1H comb then cancels it except where it changes vertically.
+        if cfg.crosstalk > 0.0 {
+            let (other_i, other_q, _) = &demodulated[1 - field];
+            let other_lines = other_i.len() / act;
+            for k in 0..n_lines {
+                let src = k.min(other_lines - 1) * act;
+                let r = if k % 2 == 0 { cfg.crosstalk } else { -cfg.crosstalk };
+                for j in 0..act {
+                    new_i[k * act + j] += r * other_i[src + j];
+                    new_q[k * act + j] += r * other_q[src + j];
                 }
             }
         }

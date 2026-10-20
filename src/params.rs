@@ -451,6 +451,27 @@ pub static SPECS: &[ParamSpec] = &[
         kind: num(0.0, 0.1, 0.02),
     },
     ParamSpec {
+        id: "chroma-noise-bw",
+        label: "Chroma noise bandwidth",
+        help: "Opt-in. Bandwidth of the colour-under noise in kHz (the colour-under channel: about 400–500). Blotches \
+               then are about 1 µs (12 px) long and independent from line to line until the 1H comb pairs them. \
+               Unset: the original 150 kHz noise (blotches three times longer).",
+        unit: "kHz",
+        group: Group::Colour,
+        kind: num(100.0, 1000.0, 450.0),
+    },
+    ParamSpec {
+        id: "chroma-crosstalk",
+        label: "Chroma crosstalk",
+        help: "Opt-in. Adjacent-track colour crosstalk (0–1; 1 = −20 dB, EP-like; SP about 0.2–0.3). The colour of \
+               the other field leaks in with a sign that alternates line by line; the 1H comb (Chroma vertical \
+               blur at 1) cancels it except at vertical colour changes, which get faint coloured fringes. Without \
+               the comb it shows as fine line-by-line colour stripes.",
+        unit: "",
+        group: Group::Colour,
+        kind: num(0.0, 1.0, 0.3),
+    },
+    ParamSpec {
         id: "chroma-phase-noise",
         label: "Chroma phase jitter",
         help: "Per-line hue jitter, std dev in degrees (subtle 1–3). Lines flicker slightly in hue.",
@@ -461,7 +482,8 @@ pub static SPECS: &[ParamSpec] = &[
     ParamSpec {
         id: "chroma-vblur",
         label: "Chroma vertical blur",
-        help: "Playback 1H chroma comb (0–1). Colour is mixed with the line above, softening colour edges vertically.",
+        help: "Playback 1H chroma comb (0–1). Colour is mixed with the line above, softening colour edges \
+               vertically. Real decks average the two lines equally (1); it cancels adjacent-track crosstalk.",
         unit: "",
         group: Group::Colour,
         kind: num(0.0, 1.0, 0.6),
@@ -1086,6 +1108,8 @@ impl ParamValues {
             dropouts: None,
             dropout_span: 1,
             rf_loss: None,
+            chroma_noise_bw: None,
+            chroma_crosstalk: None,
             tracking_bars: None,
             tape_model: match self.choice("tape-model") {
                 "fm" => TapeModel::Fm,
@@ -1123,6 +1147,8 @@ impl ParamValues {
         fx.tape_snr = s("tape-snr", rng);
         fx.dropouts = s("dropouts", rng);
         fx.rf_loss = s("rf-loss", rng);
+        fx.chroma_noise_bw = s("chroma-noise-bw", rng).map(|k| k * 1e3);
+        fx.chroma_crosstalk = s("chroma-crosstalk", rng);
         fx.tracking_bars = s("tracking-bars", rng);
         fx.dropout_span = req("dropout-span").sample(rng).round().max(1.0) as usize;
         fx.deck_ynr = s("deck-ynr", rng);
@@ -1215,6 +1241,8 @@ impl ParamValues {
         opt("tape_snr", "tape-snr", fx.tape_snr);
         opt("dropouts", "dropouts", fx.dropouts);
         opt("rf_loss", "rf-loss", fx.rf_loss);
+        opt("chroma_noise_khz", "chroma-noise-bw", fx.chroma_noise_bw.map(|v| v / 1e3));
+        opt("chroma_crosstalk", "chroma-crosstalk", fx.chroma_crosstalk);
         opt("tracking_bars", "tracking-bars", fx.tracking_bars);
         opt("dropout_span", "dropout-span", Some(fx.dropout_span as f32));
         opt("deck_ynr", "deck-ynr", fx.deck_ynr);
