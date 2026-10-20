@@ -149,13 +149,15 @@ pub(crate) fn active_line_groups() -> Vec<Vec<usize>> {
 pub struct DeckLuma {
     /// Noise canceller limiter threshold in IRE.
     pub nc_ire: f32,
+    /// Recursive line noise reducer strength, 0-1.
+    pub ynr: f32,
     /// Picture control, −1 (soft) … 0 (edit) … 1 (sharp).
     pub sharpness: f32,
 }
 
 impl DeckLuma {
     pub fn is_active(&self) -> bool {
-        self.nc_ire > 0.0 || self.sharpness != 0.0
+        self.nc_ire > 0.0 || self.ynr > 0.0 || self.sharpness != 0.0
     }
 }
 
@@ -165,6 +167,13 @@ const APERTURE_TAP: usize = 3;
 
 /// Detail smaller than this (IRE) is not boosted by the picture control.
 const APERTURE_CORING_IRE: f32 = 1.5;
+
+/// Limiter threshold of the line noise reducer, IRE.
+const YNR_LIMIT_IRE: f32 = 6.0;
+
+/// Lines at each end of a field where the line noise reducer is not
+/// recursive (the head switch falls there).
+const YNR_PLAIN_LINES: usize = 10;
 
 /// Highpass corner of the noise canceller.
 const NC_HPF_HZ: f64 = 1.0e6;
@@ -178,6 +187,14 @@ const NC_HPF_HZ: f64 = 1.0e6;
 /// amount.  Flat areas come out clean and slightly "waxy": texture below
 /// the threshold goes with the noise.  The highpass runs forwards and
 /// backwards, like decks that delay-match the cancelled signal.
+///
+/// **Line noise reducer** (YNR, HQ decks): neighbouring lines of a field
+/// are highly correlated, so each line moves towards the previous output
+/// line by k = 0.5 × strength of their difference, limited to ±6 IRE: noise
+/// and faint detail are averaged vertically (a slight vertical smear below
+/// small features), strong vertical changes pass.  In the 10 lines at each
+/// end of a field, around the head switch, it uses the previous input line
+/// instead (non-recursive), as decks do there.
 ///
 /// **Picture control** (sharpness), after the noise canceller as on real
 /// decks: a linear-phase aperture, the centre sample minus the mean of
@@ -193,6 +210,9 @@ pub fn apply_deck_luma(signal: &mut [f32], cfg: &DeckLuma, full_luma: bool) {
     let mut hp = Vec::new();
     let lp = [Biquad::lowpass1(NC_HPF_HZ)];
     let t = cfg.nc_ire * IRE_V;
+    let mut prev_in = vec![0.0f32; REGION_LEN];
+    let mut prev_out = vec![0.0f32; REGION_LEN];
+    let mut line_in = vec![0.0f32; REGION_LEN];
     for lines in active_line_groups() {
         g.load(signal, &lines, full_luma);
         if cfg.nc_ire > 0.0 {
@@ -204,10 +224,38 @@ pub fn apply_deck_luma(signal: &mut [f32], cfg: &DeckLuma, full_luma: bool) {
                 *y -= h.clamp(-t, t);
             }
         }
+        if cfg.ynr > 0.0 {
+            line_noise_reducer(&mut g, cfg.ynr, &mut prev_in, &mut prev_out, &mut line_in);
+        }
         if cfg.sharpness != 0.0 {
             aperture(&mut g.luma, &mut hp, cfg.sharpness.clamp(-1.0, 1.0));
         }
         g.store(signal);
+    }
+}
+
+/// The line noise reducer on one group of lines, continuing from the
+/// previous line of the field in `prev_in` / `prev_out`.
+fn line_noise_reducer(g: &mut LaneGroup, strength: f32, prev_in: &mut [f32], prev_out: &mut [f32], input: &mut [f32]) {
+    let k = 0.5 * strength;
+    let t = YNR_LIMIT_IRE * IRE_V;
+    for (l, &line) in g.lines.iter().enumerate() {
+        let (first, end) = *FIELD_ACTIVE_LINES.iter().find(|(a, b)| (*a..*b).contains(&line)).expect("active line");
+        let pos = line - first;
+        for (j, v) in input.iter_mut().enumerate() {
+            *v = g.luma[j * LANES + l];
+        }
+        if pos > 0 {
+            let recursive = pos >= YNR_PLAIN_LINES && line + YNR_PLAIN_LINES < end;
+            let reference: &[f32] = if recursive { prev_out } else { prev_in };
+            for (j, &x) in input.iter().enumerate() {
+                g.luma[j * LANES + l] = x - k * (x - reference[j]).clamp(-t, t);
+            }
+        }
+        for j in 0..REGION_LEN {
+            prev_out[j] = g.luma[j * LANES + l];
+        }
+        prev_in.copy_from_slice(input);
     }
 }
 

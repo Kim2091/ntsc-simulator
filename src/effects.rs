@@ -170,6 +170,10 @@ pub struct SignalEffects {
     pub stage_seed: u64,
     /// Deck noise canceller limiter threshold in IRE.  `None` = off.
     pub deck_nc: Option<f32>,
+    /// Deck recursive line noise reducer strength (0-1).  `None` = off.
+    pub deck_ynr: Option<f32>,
+    /// Deck recursive chroma noise reducer strength (0-1).  `None` = off.
+    pub deck_cnr: Option<f32>,
     /// What the dropout compensator does with long dropouts.
     pub doc: Doc,
     /// Head-switch point in lines before vertical sync; `None` = use
@@ -227,7 +231,11 @@ impl SignalEffects {
 
     /// Settings of the deck's playback luma circuits.
     fn deck_luma(&self) -> DeckLuma {
-        DeckLuma { nc_ire: self.deck_nc.unwrap_or(0.0).max(0.0), sharpness: self.deck_sharpness.unwrap_or(0.0) }
+        DeckLuma {
+            nc_ire: self.deck_nc.unwrap_or(0.0).max(0.0),
+            ynr: self.deck_ynr.unwrap_or(0.0).clamp(0.0, 1.0),
+            sharpness: self.deck_sharpness.unwrap_or(0.0),
+        }
     }
 
     /// Settings for the playback chroma path; zero turns a stage off.
@@ -239,6 +247,7 @@ impl SignalEffects {
             // Pixels at 640 wide to samples.
             delay_samples: self.chroma_delay.unwrap_or(0.0) * ACTIVE_SAMPLES as f32 / 640.0,
             delay_lines: self.chroma_delay_v.map_or(0, |v| v.round().max(0.0) as usize),
+            cnr: self.deck_cnr.unwrap_or(0.0).clamp(0.0, 1.0),
         }
     }
 
@@ -1838,6 +1847,8 @@ pub struct ChromaPathConfig {
     pub delay_samples: f32,
     /// Vertical chroma delay in field lines (positive = down).
     pub delay_lines: usize,
+    /// Deck chroma noise reducer (recursive line comb) strength, 0-1.
+    pub cnr: f32,
 }
 
 impl ChromaPathConfig {
@@ -1847,8 +1858,12 @@ impl ChromaPathConfig {
             || self.vblur > 0.0
             || self.delay_samples != 0.0
             || self.delay_lines > 0
+            || self.cnr > 0.0
     }
 }
+
+/// Limiter threshold of the chroma noise reducer, in IRE of chroma.
+const CNR_LIMIT_IRE: f32 = 6.0;
 
 /// −3 dB cutoff of the colour-under noise.  Well under the colour-under
 /// bandwidth, so the noise forms blotches a few to tens of pixels long.
@@ -2063,6 +2078,26 @@ fn apply_chroma_path(
                     let (cur, prev) = (line * act + j, (line - 1) * act + j);
                     new_i[cur] = (1.0 - k) * new_i[cur] + k * new_i[prev];
                     new_q[cur] = (1.0 - k) * new_q[cur] + k * new_q[prev];
+                }
+            }
+        }
+
+        // ── 3b. Chroma noise reducer ──
+        // A recursive line comb: each line's colour moves towards the
+        // previous output line by up to k·threshold, so small line-to-line
+        // differences (noise) are averaged and large ones (real colour
+        // edges) pass.  Near the head switch, where line correlation is
+        // weak, decks run it non-recursively.
+        if cfg.cnr > 0.0 {
+            let k = 0.5 * cfg.cnr;
+            let t = CNR_LIMIT_IRE * IRE_V;
+            for line in 1..n_lines {
+                let recursive = line >= 10 && line + 10 < n_lines;
+                for j in 0..act {
+                    let (cur, prev) = (line * act + j, (line - 1) * act + j);
+                    let (pi, pq) = if recursive { (new_i[prev], new_q[prev]) } else { (orig_i[prev], orig_q[prev]) };
+                    new_i[cur] -= k * (new_i[cur] - pi).clamp(-t, t);
+                    new_q[cur] -= k * (new_q[cur] - pq).clamp(-t, t);
                 }
             }
         }

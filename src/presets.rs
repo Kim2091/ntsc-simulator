@@ -237,6 +237,8 @@ pub static DECKS: &[BuiltinPreset] = &[
             ("comb", "3d"),
             ("video-out", "svideo"),
             ("deck-nc", "5"),
+            ("deck-ynr", "1"),
+            ("deck-cnr", "1"),
             ("deck-sharpness", "0.2"),
             ("doc", "luma"),
         ],

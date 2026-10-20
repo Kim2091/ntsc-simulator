@@ -668,6 +668,26 @@ pub static SPECS: &[ParamSpec] = &[
         kind: num(0.0, 15.0, 7.0),
     },
     ParamSpec {
+        id: "deck-ynr",
+        label: "Line noise reducer",
+        help: "Opt-in. HQ decks' recursive line noise reducer (YNR), 0–1: each line is averaged with the line above \
+               where they differ by less than 6 IRE, so noise and faint detail are smoothed vertically (a slight \
+               vertical smear below small features) while strong edges pass. Not every HQ deck has it.",
+        unit: "",
+        group: Group::Deck,
+        kind: num(0.0, 1.0, 1.0),
+    },
+    ParamSpec {
+        id: "deck-cnr",
+        label: "Chroma noise reducer",
+        help: "Opt-in. HQ decks' recursive chroma noise reducer (CNR), 0–1: colour noise is averaged with the line \
+               above where the colour changes little, which reduces colour blotches but smears colour vertically \
+               a little more.",
+        unit: "",
+        group: Group::Deck,
+        kind: num(0.0, 1.0, 1.0),
+    },
+    ParamSpec {
         id: "deck-sharpness",
         label: "Deck sharpness",
         help: "Deck picture / sharpness control (−1 to 1), applied after the noise canceller: positive adds a \
@@ -965,6 +985,8 @@ impl ParamValues {
             deck_dnr: None,
             stage_seed: 0,
             deck_nc: None,
+            deck_ynr: None,
+            deck_cnr: None,
             head_switch_point: None,
             head_switch_after: match self.choice("head-switch-after") {
                 "picture" => HeadSwitchAfter::Picture,
@@ -1001,6 +1023,8 @@ impl ParamValues {
         // Stages with their own random streams (drawn after everything
         // above, so older parameter sets keep their exact values).
         fx.deck_nc = s("deck-nc", rng);
+        fx.deck_ynr = s("deck-ynr", rng);
+        fx.deck_cnr = s("deck-cnr", rng);
         fx.head_switch_point = s("head-switch-point", rng);
         fx.flagging = s("flagging", rng);
         fx.stage_seed = match self.seed {
@@ -1083,6 +1107,8 @@ impl ParamValues {
         opt("deck_sharpness", "deck-sharpness", fx.deck_sharpness);
         opt("deck_dnr", "deck-dnr", fx.deck_dnr);
         opt("deck_nc", "deck-nc", fx.deck_nc);
+        opt("deck_ynr", "deck-ynr", fx.deck_ynr);
+        opt("deck_cnr", "deck-cnr", fx.deck_cnr);
         opt("head_switch_point", "head-switch-point", fx.head_switch_point);
         opt("flagging", "flagging", fx.flagging);
         parts

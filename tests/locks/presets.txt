@@ -11,7 +11,7 @@ hq/frame3 1ff9f61b5bdaa2d6
 hq/synthetic d01ba10b769e6ec2
 hq/synthetic-640 3a5efc1b2a1d1951
 hq/video 969bc52c48d16ab6
-lq+deck-svhs-tbc/video 983bf0b117e3d05b
+lq+deck-svhs-tbc/video 87b59bc777eec29e
 lq+svideo/bars 2c6a39247c26ff04
 lq+svideo/frame1 b7fae5f1b57e130e
 lq+svideo/frame2 51bcec52d82bbe9c
@@ -37,12 +37,12 @@ mq+deck-edit/frame2 0095b618d25b1fd8
 mq+deck-edit/frame3 ef4beedab54be201
 mq+deck-edit/synthetic f8a0ead6db97572e
 mq+deck-edit/synthetic-640 f3f0935d925493dd
-mq+deck-svhs-tbc/bars 20b6f4bdcb69d914
-mq+deck-svhs-tbc/frame1 819a9de4f78ed5f7
-mq+deck-svhs-tbc/frame2 7e51b1066b0d61f6
-mq+deck-svhs-tbc/frame3 0f9be71121f598ad
-mq+deck-svhs-tbc/synthetic 7ea6bffd48d1f797
-mq+deck-svhs-tbc/synthetic-640 9b062c1693df3eef
+mq+deck-svhs-tbc/bars fc5b2a273af0a7ae
+mq+deck-svhs-tbc/frame1 1661c0ff4b90c5ec
+mq+deck-svhs-tbc/frame2 65b02328d8061a97
+mq+deck-svhs-tbc/frame3 7fa9c997c0f1e6c2
+mq+deck-svhs-tbc/synthetic 59bb13b85d9be24a
+mq+deck-svhs-tbc/synthetic-640 2cc9032ebd4a0030
 mq+svideo/bars 188e636ba510f425
 mq+svideo/frame1 2de22fec1bebea14
 mq+svideo/frame2 dfd1471c4ab39fcf
