@@ -231,6 +231,123 @@ impl Decoder {
         self.finish(output_width, output_height, legacy_burst_phase)
     }
 
+    /// Decode with an adaptive 3-line (2D) comb, as in most TVs and
+    /// broadcast monitors from the late 1980s on.
+    ///
+    /// The subcarrier inverts from one line of a field to the next, so
+    /// where the picture does not change vertically, `(2·cur − up − down)/4`
+    /// is pure chroma (the full 3-line comb), and so is half the difference
+    /// between a line and either neighbour.  For every sample the comb
+    /// checks, smoothed over ±4 samples:
+    ///   - whether the lines above and below are the same (they carry the
+    ///     same subcarrier phase, so they are compared directly) and the
+    ///     centre line's luma matches theirs: then the 3-line comb is used;
+    ///   - otherwise which neighbour matches the centre line's luma: the
+    ///     2-line comb with that neighbour;
+    ///   - where neither does, the 2-sample comb.
+    /// Luma is compared through the low-frequency part of the line
+    /// difference (a binomial filter on every second sample, with a
+    /// fourth-order zero at the subcarrier), which stays free of chroma
+    /// even where the chroma amplitude changes at a colour edge.  The blend
+    /// goes from comb to fallback between 1.5 and 4 IRE of mismatch.
+    /// Colour bars and other vertical edges come out without dot crawl or
+    /// cross-colour, and horizontal colour edges without the hanging dots
+    /// of a plain 1H comb.  The first and last line of a field use their
+    /// one neighbour.
+    pub fn decode_frame_2d(
+        &mut self,
+        signal: &[f32],
+        output_width: usize,
+        output_height: usize,
+        legacy_burst_phase: bool,
+    ) -> &[u8] {
+        let p = profile::scope("decode comb");
+        let spl = SAMPLES_PER_LINE;
+        let ypl = spl + RIGHT_PAD;
+        self.prepare_output(output_width, output_height);
+        let ire = BLANKING_V / 40.0;
+        let (lo, hi) = (1.5 * ire, 4.0 * ire);
+        let line = |abs: usize| &signal[abs * spl..(abs + 1) * spl];
+        // |low-frequency part of e|, then a ±4-sample mean, into `out`.
+        let mismatch = |e: &[f32], extra: &[f32], tmp: &mut [f32], out: &mut [f32]| {
+            const W: [f32; 5] = [1.0, 4.0, 6.0, 4.0, 1.0];
+            for n in 0..spl {
+                let mut s = 0.0f32;
+                for (t, w) in W.iter().enumerate() {
+                    let i = (n as isize + 2 * t as isize - 4).clamp(0, spl as isize - 1) as usize;
+                    s += w * e[i];
+                }
+                tmp[n] = (s / 16.0).abs() + extra[n];
+            }
+            let mut acc = 0.0f32;
+            for n in 0..spl + 4 {
+                if n < spl {
+                    acc += tmp[n];
+                }
+                if n >= 9 {
+                    acc -= tmp[n - 9];
+                }
+                if n >= 4 {
+                    out[n - 4] = acc / (n.min(spl - 1) + 1 - (n.saturating_sub(8))) as f32;
+                }
+            }
+        };
+        let zeros = vec![0.0f32; spl];
+        let (mut e, mut extra, mut tmp) = (vec![0.0f32; spl], vec![0.0f32; spl], vec![0.0f32; spl]);
+        let mut m = [vec![0.0f32; spl], vec![0.0f32; spl], vec![0.0f32; spl]];
+        for vis in 0..VISIBLE_LINES {
+            let abs = self.abs_lines[vis];
+            let field = vis % 2;
+            let (first, last) = (self.abs_lines[field], self.abs_lines[VISIBLE_LINES - 2 + field]);
+            let cur = line(abs);
+            let base = vis * spl;
+            let ybase = vis * ypl;
+            self.full_lines[base..base + spl].copy_from_slice(cur);
+            let up = (abs > first).then(|| line(abs - 1));
+            let dn = (abs < last).then(|| line(abs + 1));
+            if let (Some(u), Some(d)) = (up, dn) {
+                for n in 0..spl {
+                    e[n] = cur[n] - 0.5 * (u[n] + d[n]);
+                    extra[n] = 0.5 * (u[n] - d[n]).abs();
+                }
+                mismatch(&e, &extra, &mut tmp, &mut m[0]);
+            } else {
+                m[0].fill(f32::INFINITY);
+            }
+            for (k, nb) in [up, dn].iter().enumerate() {
+                match nb {
+                    Some(l) => {
+                        for n in 0..spl {
+                            e[n] = cur[n] - l[n];
+                        }
+                        mismatch(&e, &zeros, &mut tmp, &mut m[1 + k]);
+                    }
+                    None => m[1 + k].fill(f32::INFINITY),
+                }
+            }
+            for n in 0..spl {
+                let c2 = if n >= 2 { 0.5 * (cur[n] - cur[n - 2]) } else { 0.0 };
+                let (mu, md) = (m[1][n], m[2][n]);
+                let c1 = match (up, dn) {
+                    (Some(u), _) if mu <= md => 0.5 * (cur[n] - u[n]),
+                    (_, Some(d)) => 0.5 * (cur[n] - d[n]),
+                    _ => c2,
+                };
+                let w1 = ((hi - mu.min(md)) / (hi - lo)).clamp(0.0, 1.0);
+                let mut c = c2 + w1 * (c1 - c2);
+                if let (Some(u), Some(d)) = (up, dn) {
+                    let w3 = ((hi - m[0][n]) / (hi - lo)).clamp(0.0, 1.0);
+                    let c3 = 0.25 * (2.0 * cur[n] - u[n] - d[n]);
+                    c += w3 * (c3 - c);
+                }
+                self.chroma_full[base + n] = c;
+                self.y_full[ybase + n] = cur[n] - c;
+            }
+        }
+        drop(p);
+        self.finish(output_width, output_height, legacy_burst_phase)
+    }
+
     /// Decode with a chroma trap, as capture chips do for VCR input (the
     /// TVP5150 switches to it automatically when the timing is unstable).
     /// Chroma is the band fsc ± 0.6 MHz (−6 dB), luma is everything else,
@@ -559,5 +676,43 @@ multiversion! {
 impl Default for Decoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoder::Encoder;
+
+    /// Luma (0-255) of a decoded RGB frame.
+    fn luma(rgb: &[u8]) -> Vec<f32> {
+        rgb.chunks_exact(3).map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).collect()
+    }
+
+    /// Largest luma change between two consecutive frames of a still
+    /// picture (the subcarrier inverts, so leaked chroma flips), 8 px clear
+    /// of the picture's sides.
+    fn crawl(pixels: &[u8], decode: &dyn Fn(&mut Decoder, &[f32]) -> Vec<u8>) -> f32 {
+        let mut enc = Encoder::new();
+        let mut dec = Decoder::new();
+        let a = luma(&decode(&mut dec, &enc.encode_frame(pixels, 640, 480, 0).to_vec()));
+        let b = luma(&decode(&mut dec, &enc.encode_frame(pixels, 640, 480, 1).to_vec()));
+        (0..640 * 480).filter(|i| (8..632).contains(&(i % 640))).map(|i| (a[i] - b[i]).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn adaptive_comb_has_no_dot_crawl_on_bars_or_colour_edges() {
+        let bars = crate::colorbars::generate_colorbars(640, 480);
+        // Top half red, bottom half blue: a horizontal colour edge.
+        let edge: Vec<u8> = (0..640 * 480).flat_map(|i| if i / 640 < 240 { [200u8, 40, 40] } else { [40, 60, 200] }).collect();
+        let two_sample = |d: &mut Decoder, s: &[f32]| d.decode_frame(s, 640, 480, false, false).to_vec();
+        let one_line = |d: &mut Decoder, s: &[f32]| d.decode_frame(s, 640, 480, true, false).to_vec();
+        let adaptive = |d: &mut Decoder, s: &[f32]| d.decode_frame_2d(s, 640, 480, false).to_vec();
+        // The 2-sample comb leaves dots at every bar edge, the 1H comb
+        // hanging dots on the horizontal edge; the adaptive comb neither.
+        assert!(crawl(&bars, &two_sample) > 20.0);
+        assert!(crawl(&edge, &one_line) > 20.0);
+        assert!(crawl(&bars, &adaptive) < 4.0, "{}", crawl(&bars, &adaptive));
+        assert!(crawl(&edge, &adaptive) < 4.0, "{}", crawl(&edge, &adaptive));
     }
 }

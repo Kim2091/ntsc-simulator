@@ -195,6 +195,7 @@ fn preset_outputs_are_locked() {
     for deck in presets::DECKS {
         render_set(&format!("mq+{}", deck.name), &values("mq", Some(deck.name), &[]), &mut got);
     }
+    render_set("none+2d", &values("none", None, &[("comb", "2d")]), &mut got);
     if has_ffmpeg() {
         let dir = work_dir("presets");
         let input = clip(&dir);

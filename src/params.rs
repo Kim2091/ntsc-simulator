@@ -892,13 +892,15 @@ pub static SPECS: &[ParamSpec] = &[
         label: "Decoder comb filter",
         help: "Luma/chroma separation in the TV or capture card (composite only). 2sample: simple, rainbow on fine \
                detail, and soft luma (−3 dB at 1.8 MHz). 1h: line comb, less rainbow but hanging dots on colour \
-               edges. 3d: frame comb using the previous frame where the picture is still (motion-adaptive), the \
+               edges. 2d: adaptive 3-line comb, as in most TVs and monitors from the late 1980s on: takes the \
+               chroma from the line above or below, whichever matches, and falls back to 2sample where neither \
+               does; clean colour bars and vertical edges, no hanging dots. 3d: frame comb using the previous frame where the picture is still (motion-adaptive), the \
                cleanest on static areas. trap: a chroma trap (notch ± 0.6 MHz around the subcarrier), what \
                capture chips use for VCR input: luma keeps its detail to about 2.9 MHz, fine detail near the \
                subcarrier shows as rainbow.",
         unit: "",
         group: Group::Deck,
-        kind: Kind::Choice { options: &["2sample", "1h", "3d", "trap"], default: "2sample" },
+        kind: Kind::Choice { options: &["2sample", "1h", "2d", "3d", "trap"], default: "2sample" },
     },
     // ── Decoder / output ──
     ParamSpec {

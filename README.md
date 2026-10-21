@@ -321,7 +321,7 @@ Only used with `--format dvd`.
 | `--deck-sharpness` | The deck's picture control after the noise canceller: positive adds a short peaker around 2.4 MHz (up to +6 dB, thin halos, lifted grain), 0 is edit mode, negative softens. | −1–1 |
 | `--capture-peaking` | The capture chip's luma peaking gain; on VHS it mostly lifts noise above the tape bandwidth (crisper grain, thin halos). | 0–2, 1 = +6 dB (SAA7113 about 0.25) |
 | `--capture-peaking-mhz` | Its centre frequency. | 1.5–4.5 MHz, default 2.6 |
-| `--comb` | Luma/chroma separation in the TV or capture card (composite only). `2sample`: rainbow on fine detail, soft luma (−3 dB at 1.8 MHz). `1h`: line comb, less rainbow but hanging dots on colour edges. `3d`: motion-adaptive frame comb, cleanest on still areas. `trap`: chroma notch (± 0.6 MHz) as capture chips use for VCR input, luma to about 2.9 MHz. | `2sample` (default), `1h`, `3d`, `trap` |
+| `--comb` | Luma/chroma separation in the TV or capture card (composite only). `2sample`: rainbow on fine detail, soft luma (−3 dB at 1.8 MHz). `1h`: line comb, less rainbow but hanging dots on colour edges. `2d`: adaptive 3-line comb as in most TVs and monitors from the late 1980s on (line above or below, whichever matches, 2-sample fallback): clean colour bars, no dot crawl on still vertical edges, no hanging dots; the closest to a decent receiver. `3d`: motion-adaptive frame comb, cleanest on still areas. `trap`: chroma notch (± 0.6 MHz) as capture chips use for VCR input, luma to about 2.9 MHz. | `2sample` (default), `1h`, `2d`, `3d`, `trap` |
 
 ### Input, decoder and output
 

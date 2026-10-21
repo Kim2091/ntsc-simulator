@@ -57,3 +57,9 @@ mq/frame3 165f47e8cbcc6d6b
 mq/synthetic 50e3b0a0abbc0610
 mq/synthetic-640 17fcea2fa27237e7
 mq/video 08c433be6c553a7c
+none+2d/bars 8f5a6e2c9f89508f
+none+2d/frame1 cc5d90695474586e
+none+2d/frame2 b2308edc0e8b53e6
+none+2d/frame3 509f1c8fd5d56c7c
+none+2d/synthetic 34a9f6df951d0f81
+none+2d/synthetic-640 72974760965ba0a5

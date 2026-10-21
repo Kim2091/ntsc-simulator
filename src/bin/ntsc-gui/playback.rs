@@ -513,7 +513,7 @@ mod tests {
             let mut k = 0u64;
             for preset in ["lq", "mq", "hq"] {
                 for deck in [None, Some("deck-basic"), Some("deck-svhs-tbc"), Some("deck-edit")] {
-                    for comb in ["trap", "2sample", "1h", "3d"] {
+                    for comb in ["trap", "2sample", "1h", "2d", "3d"] {
                         for out in ["composite", "svideo"] {
                             k += 1;
                             let start = (k * 37) % frames;
