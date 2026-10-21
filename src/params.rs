@@ -667,8 +667,8 @@ pub static SPECS: &[ParamSpec] = &[
         id: "head-switch-point",
         label: "Head-switch point",
         help: "Opt-in. Where the heads switch, in lines before vertical sync (the format allows 6.5 ± 1.5). Sets \
-               how many lines at the bottom are torn, about 2·point − 7 rows of a 480-line capture (5-7 rows at \
-               6.5, 2-10 over the format's range), independent of the head-switching strength. Replaces \
+               how many lines at the bottom are torn, about 2·point − 5.5 rows of a 480-line capture (7-8 rows at \
+               6.5, 5-11 over the format's range), independent of the head-switching strength. Replaces \
                Head-switch lines.",
         unit: "H",
         group: Group::Timing,

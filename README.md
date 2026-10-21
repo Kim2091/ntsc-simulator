@@ -287,7 +287,7 @@ Only used with `--format dvd`.
 | `--v-jitter` | Vertical bounce: the picture jumps up and down by whole lines from frame to frame. A frame TBC removes it. | 0–4 rows std dev (typical 1) |
 | `--head-switch` | Head-switching noise at the bottom of each field: a displaced switch line with a switching transient, then near-black lines with bright noise streaks. Stable over a tape, with per-field flicker and occasional sudden jumps. | 0–1 (typical 0.6) |
 | `--head-switch-lines` | Active lines per field torn at full strength. | 1–20, default 3 (6 rows at 480) |
-| `--head-switch-point` | Where the heads switch, in lines before vertical sync: sets how many rows tear (about 2 × point − 7), independent of strength. Replaces `--head-switch-lines`. | 4–9 (the format allows 6.5 ± 1.5) |
+| `--head-switch-point` | Where the heads switch, in lines before vertical sync: sets how many rows tear (about 2 × point − 5.5), independent of strength. Replaces `--head-switch-lines`. | 4–9 (the format allows 6.5 ± 1.5) |
 | `--head-switch-after` | What the lines after the switch show: `black` (signal lost, light streaks) or `picture` (shifted sideways with a small level step, the common case on healthy tapes). | `black` (default), `picture` |
 | `--flagging` | Top-of-field skew: the head switch's time-base step carried into the next field by a slow PLL, so the top lines bend sideways and straighten over about 30 lines. Both fields bend the same way; the heads' phase error adds a few tens of ns between them. A line TBC removes it. | 0–1, 1 ≈ 12 px at the top line (typical 0.5) |
 | `--top-band` | Faint blue/purple chroma bands on the first lines of each field, as the deck's chroma loop settles. | 0–1 (typical 0.4) |
