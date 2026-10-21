@@ -126,6 +126,7 @@ const KEY_RF: u64 = 0x7A9E_0004;
 const KEY_TRACKING: u64 = 0x7A9E_0005;
 const KEY_CLICKS: u64 = 0x7A9E_0006;
 const KEY_INVERSION: u64 = 0x7A9E_0007;
+const KEY_HEADS: u64 = 0x7A9E_0008;
 
 /// FM deviation per IRE (1 MHz over the 140 IRE sync-to-white span) and the
 /// EP carrier interleave offset (½ fH).
@@ -168,6 +169,18 @@ fn rf_loss_db(cfg: &TapeFm, line: usize) -> f32 {
         }
     }
     loss
+}
+
+/// +1 if head CH-1 recorded field 1 of this tape, −1 if it recorded field
+/// 2.  Which head takes which field is a matter of where the recording
+/// started, so the head-dependent offsets of the generations of a dub add
+/// or cancel at random instead of always adding up.
+fn head_sign(seed: u64) -> f32 {
+    if hash_signed(seed, KEY_HEADS, 0) < 0.0 {
+        -1.0
+    } else {
+        1.0
+    }
 }
 
 /// Chroma level left by an RF loss (the deck's ACC makes up most of it) and
@@ -303,6 +316,7 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
     let dark = -40.0 - 1.4 * cfg.dark_clip;
     let nl = NlEmphasis::new(cfg.nl_emphasis);
     let dropouts = frame_dropouts(cfg);
+    let heads = head_sign(cfg.seed);
     let do_luma = wire != Wire::Chroma;
 
     // ── Record ──
@@ -370,12 +384,14 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
                     None => 0.0,
                 };
                 let field = usize::from(abs >= FIELD_ACTIVE_LINES[1].0);
+                // +1 on the lines of head CH-1, −1 on those of CH-2.
+                let head = heads * if field == 0 { 1.0 } else { -1.0 };
                 if let Some(rf) = rf_channel.as_mut() {
                     let half = groups_lines.len() / 2;
                     let other = if gi >= half { gi - half } else { gi + half };
                     let o = recorded.get(other).map(|o| (o.as_slice(), l));
                     let line_drops: Vec<Dropout> = dropouts.iter().filter(|d| d.line == abs).copied().collect();
-                    rf.line(&mut line, o, loss, &line_drops, field, cfg);
+                    rf.line(&mut line, o, loss, &line_drops, head, cfg);
                 } else if s_line > 0.0 {
                     noise.fill(&mut white_n);
                     for j in 0..REGION_LEN {
@@ -397,7 +413,7 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
                     crosstalk_beats(&mut line, o, l, cfg, field, abs, &mut beat_scratch);
                 }
                 if cfg.ep_interleave != 0.0 {
-                    let dc = 0.5 * cfg.ep_interleave * if field == 0 { 1.0 } else { -1.0 };
+                    let dc = 0.5 * cfg.ep_interleave * head;
                     for v in line.iter_mut() {
                         *v += dc;
                     }
@@ -434,7 +450,8 @@ pub fn apply_tape_fm(signal: &mut [f32], cfg: &TapeFm, wire: Wire) {
             advance_lanes(&mut g.luma, advance);
             if cfg.head_level_step != 0.0 {
                 for (l, &abs) in g.lines.iter().enumerate() {
-                    let k = 1.0 + 0.5 * cfg.head_level_step * if abs < FIELD_ACTIVE_LINES[1].0 { 1.0 } else { -1.0 };
+                    let head = heads * if abs < FIELD_ACTIVE_LINES[1].0 { 1.0 } else { -1.0 };
+                    let k = 1.0 + 0.5 * cfg.head_level_step * head;
                     for j in 0..REGION_LEN {
                         g.luma[j * LANES + l] *= k;
                     }
@@ -633,7 +650,8 @@ impl RfChannel {
         ch
     }
 
-    fn line(&mut self, line: &mut [f32], other: Option<(&[f32], usize)>, loss_db: f32, drops: &[Dropout], field: usize, cfg: &TapeFm) {
+    /// `head` is +1 on the lines of head CH-1 and −1 on those of CH-2.
+    fn line(&mut self, line: &mut [f32], other: Option<(&[f32], usize)>, loss_db: f32, drops: &[Dropout], head: f32, cfg: &TapeFm) {
         let mut other_line = std::mem::take(&mut self.other_line);
         other_line.clear();
         if let Some((o, l)) = other {
@@ -642,13 +660,7 @@ impl RfChannel {
         let rl = RfLine {
             loss_db,
             crosstalk: cfg.luma_crosstalk,
-            interleave: if cfg.ep_interleave == 0.0 {
-                0.0
-            } else if field == 0 {
-                0.5 * INTERLEAVE_HZ
-            } else {
-                -0.5 * INTERLEAVE_HZ
-            },
+            interleave: if cfg.ep_interleave == 0.0 { 0.0 } else { 0.5 * INTERLEAVE_HZ * head },
         };
         self.process(line, (!other_line.is_empty()).then_some(other_line.as_slice()), &rl, drops);
         self.other_line = other_line;
@@ -1043,6 +1055,30 @@ mod tests {
             (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
         };
         assert!(rms(1.0) < 0.85 * rms(0.0), "{} {}", rms(1.0), rms(0.0));
+    }
+
+    #[test]
+    fn head_level_step_sign_depends_on_the_tape() {
+        // Which head records field 1 varies from tape to tape (and from
+        // generation to generation of a dub), so the step takes both signs.
+        let mut signs = Vec::new();
+        for seed in 1..17u64 {
+            let (mut sig, _) = step_signal(50.0, 50.0);
+            let c = TapeFm { head_level_step: 0.04, seed, ..cfg() };
+            apply_tape_fm(&mut sig, &c, Wire::Luma);
+            let mean = |line: usize| {
+                (crate::constants::ACTIVE_START + 60..SAMPLES_PER_LINE - 40)
+                    .map(|k| (sig[line * SAMPLES_PER_LINE + k] - BLANKING_V) / IRE_V)
+                    .sum::<f32>()
+                    / (SAMPLES_PER_LINE - 100 - crate::constants::ACTIVE_START) as f32
+            };
+            let d = mean(100) - mean(363);
+            // 4 % of 50 IRE between the fields.
+            assert!((d.abs() - 2.0).abs() < 0.2, "{d}");
+            assert_eq!(d.signum(), head_sign(seed));
+            signs.push(d > 0.0);
+        }
+        assert!(signs.contains(&true) && signs.contains(&false));
     }
 
     #[test]
