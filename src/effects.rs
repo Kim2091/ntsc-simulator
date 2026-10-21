@@ -1683,8 +1683,12 @@ fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng, clock: 
 /// How many lines are torn: with `HeadSwitch::point` set, from the switch
 /// point (in lines before vertical sync; the format allows 6.5 ± 1.5).  In
 /// a 480-line capture that leaves `point − 3` lines of field 1 and
-/// `point − 4` of field 2 after the switch, the fraction setting where
-/// along the switch line it happens: about 5-7 rows in all at 6.5.
+/// `point − 2.5` of field 2 after the switch, the fraction setting where
+/// along the switch line it happens: about 7-8 rows in all at 6.5.  Field
+/// 2's picture ends half a line closer to the next vertical interval than
+/// field 1's, so both fields switch at the same height on the screen and
+/// the torn rows of the two fields interleave without picture rows
+/// between them.
 /// Without it, `lines` at full strength (a little fewer at low strength).
 ///
 /// Over time the switch behaves as on a real tape: the switch point, the
@@ -1740,7 +1744,7 @@ fn apply_head_switch<R: Rng>(signal: &mut [f32], hs: &HeadSwitch, rng: &mut R, c
         let n_lines = match hs.point {
             Some(point) => {
                 // Field lines after the switch in a 480-line capture.
-                let after = point - if field == 0 { 3.0 } else { 4.0 } + clock.blend(0.0, || extra);
+                let after = point - if field == 0 { 3.0 } else { 2.5 } + clock.blend(0.0, || extra);
                 if after <= 0.0 {
                     continue;
                 }
@@ -2970,7 +2974,7 @@ mod tests {
     #[test]
     fn head_switch_point_sets_the_torn_lines() {
         let orig = test_signal();
-        for (point, n1, n2) in [(6.5f32, 4usize, 3usize), (5.0, 2, 1), (8.0, 5, 4)] {
+        for (point, n1, n2) in [(6.5f32, 4usize, 4usize), (5.0, 2, 3), (8.0, 5, 6)] {
             let mut sig = orig.clone();
             let cfg = HeadSwitch { point: Some(point), after: HeadSwitchAfter::Picture, ..hs(0.5, 3) };
             apply_head_switch(&mut sig, &cfg, &mut StdRng::seed_from_u64(2), &TapeClock::off());

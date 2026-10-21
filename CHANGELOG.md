@@ -2,7 +2,9 @@
 
 Newest first.
 
-- **Chroma noise reducer at the field edges**: in the first and last 10 lines of each field `--deck-cnr` compared each line with the previous line as it was before the colour-under noise, so it pulled the noise towards a clean picture and the top and bottom of the frame came out cleaner than the middle (rms 0.86 × the middle instead of 1.2 ×). It now uses the previous line as it enters the reducer. Affects `--deck-cnr` (`deck-svhs-tbc`); locks of those decks updated.
+- **Head switch at the same height in both fields**: with `--head-switch-point` field 2 tore one line fewer than field 1 (`point − 4` against `point − 3` lines), so its switch fell a line and a half higher on the screen and the bottom rows alternated between torn lines and picture. Field 2's picture ends half a line closer to the next vertical interval, so it now has `point − 2.5` lines after the switch: both fields switch at the same height and the torn rows form one band (flat-area luma difference between the fields in the head-switch rows, `mq`: 61 -> 25 8-bit levels, within one field 45). `lq`/`mq`/`hq` locks updated.
+
+- **Chroma noise reducer at the field edges**: in the first and last 10 lines of each field `--deck-cnr` compared each line with the previous line as it was before the colour-under noise, so it pulled the noise towards a clean picture and the top and bottom of the frame came out cleaner than the middle (rms 0.86 × the middle instead of 1.15 ×). It now uses the previous line as it enters the reducer. Affects `--deck-cnr` (`deck-svhs-tbc`); locks of those decks updated.
 
 - **Dubs no longer double the field step**: with `--generations 2` or more every generation put its head level step and EP interleave residue on the same field, so a dub had twice the level difference between the fields (`lq --deck deck-svhs-tbc`, seed 42: 5.4 8-bit levels). Which head records field 1 is now a property of each tape, so the generations' steps add or cancel at random (same example: 0.0 levels). Preset locks updated.
 
