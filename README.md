@@ -118,7 +118,6 @@ The full VHS look, built on the FM tape model with a typical consumer deck and c
 | `--generations` | 1..2 | 1 | 1 |
 | `--head-switch` | 0.8..1.0 | 0.55..0.7 | 0.35..0.45 |
 | `--head-switch-point` | 5.5..7.5 | 6..7 | 6..7 |
-| `--flagging` | 0.4..0.6 | 0.25..0.4 | 0.15..0.25 |
 | `--top-band` | 0.6..0.8 | 0.4..0.55 | 0.2..0.3 |
 | `--vbi-data` | 0.6..0.8 | 0.4..0.55 | 0.25..0.35 |
 | `--chroma-noise` | 0.025..0.035 | 0.015..0.025 | 0.008..0.015 |
@@ -293,7 +292,7 @@ Only used with `--format dvd`.
 | `--head-switch-lines` | Active lines per field torn at full strength. | 1–20, default 3 (6 rows at 480) |
 | `--head-switch-point` | Where the heads switch, in lines before vertical sync: sets how many rows tear (about 2 × point − 5.5), independent of strength. Replaces `--head-switch-lines`. | 4–9 (the format allows 6.5 ± 1.5) |
 | `--head-switch-after` | What the lines after the switch show: `black` (signal lost, light streaks) or `picture` (shifted sideways with a small level step, the common case on healthy tapes). | `black` (default), `picture` |
-| `--flagging` | Top-of-field skew: the head switch's time-base step carried into the next field by a slow PLL, so the top lines bend sideways and straighten over about 30 lines. Both fields bend the same way; the heads' phase error adds a few tens of ns between them. A line TBC removes it. | 0–1, 1 ≈ 12 px at the top line (typical 0.5) |
+| `--flagging` | Opt-in, not used by any preset. Top-of-field skew as some TVs and capture cards with a slow horizontal lock show it: the head switch's time-base step carried into the next field by a slow PLL, so the top lines bend sideways and straighten over about 30 lines. Both fields bend the same way; the heads' phase error adds a few tens of ns between them. A line TBC removes it. | 0–1, 1 ≈ 12 px at the top line (typical 0.5) |
 | `--top-band` | Faint blue/purple chroma bands on the first lines of each field, as the deck's chroma loop settles. | 0–1 (typical 0.4) |
 | `--vbi-data` | Closed-caption data on lines 21/284: a row of short light dashes near the top. | 0–1 (typical 0.5) |
 
