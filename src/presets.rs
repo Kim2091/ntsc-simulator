@@ -33,8 +33,9 @@ pub struct BuiltinPreset {
     pub values: &'static [(&'static str, &'static str)],
 }
 
-/// Values of the original VHS presets, used by both preset families.
-const LEGACY_LQ: [(&str, &str); 7] = [
+/// Values of the original VHS presets: the original seven flags, and the
+/// 2-sample decoder comb, the default when they were made.
+const LEGACY_LQ: [(&str, &str); 8] = [
     ("vhs-luma-bw", "1.6"),
     ("color-under-bw", "400..450"),
     ("edge-ringing", "0.3..0.4"),
@@ -42,8 +43,9 @@ const LEGACY_LQ: [(&str, &str); 7] = [
     ("tape-dropout-rate", "1"),
     ("head-smear", "0.2..0.3"),
     ("tape-trail", "0.75..0.9"),
+    ("comb", "2sample"),
 ];
-const LEGACY_MQ: [(&str, &str); 7] = [
+const LEGACY_MQ: [(&str, &str); 8] = [
     ("vhs-luma-bw", "3"),
     ("color-under-bw", "400..450"),
     ("edge-ringing", "0.25..0.35"),
@@ -51,8 +53,9 @@ const LEGACY_MQ: [(&str, &str); 7] = [
     ("tape-dropout-rate", "0..1"),
     ("head-smear", "0.15..0.2"),
     ("tape-trail", "0.6..0.75"),
+    ("comb", "2sample"),
 ];
-const LEGACY_HQ: [(&str, &str); 7] = [
+const LEGACY_HQ: [(&str, &str); 8] = [
     ("vhs-luma-bw", "3"),
     ("color-under-bw", "300..400"),
     ("edge-ringing", "0.2..0.3"),
@@ -60,6 +63,7 @@ const LEGACY_HQ: [(&str, &str); 7] = [
     ("tape-dropout-rate", "0"),
     ("head-smear", "0.1..0.15"),
     ("tape-trail", "0.5..0.7"),
+    ("comb", "2sample"),
 ];
 
 pub static BUILTIN: &[BuiltinPreset] = &[
@@ -425,9 +429,12 @@ mod tests {
             let set = v.numbers.len() + v.flags.len() + v.texts.len() + v.choices.len();
             assert_eq!(set, p.values.len(), "{}", p.name);
         }
-        // Legacy presets hold the original seven values and nothing else.
+        // Legacy presets hold the original seven values and the comb they
+        // were decoded with, nothing else.
         for name in ["legacy-lq", "legacy-mq", "legacy-hq"] {
-            assert_eq!(builtin(name).unwrap().values.len(), 7);
+            let p = builtin(name).unwrap();
+            assert_eq!(p.values.len(), 8);
+            assert!(p.values.contains(&("comb", "2sample")));
         }
     }
 

@@ -1845,6 +1845,7 @@ mod tests {
             s / (out.len() / 3) as f32
         };
         let mut v = ParamValues::default();
+        v.set_from_str("comb", "2sample").unwrap();
         let fx = resolve_effects(&v);
         let composite = sat(&render_frame(&src, 640, 480, 640, 480, false, &v, &fx, 0));
         v.set_from_str("video-out", "svideo").unwrap();

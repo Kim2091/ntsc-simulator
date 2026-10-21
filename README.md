@@ -28,7 +28,7 @@ It is built for people who need believable analog and early-digital artefacts, f
 
 ## Features
 
-- **NTSC composite signal path**: RGB to YIQ, band-limiting (luma 4.2 MHz, I 1.5 MHz, Q 0.5 MHz), modulation onto the 3.58 MHz subcarrier, a full 525-line frame with sync, blanking and colour burst, and a decoder with a choice of comb filters (2-sample, 1H line comb, motion-adaptive 3D frame comb, chroma trap). Composite or S-Video connection.
+- **NTSC composite signal path**: RGB to YIQ, band-limiting (luma 4.2 MHz, I 1.5 MHz, Q 0.5 MHz), modulation onto the 3.58 MHz subcarrier, a full 525-line frame with sync, blanking and colour burst, and a decoder with a choice of comb filters (adaptive 2D comb by default, 2-sample, 1H line comb, motion-adaptive 3D frame comb, chroma trap). Composite or S-Video connection.
 - **VHS tape model**: the original lowpass model (`classic`), and an FM model of the format's record and playback circuits (`fm`, optionally with the FM carrier itself simulated, `rf`): emphasis and clipping, FM noise, colour-under, dropouts, head-contact loss, crosstalk, head switching, time-base errors, dubbing generations.
 - **Playback deck and capture card**: noise canceller, line and chroma noise reducers, sharpness control, dropout compensator, line and frame time-base correctors, recursive noise reduction, capture-chip peaking.
 - **Reception**: snow, multipath ghosts (several reflections, phase, high-frequency rolloff, slow drift) and attenuation, before or after the tape.
@@ -139,7 +139,7 @@ Measured with `examples/vhs_measure.rs` (60 IRE peak-to-peak multiburst, flat 50
 
 ### VHS legacy
 
-`legacy-lq`, `legacy-mq` and `legacy-hq` are the original tape-path settings and nothing else: the `classic` lowpass tape model with luma noise, dropouts, head-wear smear and a rightward trail. With the same `--seed` they reproduce the output of earlier versions byte for byte (locked by the test suite), the same as passing their seven flags by hand.
+`legacy-lq`, `legacy-mq` and `legacy-hq` are the original tape-path settings and nothing else: the `classic` lowpass tape model with luma noise, dropouts, head-wear smear and a rightward trail. With the same `--seed` they reproduce the output of earlier versions byte for byte (locked by the test suite), the same as passing their seven flags by hand together with `--comb 2sample`. They pin the 2-sample comb, the decoder default when they were made; the default is now `2d`.
 
 | Flag | `legacy-lq` | `legacy-mq` | `legacy-hq` |
 |---|---|---|---|
@@ -150,6 +150,7 @@ Measured with `examples/vhs_measure.rs` (60 IRE peak-to-peak multiburst, flat 50
 | `--tape-dropout-rate` | 1 | 0..1 | 0 |
 | `--head-smear` | 0.2..0.3 | 0.15..0.2 | 0.1..0.15 |
 | `--tape-trail` | 0.75..0.9 | 0.6..0.75 | 0.5..0.7 |
+| `--comb` | 2sample | 2sample | 2sample |
 
 ### DVD
 
@@ -324,7 +325,7 @@ Only used with `--format dvd`.
 | `--deck-sharpness` | The deck's picture control after the noise canceller: positive adds a short peaker around 2.4 MHz (up to +6 dB, thin halos, lifted grain), 0 is edit mode, negative softens. | −1–1 |
 | `--capture-peaking` | The capture chip's luma peaking gain; on VHS it mostly lifts noise above the tape bandwidth (crisper grain, thin halos). | 0–2, 1 = +6 dB (SAA7113 about 0.25) |
 | `--capture-peaking-mhz` | Its centre frequency. | 1.5–4.5 MHz, default 2.6 |
-| `--comb` | Luma/chroma separation in the TV or capture card (composite only). `2sample`: rainbow on fine detail, soft luma (−3 dB at 1.8 MHz). `1h`: line comb, less rainbow but hanging dots on colour edges. `2d`: adaptive 3-line comb as in most TVs and monitors from the late 1980s on (line above or below, whichever matches, 2-sample fallback): clean colour bars, no dot crawl on still vertical edges, no hanging dots; the closest to a decent receiver. `3d`: motion-adaptive frame comb, cleanest on still areas. `trap`: chroma notch (± 0.6 MHz) as capture chips use for VCR input, luma to about 2.9 MHz. | `2sample` (default), `1h`, `2d`, `3d`, `trap` |
+| `--comb` | Luma/chroma separation in the TV or capture card (composite only). `2d` (default): adaptive 3-line comb as in most TVs and monitors from the late 1980s on (line above or below, whichever matches, 2-sample fallback): clean colour bars, no dot crawl on still vertical edges, no hanging dots; the closest to a decent receiver. `2sample`: rainbow on fine detail, soft luma (−3 dB at 1.8 MHz); the default of earlier versions, kept by the `legacy-*` presets. `1h`: line comb, less rainbow but hanging dots on colour edges. `3d`: motion-adaptive frame comb, cleanest on still areas. `trap`: chroma notch (± 0.6 MHz) as capture chips use for VCR input, luma to about 2.9 MHz. | `2d` (default), `2sample`, `1h`, `3d`, `trap` |
 
 ### Input, decoder and output
 
