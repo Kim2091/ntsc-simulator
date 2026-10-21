@@ -178,14 +178,17 @@ Deck profiles combine with any preset. The images show `lq` with each deck, rend
 | ![lq without a deck profile](docs/images/deck_none.png) | ![lq with deck-basic](docs/images/deck-basic.png) |
 | **`lq --deck deck-svhs-tbc`** | **`lq --deck deck-edit`** |
 | ![lq with deck-svhs-tbc](docs/images/deck-svhs-tbc.png) | ![lq with deck-edit](docs/images/deck-edit.png) |
+| **`lq --deck deck-vhs-decode`** | |
+| ![lq with deck-vhs-decode](docs/images/deck-vhs-decode.png) | |
 
 | Profile | What it is | Settings |
 |---|---|---|
 | `deck-basic` | ordinary consumer VCR: composite output, no TBC | `--deck-nc 4 --deck-sharpness 0.4 --doc luma` |
 | `deck-svhs-tbc` | high-end S-VHS deck with line and frame TBC, recursive noise reduction, S-Video out (3D comb for composite captures) | `--line-tbc 0.9 --frame-tbc 1 --deck-dnr 0.5 --comb 3d --video-out svideo --deck-nc 5 --deck-ynr 1 --deck-cnr 1 --deck-sharpness 0.2 --doc luma` |
 | `deck-edit` | edit mode as on pro decks for dubbing (e.g. JVC BR-S422): no sharpening, noise canceller and colour noise reducer off | `--deck-sharpness 0 --deck-nc 0 --deck-cnr 0` |
+| `deck-vhs-decode` | an RF capture decoded by vhs-decode and exported with tbc-video-export: no VCR playback electronics; every line re-timed from its own sync and the fields aligned in software; separate luma and chroma files, decoded like S-Video; luma dropouts corrected from neighbouring lines (colour muted here, as the closest option); vhs-decode's own 1H chroma comb is on by default, as in the tape presets; sharpness 0 | `--line-tbc 1 --frame-tbc 1 --video-out svideo --deck-nc 0 --deck-ynr 0 --deck-cnr 0 --deck-sharpness 0 --deck-dnr 0 --doc luma` |
 
-The `lq` preset already includes a typical consumer deck (noise canceller, sharpness, luma dropout compensator), so `deck-basic` changes it only slightly. `deck-edit` leaves source enhancement (`--edge-ringing`) and the line noise reducer as they are set.
+The `lq` preset already includes a typical consumer deck (noise canceller, sharpness, luma dropout compensator), so `deck-basic` changes it only slightly. `deck-edit` leaves source enhancement (`--edge-ringing`) and the line noise reducer as they are set. `deck-vhs-decode` keeps the tape (the preset's tape model, wear, head switching and dropouts) and replaces only the playback deck; the head-switching rows stay, as in vhs-decode output, but the lines after the switch are re-timed. Its tape model stays `fm`: vhs-decode demodulates the RF in software, and `--tape-model rf` (the FM channel itself, about four times slower) can be added for the RF channel's own clicks and dropout streaks.
 
 ### Preset files
 

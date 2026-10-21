@@ -44,6 +44,12 @@ mq+deck-svhs-tbc/frame2 9c32513289a6ccba
 mq+deck-svhs-tbc/frame3 71ce3640565aef6c
 mq+deck-svhs-tbc/synthetic e6363a792fdf3ed9
 mq+deck-svhs-tbc/synthetic-640 44cc0042d144b970
+mq+deck-vhs-decode/bars 5d2524a6a797b9b6
+mq+deck-vhs-decode/frame1 4a4e880a989d642e
+mq+deck-vhs-decode/frame2 e52b35b56012ce36
+mq+deck-vhs-decode/frame3 d44c6dd0d5483d2e
+mq+deck-vhs-decode/synthetic f9b94eb87080b320
+mq+deck-vhs-decode/synthetic-640 68dd8fbbf6fd1109
 mq+svideo/bars 7615aeb7159ace9a
 mq+svideo/frame1 1c3e8051aa9710b9
 mq+svideo/frame2 317b5f369d790dfc

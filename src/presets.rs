@@ -290,6 +290,24 @@ pub static DECKS: &[BuiltinPreset] = &[
                       reducer off",
         values: &[("deck-sharpness", "0"), ("deck-nc", "0"), ("deck-cnr", "0")],
     },
+    BuiltinPreset {
+        name: "deck-vhs-decode",
+        group: "Deck",
+        description: "vhs-decode RF capture: the head signal demodulated in software, no VCR playback electronics. Every \
+                      line re-timed from its sync, fields aligned, separate luma and chroma, luma dropouts corrected, no \
+                      noise canceller, noise reducers or sharpening",
+        values: &[
+            ("line-tbc", "1"),
+            ("frame-tbc", "1"),
+            ("video-out", "svideo"),
+            ("deck-nc", "0"),
+            ("deck-ynr", "0"),
+            ("deck-cnr", "0"),
+            ("deck-sharpness", "0"),
+            ("deck-dnr", "0"),
+            ("doc", "luma"),
+        ],
+    },
 ];
 
 /// Look up a deck profile by name.
