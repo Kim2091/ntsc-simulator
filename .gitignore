@@ -6,8 +6,7 @@
 # Rust
 target/
 
-# Allow example images
-!examples/
-!examples/*.png
+# Allow the README's images
+!docs/images/*.png
 input/
 output/
