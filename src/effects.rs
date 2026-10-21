@@ -2261,15 +2261,17 @@ fn apply_chroma_path(
         // previous output line by up to k·threshold, so small line-to-line
         // differences (noise) are averaged and large ones (real colour
         // edges) pass.  Near the head switch, where line correlation is
-        // weak, decks run it non-recursively.
+        // weak, decks run it non-recursively: against the previous line as
+        // it enters the reducer.
         if cfg.cnr > 0.0 {
             let k = 0.5 * cfg.cnr;
             let t = CNR_LIMIT_IRE * IRE_V;
+            let (in_i, in_q) = (new_i.clone(), new_q.clone());
             for line in 1..n_lines {
                 let recursive = line >= 10 && line + 10 < n_lines;
                 for j in 0..act {
                     let (cur, prev) = (line * act + j, (line - 1) * act + j);
-                    let (pi, pq) = if recursive { (new_i[prev], new_q[prev]) } else { (orig_i[prev], orig_q[prev]) };
+                    let (pi, pq) = if recursive { (new_i[prev], new_q[prev]) } else { (in_i[prev], in_q[prev]) };
                     new_i[cur] -= k * (new_i[cur] - pi).clamp(-t, t);
                     new_q[cur] -= k * (new_q[cur] - pq).clamp(-t, t);
                 }
@@ -2850,6 +2852,33 @@ mod tests {
         let mut sig = orig.clone();
         apply_flagging(&mut sig, 1.0, 1.0, &clock);
         assert_eq!(sig, orig);
+    }
+
+    #[test]
+    fn chroma_noise_reducer_is_not_cleaner_at_the_field_edges() {
+        // Near the head switch the reducer compares each line with the
+        // previous noisy line, so the first lines of a field keep more
+        // noise than the recursive middle, never less.
+        let orig = encode_flat([150, 90, 60]);
+        let mut sig = orig.clone();
+        let cfg = ChromaPathConfig { noise: 0.04, noise_bw: 450e3, cnr: 1.0, noise_seed: 3, ..Default::default() };
+        apply_chroma_path(&mut sig, &cfg, crate::constants::SAMPLE_RATE, &mut StdRng::seed_from_u64(2));
+        let rms = |lines: std::ops::Range<usize>| {
+            let mut s = 0.0f32;
+            let mut n = 0.0f32;
+            for (first, _) in FIELD_ACTIVE_LINES {
+                for l in lines.clone() {
+                    let base = (first + l) * SAMPLES_PER_LINE;
+                    for k in base + ACTIVE_START + 40..base + SAMPLES_PER_LINE - 40 {
+                        s += (sig[k] - orig[k]).powi(2);
+                        n += 1.0;
+                    }
+                }
+            }
+            (s / n).sqrt()
+        };
+        let (edge, middle) = (rms(2..9), rms(40..200));
+        assert!(edge > 1.05 * middle, "edge {edge} middle {middle}");
     }
 
     /// Mean absolute difference between two signals.
