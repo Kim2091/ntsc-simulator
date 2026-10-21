@@ -112,9 +112,9 @@ The full VHS look, built on the FM tape model with a typical consumer deck and c
 | `--rf-loss` | 0.6..0.9 | 0.3..0.5 | 0.1..0.2 |
 | `--tracking-bars` | 0..0.3 | – | – |
 | `--luma-crosstalk` | 0.4..0.7 | 0.1..0.3 | – |
-| `--ep-interleave` | 0.2..0.8 | – | – |
+| `--ep-interleave` | 0.2..0.6 | – | – |
 | `--bw-inversion` | 0.3..0.6 | 0.1..0.2 | – |
-| `--head-level-step` | 1..3 | 0.5..2 | 0..1 |
+| `--head-level-step` | 0.5..1.5 | 0.2..0.8 | 0..0.3 |
 | `--generations` | 1..2 | 1 | 1 |
 | `--head-switch` | 0.8..1.0 | 0.55..0.7 | 0.35..0.45 |
 | `--head-switch-point` | 5.5..7.5 | 6..7 | 6..7 |
@@ -289,7 +289,7 @@ Only used with `--format dvd`.
 | `--head-switch-lines` | Active lines per field torn at full strength. | 1–20, default 3 (6 rows at 480) |
 | `--head-switch-point` | Where the heads switch, in lines before vertical sync: sets how many rows tear (about 2 × point − 7), independent of strength. Replaces `--head-switch-lines`. | 4–9 (the format allows 6.5 ± 1.5) |
 | `--head-switch-after` | What the lines after the switch show: `black` (signal lost, light streaks) or `picture` (shifted sideways with a small level step, the common case on healthy tapes). | `black` (default), `picture` |
-| `--flagging` | Top-of-field skew: the head switch's time-base step carried into the next field by a slow PLL, so the top lines bend sideways and straighten over about 30 lines. A line TBC removes it. | 0–1, 1 ≈ 12 px at the top line (typical 0.5) |
+| `--flagging` | Top-of-field skew: the head switch's time-base step carried into the next field by a slow PLL, so the top lines bend sideways and straighten over about 30 lines. Both fields bend the same way; the heads' phase error adds a few tens of ns between them. A line TBC removes it. | 0–1, 1 ≈ 12 px at the top line (typical 0.5) |
 | `--top-band` | Faint blue/purple chroma bands on the first lines of each field, as the deck's chroma loop settles. | 0–1 (typical 0.4) |
 | `--vbi-data` | Closed-caption data on lines 21/284: a row of short light dashes near the top. | 0–1 (typical 0.5) |
 
@@ -449,7 +449,7 @@ The effects run on the encoded signal between encoder and decoder, in signal-cha
 - **Tape**: FM noise in the emphasised domain (rising with frequency after de-emphasis), dropouts counted per minute (mostly 1–2 µs, none under 0.5 µs, white or black streaks with de-emphasis tails, spanning several fields on EP), head-contact RF loss in drifting bands, tracking noise bars, luma crosstalk beats, the EP interleave residue, black/white inversion after bright edges, a level step between the heads, and dubs.
 - **Playback**: the demodulator's lowpass (record + playback −3 dB at 0.66 × and −10 dB at 1.0 × `--vhs-luma-bw`), de-emphasis and nonlinear de-emphasis; dropout compensation per `--doc`.
 - **Chroma**: colour-under (heterodyned down to 629 kHz, band-limited, back up); in the playback chroma path the chroma is demodulated per line into that line's burst frame, where colour-under noise, crosstalk, hue jitter, the 1H comb and the horizontal and vertical chroma delay are applied; only the change is remodulated, so luma is untouched.
-- **Timing**: time-base wobble (three sinusoids across the lines plus a mean-reverting random walk, burst moving with the line), head switching (a time-base jump on the last lines of each field, a switching transient, then black or the displaced picture), top-of-field skew, top-of-field chroma bands, and an EIA-608 caption waveform on lines 21/284 written before the tape path.
+- **Timing**: time-base wobble (three sinusoids along the track, the same in both fields, plus a small mean-reverting random walk in scan order, burst moving with the line), head switching (a time-base jump on the last lines of each field, a switching transient, then black or the displaced picture), top-of-field skew, top-of-field chroma bands, and an EIA-608 caption waveform on lines 21/284 written before the tape path.
 
 `--tape-model rf` goes a step further and simulates the FM carrier itself (modulated at 3.4–4.4 MHz at 8 × fsc, record highpass and head/tape lowpass, RF noise, limiter and demodulator), so noise, sparkles, dropout streaks and crosstalk beats come out of the channel. It costs about four times as much per frame.
 

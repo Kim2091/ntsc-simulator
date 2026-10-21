@@ -1539,7 +1539,12 @@ fn apply_vbi_data(signal: &mut [f32], strength: f32, sample_rate: f64, rng: &mut
 ///   4. A slight luma lift with low-frequency streak noise is added.
 ///
 /// All of it decays with the line index.  Angles, bias and decay are random
-/// for every frame and field.
+/// for every frame; the two fields of a frame differ by a quarter of an
+/// independent draw.
+/// How far field 2's top-band state is from field 1's, as a fraction of an
+/// independent draw.
+const TOP_BAND_FIELD_SPREAD: f32 = 0.25;
+
 fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng, clock: &TapeClock) {
     let spl = SAMPLES_PER_LINE;
     let strength = strength.clamp(0.0, 1.0);
@@ -1561,6 +1566,7 @@ fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng, clock: 
     let mut q_bb = vec![0.0f32; ACTIVE_SAMPLES];
     let mut streak = vec![0.0f32; ACTIVE_SAMPLES];
     let mut scratch = Vec::new();
+    let mut field1_state: Option<[f32; 4]> = None;
 
     for (field, &(first, _)) in FIELD_ACTIVE_LINES.iter().enumerate() {
         // Per-field random state (drifts with the tape clock).
@@ -1581,6 +1587,18 @@ fn apply_top_band(signal: &mut [f32], strength: f32, rng: &mut impl Rng, clock: 
         let lift = clock.blend(strength * 0.02 * (0.5 + r), || {
             strength * 0.02 * (0.5 + clock.unit(key + 3))
         });
+        // The loop settles from much the same state after either head
+        // switch, so field 2 differs only a little from field 1.
+        let mut state = [rot0, hue, bias, lift];
+        match field1_state {
+            None => field1_state = Some(state),
+            Some(f1) => {
+                for (s, a) in state.iter_mut().zip(f1) {
+                    *s = a + TOP_BAND_FIELD_SPREAD * (*s - a);
+                }
+            }
+        }
+        let [rot0, hue, bias, lift] = state;
 
         for k in 0..band_lines {
             let line = first + k;
@@ -1856,13 +1874,21 @@ pub struct HeadSwitch {
 /// at the top of a field.
 const FLAG_DECAY_LINES: f32 = 10.0;
 
-/// Top-of-field skew ("flagging"): the two heads' timing differs, so each
-/// head switch is a time-base step, and a TV or capture card whose
-/// horizontal PLL is slow has not fully caught up by the top of the next
-/// field.  The top lines are displaced and straighten out over ~30 lines.
-/// The switch goes from one head to the other and back, so the two fields
-/// bend in opposite directions.  At the first active line the offset is
-/// `strength` × 0.7-1.3 µs (fixed per tape); a line TBC removes it.
+/// Head-to-head timing error (the heads not exactly 180° apart on the
+/// drum), µs at full flagging strength, before the tape's own 0.5-1 factor.
+const HEAD_PHASE_US: f32 = 0.04;
+
+/// Top-of-field skew ("flagging"): each head switch is a time-base step,
+/// and a TV or capture card whose horizontal PLL is slow has not fully
+/// caught up by the top of the next field.  The top lines are displaced and
+/// straighten out over ~30 lines.  Most of the step is skew from tape
+/// tension (the track is longer or shorter than the recorded lines), which
+/// is the same at both switches, so both fields bend the same way.  The
+/// heads' small phase error adds a step of opposite sign at the two
+/// switches, so the fields differ by a few tens of ns at the top line.  At
+/// the first active line the common offset is `strength` × 0.7-1.3 µs and
+/// the head error ±`strength` × 20-40 ns (both fixed per tape); a line TBC
+/// removes them.
 fn apply_flagging(signal: &mut [f32], strength: f32, tbc: f32, clock: &TapeClock) {
     let spl = SAMPLES_PER_LINE;
     let amount = strength.clamp(0.0, 1.0) * (1.0 - tbc.clamp(0.0, 1.0));
@@ -1873,9 +1899,10 @@ fn apply_flagging(signal: &mut [f32], strength: f32, tbc: f32, clock: &TapeClock
     let tape = |k: u64| 0.5 + 0.5 * hash_signed(clock.seed, KEY_HEAD_SWITCH + k, -11);
     let sign = if tape(0) < 0.5 { 1.0 } else { -1.0 };
     let us = 0.7 + 0.6 * tape(1);
+    let head_us = HEAD_PHASE_US * (0.5 + 0.5 * tape(2));
     for (field, &(first, end)) in FIELD_ACTIVE_LINES.iter().enumerate() {
-        let field_sign = if field == 0 { -sign } else { sign };
-        let skew = field_sign * amount * us * 1e-6 * crate::constants::SAMPLE_RATE as f32;
+        let head = if field == 0 { -head_us } else { head_us };
+        let skew = amount * (sign * us + head) * 1e-6 * crate::constants::SAMPLE_RATE as f32;
         for k in 0..(4.0 * FLAG_DECAY_LINES) as usize {
             let line = first + k;
             if line >= end {
@@ -2304,25 +2331,30 @@ const WOBBLE_COMPONENTS: [((f32, f32), f32); 3] =
     [((20.0, 45.0), 0.2), ((60.0, 140.0), 0.3), ((150.0, 300.0), 0.5)];
 
 /// Weight and line-to-line correlation of the random-walk component.
-const WOBBLE_WALK_WEIGHT: f32 = 0.3;
+const WOBBLE_WALK_WEIGHT: f32 = 0.12;
 const WOBBLE_WALK_CORR: f32 = 0.97;
 
 /// Simulate correlated time-base error (wobble) from tape stretch, capstan
 /// flutter and head-drum speed variation.
 ///
 /// Unlike `apply_jitter`, which moves lines independently by whole
-/// subcarrier cycles, the displacement here is smooth from line to line:
-///   - three sinusoids across the lines of the frame, with periods of about
-///     20–45, 60–140 and 150–300 lines (scaled by `rate`), random phases,
-///     and weights favouring the slow components;
-///   - a mean-reverting random walk (an AR(1) process with a correlation of
-///     0.97 per line) for irregular drift.
+/// subcarrier cycles, the displacement here is smooth from line to line.
+/// It has two parts:
+///   - the tape path: three sinusoids along the track, with periods of
+///     about 20–45, 60–140 and 150–300 lines (scaled by `rate`), random
+///     phases, and weights favouring the slow components.  Both heads scan
+///     the tape through the same guides at the same tension, so this
+///     depends on the position along the track and is the same in both
+///     fields (field 2's lines sit half a line lower);
+///   - irregular flutter: a mean-reverting random walk (an AR(1) process
+///     with a correlation of 0.97 per line) taken in time order (absolute
+///     line number), so it runs on from field 1 into field 2.  It is the
+///     only part that differs between the fields, so it is kept small.
 ///
-/// Lines are taken in time order (absolute line number), so the wobble
-/// continues from field 1 into field 2.  Each visible line is shifted by a
-/// fractional number of samples together with its burst, so the decoder
-/// stays locked to the chroma and hue is preserved, as on a real TV that
-/// follows the time-base error of each line.
+/// Each visible line is shifted by a fractional number of samples together
+/// with its burst, so the decoder stays locked to the chroma and hue is
+/// preserved, as on a real TV that follows the time-base error of each
+/// line.
 ///
 /// `amp_px` is the peak displacement in output pixels at 640 wide.  With
 /// `--temporal-coherence` the periods, phases and walk drift slowly from
@@ -2357,11 +2389,11 @@ fn apply_wobble(
 
     for line in 0..TOTAL_LINES {
         walk = WOBBLE_WALK_CORR * walk + fresh * randn(rng);
-        let visible = FIELD_ACTIVE_LINES.iter().any(|&(a, b)| (a..b).contains(&line));
-        if !visible {
+        let Some(field) = FIELD_ACTIVE_LINES.iter().position(|&(a, b)| (a..b).contains(&line)) else {
             continue;
-        }
-        let t = line as f32;
+        };
+        // Position along the track.
+        let t = (line - FIELD_ACTIVE_LINES[field].0) as f32 + 0.5 * field as f32;
         // With coherence the walk becomes smooth noise along the lines
         // that scrolls slowly from frame to frame.
         let w = clock.blend(walk, || {
@@ -2753,6 +2785,71 @@ mod tests {
         let a = hue(decode_mean(&orig, 500, 240, 8));
         let b = hue(decode_mean(&sig, 500, 240, 8));
         assert!((a - b).abs() < 3.0, "hue {a} vs {b}");
+    }
+
+    /// Position of the grey-to-red edge on every decoded row.
+    fn edge_rows(sig: &[f32]) -> Vec<f32> {
+        let mut dec = crate::decoder::Decoder::new();
+        let out = dec.decode_frame(sig, 640, 480, false, false).to_vec();
+        (0..480)
+            .map(|y| {
+                let r = |x: usize| out[(y * 640 + x) * 3] as f32;
+                let x = (200..450).find(|&x| r(x) > 130.0).unwrap();
+                // Sub-pixel crossing between x − 1 and x.
+                (x - 1) as f32 + (130.0 - r(x - 1)) / (r(x) - r(x - 1)).max(1.0)
+            })
+            .collect()
+    }
+
+    /// Mean |row of one field − mean of the other field's rows around it|.
+    fn field_offset(edges: &[f32], rows: std::ops::Range<usize>) -> f32 {
+        let d: Vec<f32> = rows.map(|y| (edges[y + 1] - 0.5 * (edges[y] + edges[y + 2])).abs()).collect();
+        d.iter().sum::<f32>() / d.len() as f32
+    }
+
+    fn grey_red() -> Vec<f32> {
+        let pixels: Vec<u8> = (0..640 * 480)
+            .flat_map(|i| if i % 640 < 320 { [60u8, 60, 60] } else { [200, 40, 40] })
+            .collect();
+        crate::encoder::Encoder::new().encode_frame(&pixels, 640, 480, 0).to_vec()
+    }
+
+    #[test]
+    fn wobble_moves_both_fields_together() {
+        let orig = grey_red();
+        for coherence in [0.0, 1.0] {
+            let mut sig = orig.clone();
+            let clock = TapeClock { seed: 4, frame: 3, coherence };
+            apply_wobble(&mut sig, 3.0, 1.0, &mut StdRng::seed_from_u64(10), &clock);
+            let edges = edge_rows(&sig);
+            let mean = edges.iter().sum::<f32>() / 480.0;
+            let swing = edges.iter().map(|e| (e - mean).abs()).fold(0.0, f32::max);
+            assert!(swing > 1.5, "wobble too weak: {swing}");
+            // Rows of the two fields at the same height stay within a small
+            // fraction of the swing of each other.
+            let off = field_offset(&edges, 10..460);
+            assert!(off < 0.2 * swing, "coherence {coherence}: field offset {off} px, swing {swing} px");
+        }
+    }
+
+    #[test]
+    fn flagging_bends_both_fields_the_same_way() {
+        let orig = grey_red();
+        let clock = TapeClock { seed: 8, frame: 0, coherence: 1.0 };
+        let mut sig = orig.clone();
+        apply_flagging(&mut sig, 1.0, 0.0, &clock);
+        let edges = edge_rows(&sig);
+        let base = edge_rows(&orig);
+        // Both fields' top rows move by about 1 µs (12 px) in the same
+        // direction; the fields differ by under a pixel.
+        let (d0, d1) = (edges[0] - base[0], edges[1] - base[1]);
+        assert!(d0.abs() > 6.0 && d0.signum() == d1.signum(), "{d0} {d1}");
+        assert!((d0 - d1).abs() < 1.0, "{d0} {d1}");
+        assert!(field_offset(&edges, 0..60) < 0.6);
+        // A line TBC removes it.
+        let mut sig = orig.clone();
+        apply_flagging(&mut sig, 1.0, 1.0, &clock);
+        assert_eq!(sig, orig);
     }
 
     /// Mean absolute difference between two signals.

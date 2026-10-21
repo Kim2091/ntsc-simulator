@@ -690,8 +690,9 @@ pub static SPECS: &[ParamSpec] = &[
         label: "Top skew (flagging)",
         help: "Opt-in. Top-of-field skew (0–1): the head switch's time-base step carried into the next field by a \
                slow horizontal PLL in the TV or capture card, so the top lines bend sideways and straighten out \
-               over about 30 lines, the two fields in opposite directions. 1 = about 1 µs (12 px at 640 wide) at the \
-               top line. A line TBC removes it.",
+               over about 30 lines. Both fields bend the same way (tape-tension skew); the heads' phase error adds \
+               a few tens of ns between them. 1 = about 1 µs (12 px at 640 wide) at the top line. A line TBC \
+               removes it.",
         unit: "",
         group: Group::Timing,
         kind: num(0.0, 1.0, 0.5),
