@@ -1,6 +1,6 @@
 [package]
 name = "ntsc-composite-simulator"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "NTSC composite video simulator — encode and decode RGB frames through a simulated NTSC signal path"
 
