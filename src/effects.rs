@@ -101,6 +101,13 @@ pub struct SignalEffects {
     /// sharpness-enhancement circuit in VHS playback decks.
     /// `None` = no ringing.
     pub edge_ringing: Option<f32>,
+    /// Cutoff of the source enhancement's lowpass in MHz, which sets the
+    /// spacing of the ringing (0 = the original 1.5 MHz).
+    pub ringing_freq: f32,
+    /// Source enhancement filter: 0 = linear phase (rings equally on both
+    /// sides of an edge), 1 = causal analog filter (rings after the edge),
+    /// in between a blend.
+    pub ringing_direction: f32,
     /// Luminance-dependent noise amplitude.  Noise is stronger in dark
     /// areas, mimicking real VHS tape noise characteristics.
     /// `None` = no luma-dependent noise.
@@ -264,6 +271,12 @@ impl SignalEffects {
             || self.tape_model != TapeModel::Classic
     }
 
+    /// Shape of the source enhancement: (cutoff in Hz, direction 0-1).
+    fn ringing(&self) -> (f64, f32) {
+        let mhz = if self.ringing_freq > 0.0 { self.ringing_freq } else { DEFAULT_RINGING_MHZ };
+        (mhz as f64 * 1e6, self.ringing_direction.clamp(0.0, 1.0))
+    }
+
     /// Settings of the deck's playback luma circuits.
     fn deck_luma(&self) -> DeckLuma {
         DeckLuma {
@@ -411,7 +424,7 @@ impl SignalEffects {
                 let _p = profile::scope("fx edge ringing");
                 each(wires, &mut |s, w| {
                     if luma_on(w) {
-                        apply_edge_ringing(s, gain, sample_rate, w == Wire::Luma);
+                        apply_edge_ringing(s, gain, self.ringing(), w == Wire::Luma);
                     }
                 });
             }
@@ -465,7 +478,7 @@ impl SignalEffects {
             let _p = profile::scope("fx edge ringing");
             each(wires, &mut |s, w| {
                 if luma_on(w) {
-                    apply_edge_ringing(s, gain, sample_rate, w == Wire::Luma);
+                    apply_edge_ringing(s, gain, self.ringing(), w == Wire::Luma);
                 }
             });
         }
@@ -1042,27 +1055,90 @@ fn apply_tape_dropout_doc(
 // Edge ringing / sharpness peaking
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Simulate the detail-enhancement (peaking) circuit found in VHS playback
-/// decks.  A lowpass extracts a "blurred" version of each line; the
-/// difference (high-frequency detail) is added back with adjustable gain.
+/// Default cutoff of the source enhancement's lowpass, MHz.
+pub const DEFAULT_RINGING_MHZ: f32 = 1.5;
+
+/// Passband ripple (dB) and order of the causal enhancement lowpass: a
+/// 4th-order Chebyshev, the kind of sharp LC lowpass analog video gear
+/// used, whose step response overshoots and rings for a few cycles.
+const RINGING_CHEBY_RIPPLE_DB: f64 = 1.0;
+const RINGING_CHEBY_ORDER: usize = 4;
+
+/// Biquad sections of a Chebyshev type I lowpass with its ripple band
+/// ending at `fc`, each with unity DC gain.
+fn chebyshev_lowpass(fc: f64) -> Vec<iir::Biquad> {
+    let n = RINGING_CHEBY_ORDER;
+    let eps = (10f64.powf(RINGING_CHEBY_RIPPLE_DB / 10.0) - 1.0).sqrt();
+    let a = (1.0 / eps).asinh() / n as f64;
+    (1..=n / 2)
+        .map(|k| {
+            let theta = (2 * k - 1) as f64 * std::f64::consts::PI / (2 * n) as f64;
+            let (sigma, omega) = (a.sinh() * theta.sin(), a.cosh() * theta.cos());
+            let mag = sigma.hypot(omega);
+            iir::Biquad::lowpass(fc * mag, mag / (2.0 * sigma))
+        })
+        .collect()
+}
+
+/// The causal enhancement lowpass of one line (`src`), advanced by its
+/// group delay at low frequencies so that edges stay in place; written
+/// to `out` (same length).  `tmp` is scratch.
+fn causal_lowpass_aligned(src: &[f32], sections: &[iir::Biquad], delay: f32, tmp: &mut Vec<f32>, out: &mut [f32]) {
+    let n = src.len();
+    let tail = delay.ceil() as usize + 3;
+    tmp.clear();
+    tmp.extend_from_slice(src);
+    tmp.extend(std::iter::repeat_n(src[n - 1], tail));
+    for s in sections {
+        s.run(tmp);
+    }
+    // Cubic (Catmull-Rom) interpolation at n + delay.
+    let whole = delay.floor() as usize;
+    let t = delay - whole as f32;
+    for (j, o) in out.iter_mut().enumerate() {
+        let i = j + whole;
+        let p = |k: isize| tmp[(i as isize + k).clamp(0, tmp.len() as isize - 1) as usize];
+        let (p0, p1, p2, p3) = (p(-1), p(0), p(1), p(2));
+        *o = p1 + 0.5 * t * (p2 - p0 + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + t * (3.0 * (p1 - p2) + p3 - p0)));
+    }
+}
+
+/// Edge enhancement that is already on the tape (source enhancement): a
+/// lowpass extracts a blurred version of each line's luma, and the
+/// difference (the detail) is added back with gain `strength`, which puts
+/// bright and dark halos beside edges.
 ///
-/// Because the windowed-sinc FIR has Gibbs-phenomenon overshoot, this
-/// naturally creates the bright/dark halos around edges that are
-/// characteristic of VHS sharpness enhancement.
-fn apply_edge_ringing(signal: &mut [f32], strength: f32, _sample_rate: f64, full_luma: bool) {
+/// `shape` is (lowpass cutoff in Hz, direction).  The cutoff sets how far
+/// apart the repeated outlines are (about one period of the cutoff
+/// frequency: 1.5 MHz gives about 8 px at 640 wide, 2.75 MHz about 4.4 px).
+/// Direction 0 uses a 91-tap windowed-sinc lowpass: linear phase, so the
+/// halos ring equally on both sides of an edge (digital enhancers).
+/// Direction 1 uses a causal analog-style lowpass, a 4th-order Chebyshev
+/// with 1 dB ripple, advanced by its low-frequency group delay so edges
+/// stay in place: it rings only after the edge, so the outlines trail to
+/// the right, and the advance leaves a faint pre-shoot on the left, as
+/// analog source chains do.  Values in between blend the two lowpasses.
+/// The default (1.5 MHz, direction 0) is the original effect.
+fn apply_edge_ringing(signal: &mut [f32], strength: f32, shape: (f64, f32), full_luma: bool) {
     let spl = SAMPLES_PER_LINE;
     if signal.len() < TOTAL_LINES * spl {
         return;
     }
+    let (fc, direction) = shape;
 
-    // The peaking filter extracts detail above ~1.5 MHz.  Using many taps
-    // makes the ringing more pronounced (intentionally).
-    let detail_lp = filters::design_lowpass(1.5e6, RINGING_FILTER_TAPS);
+    // The linear-phase lowpass.  Many taps make the ringing pronounced.
+    let detail_lp = (direction < 1.0).then(|| filters::design_lowpass(fc, RINGING_FILTER_TAPS));
+    let causal = (direction > 0.0).then(|| {
+        let sections = chebyshev_lowpass(fc);
+        let delay = iir::dc_group_delay(&sections);
+        (sections, delay)
+    });
 
     let mut luma = vec![0.0f32; spl];
     let mut chroma = vec![0.0f32; spl];
     let mut luma_active = vec![0.0f32; ACTIVE_SAMPLES];
     let mut blurred_active = vec![0.0f32; ACTIVE_SAMPLES];
+    let mut causal_active = vec![0.0f32; ACTIVE_SAMPLES];
     let mut scratch = Vec::new();
 
     for line in 0..TOTAL_LINES {
@@ -1077,8 +1153,20 @@ fn apply_edge_ringing(signal: &mut [f32], strength: f32, _sample_rate: f64, full
 
         // Apply peaking only on active picture luma.
         luma_active.copy_from_slice(&luma[ACTIVE_START..ACTIVE_START + ACTIVE_SAMPLES]);
-        blurred_active.copy_from_slice(&luma_active);
-        apply_fir_inplace(&mut blurred_active, &detail_lp, &mut scratch);
+        if let Some(kernel) = &detail_lp {
+            blurred_active.copy_from_slice(&luma_active);
+            apply_fir_inplace(&mut blurred_active, kernel, &mut scratch);
+        }
+        if let Some((sections, delay)) = &causal {
+            causal_lowpass_aligned(&luma_active, sections, *delay, &mut scratch, &mut causal_active);
+            if detail_lp.is_some() {
+                for (b, &c) in blurred_active.iter_mut().zip(&causal_active) {
+                    *b += direction * (c - *b);
+                }
+            } else {
+                blurred_active.copy_from_slice(&causal_active);
+            }
+        }
 
         // Unsharp-mask: output = luma + gain × (luma − lowpass(luma))
         for n in 0..ACTIVE_SAMPLES {
@@ -2883,6 +2971,67 @@ mod tests {
         };
         let (edge, middle) = (rms(2..9), rms(40..200));
         assert!(edge > 1.05 * middle, "edge {edge} middle {middle}");
+    }
+
+    /// Ringing of the source enhancement on a luma step (S-Video Y wire):
+    /// (energy left of the edge, energy right of it, ripple spacing in
+    /// pixels at 640 wide).  The spacing is the mean distance between
+    /// successive extrema of the same sign on the side with more energy.
+    fn ringing_shape(freq_mhz: f32, direction: f32) -> (f32, f32, f32) {
+        let mut sig = vec![BLANKING_V; TOTAL_LINES * SAMPLES_PER_LINE];
+        let edge = ACTIVE_START + ACTIVE_SAMPLES / 2;
+        for line in 0..TOTAL_LINES {
+            for n in ACTIVE_START..SAMPLES_PER_LINE {
+                sig[line * SAMPLES_PER_LINE + n] = if n < edge { 0.35 } else { 0.75 };
+            }
+        }
+        let orig = sig.clone();
+        apply_edge_ringing(&mut sig, 0.8, (freq_mhz as f64 * 1e6, direction), true);
+        let base = 100 * SAMPLES_PER_LINE;
+        let r: Vec<f32> = (0..SAMPLES_PER_LINE).map(|n| sig[base + n] - orig[base + n]).collect();
+        let px = 640.0 / ACTIVE_SAMPLES as f32;
+        let reach = (40.0 / px) as usize;
+        let energy = |a: usize, b: usize| (a..b).map(|n| r[n] * r[n]).sum::<f32>();
+        let (left, right) = (energy(edge - reach, edge - 1), energy(edge + 1, edge + reach));
+        let range = if right >= left { edge + 1..edge + reach } else { edge - reach..edge - 1 };
+        let peak = range.clone().map(|n| r[n].abs()).fold(0.0, f32::max);
+        // Extrema with parabolic interpolation.
+        let mut ext: Vec<(f32, f32)> = Vec::new();
+        for n in range.start + 1..range.end - 1 {
+            let (a, b, c) = (r[n - 1], r[n], r[n + 1]);
+            if b.abs() > 0.05 * peak && ((b > a && b >= c) || (b < a && b <= c)) {
+                let d = a - 2.0 * b + c;
+                let off = if d != 0.0 { 0.5 * (a - c) / d } else { 0.0 };
+                ext.push((n as f32 + off, b));
+            }
+        }
+        let gaps: Vec<f32> = (2..ext.len()).filter(|&k| ext[k].1.signum() == ext[k - 2].1.signum()).map(|k| ext[k].0 - ext[k - 2].0).collect();
+        let spacing = if gaps.is_empty() { 0.0 } else { gaps.iter().sum::<f32>() / gaps.len() as f32 * px };
+        (left, right, spacing)
+    }
+
+    #[test]
+    fn causal_ringing_trails_the_edge_at_the_set_spacing() {
+        for d in [0.0f32, 0.5, 1.0] {
+            let (l, r, s) = ringing_shape(2.5, d);
+            eprintln!("direction {d}: left {l:.4} right {r:.4} ({:.1} % right), spacing {s:.2} px", 100.0 * r / (l + r));
+        }
+        for f in [1.5f32, 2.5, 3.0] {
+            for d in [0.0f32, 1.0] {
+                let (_, _, s) = ringing_shape(f, d);
+                eprintln!("freq {f} MHz direction {d}: spacing {s:.2} px");
+            }
+        }
+        let (l, r, _) = ringing_shape(2.5, 0.0);
+        assert!((r / (l + r) - 0.5).abs() < 0.02, "symmetric: {l} {r}");
+        let (l, r, _) = ringing_shape(2.5, 1.0);
+        assert!(r / (l + r) > 0.95, "causal: {l} {r}");
+        // About one period of the cutoff frequency: 640 px span 52.7 µs.
+        let period = |mhz: f32| 640.0 / (ACTIVE_SAMPLES as f32 / crate::constants::SAMPLE_RATE as f32 * 1e6) / mhz;
+        for f in [1.5f32, 2.5, 3.0] {
+            let (_, _, s) = ringing_shape(f, 1.0);
+            assert!((s / period(f) - 1.0).abs() < 0.25, "{f} MHz: {s} px vs {} px", period(f));
+        }
     }
 
     /// Mean absolute difference between two signals.

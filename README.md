@@ -109,6 +109,8 @@ The full VHS look, built on the FM tape model with a typical consumer deck and c
 | `--dropouts` | 40..100 | 15..30 | 5..15 |
 | `--dropout-span` | 2..4 | 1..2 | 1 |
 | `--edge-ringing` (source) | 0.15..0.25 | 0.25..0.35 | 0.2..0.3 |
+| `--ringing-freq` | 2.75 | 2.75 | 2.75 |
+| `--ringing-direction` | 1 | 1 | 1 |
 | `--rf-loss` | 0.6..0.9 | 0.3..0.5 | 0.1..0.2 |
 | `--tracking-bars` | 0..0.3 | – | – |
 | `--luma-crosstalk` | 0.4..0.7 | 0.1..0.3 | – |
@@ -243,6 +245,8 @@ Only used with `--format dvd`.
 | `--vhs-luma-bw` | Luma bandwidth. Classic: a lowpass cutoff. FM: the −10 dB point of record + playback. Lower values blur fine horizontal detail. | 0.5–4.2 MHz (SP 3.0, LP/EP 2.8–2.9, worn lower) |
 | `--color-under-bw` | Colour-under chroma bandwidth; lower values smear colour sideways past edges. | 100–1000 kHz (typical 300–500) |
 | `--edge-ringing` | Source enhancement already on the tape (broadcast filters, telecine aperture correction, duplicator enhancers): bright and dark halos beside sharp edges. With the FM model it is recorded through the tape path. | 0–3 (typical 0.3) |
+| `--ringing-freq` | Cutoff of the source enhancement's filter: sets how far apart the repeated outlines are, about one period (1.5 MHz ≈ 8 px at 640 wide, 2.5 MHz ≈ 4.8 px, 3 MHz ≈ 4 px). | 1–4 MHz, default 1.5 |
+| `--ringing-direction` | Which side the source enhancement rings on: 0 both sides equally (linear-phase digital filter, the original behaviour), 1 after the edge only, as analog filters do (a 4th-order Chebyshev lowpass lined up with the picture: about 99 % of the ringing to the right, a faint pre-shoot on the left); in between a blend. | 0–1, default 0 |
 | `--white-clip` | *FM*. The recorder's white clip after pre-emphasis, in % of the sync-to-white span. Large sharp edges overshoot it and come out softened with a trail; higher keeps bright edges crisper. | 120–220 %, default 160 (HQ decks 170–200) |
 | `--dark-clip` | *FM*. The dark clip after pre-emphasis; lower values leave a lighter trail after bright objects. | 20–60 %, default 40 |
 | `--nl-emphasis` | *FM*. Nonlinear emphasis (always in EP, deck-dependent in SP): noise on flat areas drops by up to about 7 dB while noise beside large edges stays. | 0–1 (typical 1) |

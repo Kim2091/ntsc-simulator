@@ -364,6 +364,27 @@ pub static SPECS: &[ParamSpec] = &[
         kind: num(0.0, 3.0, 0.3),
     },
     ParamSpec {
+        id: "ringing-freq",
+        label: "Ringing frequency",
+        help: "Cutoff of the source enhancement's filter (MHz). It sets how far apart the repeated outlines beside \
+               an edge are, about one period of this frequency: 1.5 MHz (the original) about 8 px at 640 wide, \
+               2.5 MHz about 5 px, 3 MHz about 4 px.",
+        unit: "MHz",
+        group: Group::Tape,
+        kind: num_def(1.0, 4.0, 1.5),
+    },
+    ParamSpec {
+        id: "ringing-direction",
+        label: "Ringing direction",
+        help: "Which side of an edge the source enhancement rings on. 0: both sides equally (a linear-phase \
+               digital filter, the original behaviour). 1: after the edge only, as analog filters do: the \
+               outlines trail to the right and only a faint pre-shoot stays on the left. Values in between \
+               blend the two.",
+        unit: "",
+        group: Group::Tape,
+        kind: num_def(0.0, 1.0, 0.0),
+    },
+    ParamSpec {
         id: "white-clip",
         label: "White clip",
         help: "FM tape model: the recorder's white clip after pre-emphasis, in % of the sync-to-white span above \
@@ -1153,6 +1174,8 @@ impl ParamValues {
             tape_dropout_rate: s("tape-dropout-rate", rng),
             tape_dropout_len: req("tape-dropout-len").sample(rng),
             edge_ringing: s("edge-ringing", rng),
+            ringing_freq: 0.0,
+            ringing_direction: 0.0,
             luma_noise: s("luma-noise", rng),
             head_switching_smear: s("head-smear", rng),
             tape_trail_smear: s("tape-trail", rng),
@@ -1259,6 +1282,9 @@ impl ParamValues {
             Some(seed) => mix_seed(seed, 0x57A6E),
             None => rng.random(),
         };
+        // Drawn last, so they never change the values above.
+        fx.ringing_freq = req("ringing-freq").sample(rng);
+        fx.ringing_direction = req("ringing-direction").sample(rng);
         fx
     }
 
@@ -1355,6 +1381,8 @@ impl ParamValues {
         opt("deck_cnr", "deck-cnr", fx.deck_cnr);
         opt("head_switch_point", "head-switch-point", fx.head_switch_point);
         opt("flagging", "flagging", fx.flagging);
+        opt("ringing_freq", "ringing-freq", Some(fx.ringing_freq));
+        opt("ringing_direction", "ringing-direction", Some(fx.ringing_direction));
         parts
     }
 
