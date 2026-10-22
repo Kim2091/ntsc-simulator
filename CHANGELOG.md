@@ -2,6 +2,8 @@
 
 Newest first.
 
+- **GUI settings search and copy buttons**: a search box above the setting groups (Ctrl+F; matches name, flag, group and description, every word; `-`/`_` count as spaces; Escape or ✕ clears it and gives Space and Ctrl+C back to playback and copying). **Copy frame** becomes **Copy after** (still Ctrl+C), plus **Copy before** (the source frame, or the frame being played) and **Copy comparison** (source scaled bilinearly to the processed size, side by side with a 4 px gap).
+
 - **Top-of-field skew off in the VHS presets**: `lq`/`mq`/`hq` no longer set `--flagging`. The bending of the top lines depends on the TV's or capture card's horizontal lock, most captures show little of it and a TBC removes it, so it is now an opt-in setting. `lq`/`mq`/`hq` locks and sample images updated; legacy output unchanged.
 
 - **`--comb 2d` is the default decoder comb**: composite output without a `--comb` setting (effects off, `colorbars`, `image` and `roundtrip` without a preset, the DVD player's composite output) now decodes with the adaptive 2D comb, as a decent TV would: no dot crawl on colour bars, no cross-colour at still vertical edges. The `legacy-lq`/`legacy-mq`/`legacy-hq` presets pin `--comb 2sample` and stay byte-identical; `lq`/`mq`/`hq` (trap) and S-Video output are unchanged. Running the original legacy flags by hand without `--preset legacy-*` now decodes with `2d`; add `--comb 2sample` to reproduce earlier output. Legacy lock entries changed on purpose: `none/*` (effects off) and `dvd-mq+composite/synthetic`.

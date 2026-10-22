@@ -99,6 +99,8 @@ pub struct App {
     sampled: Vec<String>,
 
     viewer: Viewer,
+    /// Text in the settings search box; empty shows the groups.
+    settings_search: String,
     process: ProcessDialog,
     status: Option<(bool, String)>,
 
@@ -134,6 +136,35 @@ pub struct App {
 
 fn bars_source() -> SourceImage {
     SourceImage { rgb: colorbars::generate_colorbars(640, 480), w: 640, h: 480, history: Vec::new() }
+}
+
+/// Bilinear resize of an RGB24 image.
+fn resize_rgb(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    if sw == dw && sh == dh {
+        return src.to_vec();
+    }
+    let mut out = vec![0u8; dw * dh * 3];
+    let sx = sw as f32 / dw as f32;
+    let sy = sh as f32 / dh as f32;
+    for y in 0..dh {
+        let fy = ((y as f32 + 0.5) * sy - 0.5).clamp(0.0, (sh - 1) as f32);
+        let y0 = fy as usize;
+        let y1 = (y0 + 1).min(sh - 1);
+        let ty = fy - y0 as f32;
+        for x in 0..dw {
+            let fx = ((x as f32 + 0.5) * sx - 0.5).clamp(0.0, (sw - 1) as f32);
+            let x0 = fx as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let tx = fx - x0 as f32;
+            for c in 0..3 {
+                let p = |xx: usize, yy: usize| src[(yy * sw + xx) * 3 + c] as f32;
+                let top = p(x0, y0) + (p(x1, y0) - p(x0, y0)) * tx;
+                let bottom = p(x0, y1) + (p(x1, y1) - p(x0, y1)) * tx;
+                out[(y * dw + x) * 3 + c] = (top + (bottom - top) * ty).round() as u8;
+            }
+        }
+    }
+    out
 }
 
 fn quote(arg: &str) -> String {
@@ -174,6 +205,7 @@ impl App {
             last_ms: 0.0,
             sampled: Vec::new(),
             viewer: Viewer::default(),
+            settings_search: String::new(),
             process: ProcessDialog::default(),
             status: None,
             screenshot: args.screenshot.clone(),
@@ -726,7 +758,52 @@ impl App {
     fn copy_preview(&mut self, ctx: &egui::Context) {
         let Some((rgb, w, h)) = &self.after_rgb else { return };
         ctx.copy_image(egui::ColorImage::from_rgb([*w, *h], rgb));
-        self.status = Some((true, format!("Copied the {}×{} frame to the clipboard", w, h)));
+        self.status = Some((true, format!("Copied the processed {}×{} frame to the clipboard", w, h)));
+    }
+
+    /// The source frame shown on the "before" side: (pixels, width, height).
+    /// During playback that is the played frame, at the video's size.
+    fn before_frame(&self) -> (&[u8], usize, usize) {
+        if let (Some(pb), Some((_, px))) = (&self.playback, &self.play_shown) {
+            let (w, h) = (pb.request.in_w, pb.request.in_h);
+            if px.len() == w * h * 3 {
+                return (px, w, h);
+            }
+        }
+        (&self.src.rgb, self.src.w, self.src.h)
+    }
+
+    /// Put the source frame on the clipboard, at its own size.
+    fn copy_before(&mut self, ctx: &egui::Context) {
+        let (rgb, w, h) = self.before_frame();
+        if w == 0 || h == 0 || rgb.len() != w * h * 3 {
+            return;
+        }
+        ctx.copy_image(egui::ColorImage::from_rgb([w, h], rgb));
+        self.status = Some((true, format!("Copied the source {}×{} frame to the clipboard", w, h)));
+    }
+
+    /// Put source and processed frame side by side on the clipboard, the
+    /// source scaled to the processed frame's size.
+    fn copy_comparison(&mut self, ctx: &egui::Context) {
+        let Some((after, w, h)) = &self.after_rgb else { return };
+        let (w, h) = (*w, *h);
+        let (src, sw, sh) = self.before_frame();
+        if sw == 0 || sh == 0 || w == 0 || h == 0 || src.len() != sw * sh * 3 || after.len() != w * h * 3 {
+            return;
+        }
+        let before = resize_rgb(src, sw, sh, w, h);
+        let gap = 4;
+        let out_w = w * 2 + gap;
+        let mut out = vec![0u8; out_w * h * 3];
+        for y in 0..h {
+            let row = y * out_w * 3;
+            out[row..row + w * 3].copy_from_slice(&before[y * w * 3..(y + 1) * w * 3]);
+            let right = row + (w + gap) * 3;
+            out[right..right + w * 3].copy_from_slice(&after[y * w * 3..(y + 1) * w * 3]);
+        }
+        ctx.copy_image(egui::ColorImage::from_rgb([out_w, h], &out));
+        self.status = Some((true, format!("Copied the before/after comparison ({}×{}) to the clipboard", out_w, h)));
     }
 
     // ── UI ───────────────────────────────────────────────────────────────
@@ -773,11 +850,20 @@ impl App {
                 if ui.add_enabled(self.after_rgb.is_some() && no_dialog, egui::Button::new("Save PNG…")).on_hover_text("Save the processed preview").clicked() {
                     self.save_preview_png(ui.ctx());
                 }
-                if ui.add_enabled(self.after_rgb.is_some(), egui::Button::new("Copy frame"))
-                    .on_hover_text("Copy the processed preview frame to the clipboard (Ctrl+C)")
+                if ui.add_enabled(self.after_rgb.is_some(), egui::Button::new("Copy comparison"))
+                    .on_hover_text("Copy the source and the processed frame side by side to the clipboard")
+                    .clicked()
+                {
+                    self.copy_comparison(ui.ctx());
+                }
+                if ui.add_enabled(self.after_rgb.is_some(), egui::Button::new("Copy after"))
+                    .on_hover_text("Copy the processed frame to the clipboard (Ctrl+C)")
                     .clicked()
                 {
                     self.copy_preview(ui.ctx());
+                }
+                if ui.button("Copy before").on_hover_text("Copy the source frame to the clipboard").clicked() {
+                    self.copy_before(ui.ctx());
                 }
                 if ui.button("Copy CLI command").on_hover_text("Copy the equivalent ntsc-composite-simulator command line").clicked() {
                     let cmd = self.cli_command();
@@ -912,6 +998,51 @@ impl App {
                     }
                 });
             });
+    }
+
+    /// The settings search box; Ctrl+F focuses it, Escape clears it.
+    fn search_row(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let edit = egui::TextEdit::singleline(&mut self.settings_search)
+                .hint_text("Search settings (Ctrl+F)")
+                .desired_width(ui.available_width() - 28.0);
+            let response = ui.add(edit).on_hover_text("Matches setting names, command-line flags and descriptions");
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+                response.request_focus();
+            }
+            // A text field gives up its focus on Escape in the same frame,
+            // so check both; the focus is released either way, so Space and
+            // Ctrl+C go back to playback and frame copying.
+            if (response.has_focus() || response.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.settings_search.clear();
+                response.surrender_focus();
+            }
+            if ui.add_enabled(!self.settings_search.is_empty(), egui::Button::new("✕").small())
+                .on_hover_text("Clear the search")
+                .clicked()
+            {
+                self.settings_search.clear();
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    /// The parameters matching the search, under their group names.
+    fn search_results(&mut self, ui: &mut egui::Ui) {
+        let query = self.settings_search.clone();
+        let mut any = false;
+        for group in Group::ALL {
+            if !self.editor.group_matches(group, &query) {
+                continue;
+            }
+            any = true;
+            ui.label(egui::RichText::new(group.label()).strong());
+            ui.indent(("search", group.label()), |ui| self.editor.ui_group_matching(ui, group, &query));
+            ui.add_space(6.0);
+        }
+        if !any {
+            ui.label(egui::RichText::new("No settings match.").weak());
+        }
     }
 
     fn output_controls(&mut self, ui: &mut egui::Ui) {
@@ -1193,9 +1324,14 @@ impl eframe::App for App {
             ui.add_space(6.0);
             self.preset_row(ui);
             ui.separator();
+            self.search_row(ui);
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                for group in Group::ALL {
-                    self.group_section(ui, group);
+                if self.settings_search.trim().is_empty() {
+                    for group in Group::ALL {
+                        self.group_section(ui, group);
+                    }
+                } else {
+                    self.search_results(ui);
                 }
             });
         });
@@ -1213,5 +1349,21 @@ impl eframe::App for App {
 
         self.update_render(&ctx);
         self.handle_screenshot(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resize_rgb;
+
+    #[test]
+    fn resize_keeps_size_and_flat_colour() {
+        let src: Vec<u8> = (0..4 * 3).flat_map(|_| [10u8, 200, 30]).collect();
+        assert_eq!(resize_rgb(&src, 4, 3, 4, 3), src);
+        let big = resize_rgb(&src, 4, 3, 9, 7);
+        assert_eq!(big.len(), 9 * 7 * 3);
+        assert!(big.chunks_exact(3).all(|p| p == [10, 200, 30]));
+        let small = resize_rgb(&src, 4, 3, 1, 1);
+        assert_eq!(small, vec![10, 200, 30]);
     }
 }

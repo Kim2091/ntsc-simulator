@@ -125,6 +125,32 @@ impl ParamEditor {
             }
         }
     }
+
+    /// `true` if any parameter of `group` matches the search `query`.
+    pub fn group_matches(&self, group: Group, query: &str) -> bool {
+        SPECS.iter().any(|spec| spec.group == group && spec_matches(spec, query))
+    }
+
+    /// Controls for the parameters of `group` that match the search `query`.
+    pub fn ui_group_matching(&mut self, ui: &mut egui::Ui, group: Group, query: &str) {
+        for (i, spec) in SPECS.iter().enumerate() {
+            if spec.group == group && spec_matches(spec, query) {
+                param_ui(ui, spec, &mut self.states[i]);
+            }
+        }
+    }
+}
+
+/// Lower case with `-` and `_` as spaces, so "edge ringing" finds `edge-ringing`.
+fn normalize(text: &str) -> String {
+    text.to_lowercase().replace(['-', '_'], " ")
+}
+
+/// `true` if every word of `query` occurs in the parameter's label, flag,
+/// group or help text.
+fn spec_matches(spec: &ParamSpec, query: &str) -> bool {
+    let haystack = normalize(&format!("{} {} {} {}", spec.label, spec.id, spec.group.label(), spec.help));
+    normalize(query).split_whitespace().all(|word| haystack.contains(word))
 }
 
 fn tooltip(spec: &ParamSpec) -> String {
@@ -238,3 +264,24 @@ fn param_ui(ui: &mut egui::Ui, spec: &ParamSpec, st: &mut ParamState) {
     }
     ui.add_space(2.0);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find(query: &str) -> Vec<&'static str> {
+        SPECS.iter().filter(|s| spec_matches(s, query)).map(|s| s.id).collect()
+    }
+
+    #[test]
+    fn search_matches_labels_flags_and_words_in_any_order() {
+        for q in ["edge ringing", "--edge-ringing", "EDGE_RINGING", "ringing edge"] {
+            assert!(find(q).contains(&"edge-ringing"), "{q}");
+        }
+        // Every word has to match somewhere.
+        assert!(find("edge ringing zzz").is_empty());
+        // An empty query matches everything.
+        assert_eq!(find("  ").len(), SPECS.len());
+    }
+}
+
